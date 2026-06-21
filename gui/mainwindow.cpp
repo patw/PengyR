@@ -14,6 +14,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMessageBox>
+#include <QFile>
+#include <QMimeDatabase>
+#include <QMimeType>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // Load config
@@ -193,14 +196,18 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     m_chatHistory->setThinking(true);
     m_chatHistory->updateTokenUsage(0, 0);
 
-    QString displayContent = text;
-    if (!images.isEmpty()) {
-        for (const QString& img : images) {
-            displayContent = QString("[Image: %1]\n").arg(img) + displayContent;
-        }
+    // Build display content with placeholders for images
+    QStringList placeholderParts;
+    for (const QString& img : images) {
+        QString fname = img.section('/', -1);
+        placeholderParts.append(QString("[Image: %1]").arg(fname));
     }
+    if (!text.isEmpty()) {
+        placeholderParts.append(text);
+    }
+    QString displayContent = placeholderParts.join("\n");
 
-    // Add user message to chat
+    // Add user message to chat (persistent/display version with placeholders)
     QJsonObject userMsg;
     userMsg["role"] = "user";
     userMsg["content"] = displayContent;
@@ -209,9 +216,11 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     m_currentChat["messages"] = messages;
     m_chatView->appendMessageText("user", displayContent);
 
-    // Update title
+    // Update title from first message
     if (m_currentChat["title"].toString() == "New Chat") {
-        QString title = text.left(50);
+        QString titleSource = text.isEmpty() ? (images.isEmpty() ? "" : images[0].section('/', -1)) : text;
+        QString title = titleSource.left(50);
+        if (titleSource.length() > 50) title += "...";
         m_currentChat["title"] = title;
         m_chatHistory->updateChatTitle(m_currentChatId, title);
     }
@@ -222,10 +231,84 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     loadChatList();
 
     m_stopBtn->show();
-    processResponse(messages);
+
+    // Build message history for the API call — images get real base64 data
+    QJsonArray apiMessages;
+    QString sysMsg = m_config["system_message"].toString();
+    if (!sysMsg.isEmpty()) {
+        char* rendered = pengy_config_render(sysMsg.toUtf8().constData());
+        QJsonObject sysObj;
+        sysObj["role"] = "system";
+        sysObj["content"] = QString::fromUtf8(rendered);
+        pengy_free(rendered);
+        apiMessages.append(sysObj);
+    }
+
+    // Prior messages use stored (placeholder) content — all except the last
+    QJsonArray prior;
+    for (int i = 0; i < messages.size() - 1; ++i) {
+        prior.append(messages[i]);
+    }
+    QByteArray priorJson = QJsonDocument(prior).toJson(QJsonDocument::Compact);
+    char* cleaned = pengy_clean_messages(priorJson.constData());
+    QJsonArray cleanedMsgs = QJsonDocument::fromJson(QByteArray(cleaned)).array();
+    pengy_free(cleaned);
+
+    for (const QJsonValue& v : cleanedMsgs) apiMessages.append(v);
+
+    // Build the current user message — with image data if present
+    if (!images.isEmpty()) {
+        QJsonArray contentParts;
+        for (const QString& imgPath : images) {
+            QFile imgFile(imgPath);
+            if (imgFile.open(QIODevice::ReadOnly)) {
+                QByteArray imgData = imgFile.readAll();
+                imgFile.close();
+                QString b64 = QString::fromUtf8(imgData.toBase64());
+
+                // Detect MIME type
+                QMimeDatabase mimeDb;
+                QMimeType mime = mimeDb.mimeTypeForFile(imgPath);
+                QString mimeStr = mime.name();
+                if (mimeStr.isEmpty() || !mimeStr.startsWith("image/")) {
+                    // Fall back to extension-based detection
+                    QString ext = imgPath.section('.', -1).toLower();
+                    if (ext == "jpg" || ext == "jpeg") mimeStr = "image/jpeg";
+                    else if (ext == "png") mimeStr = "image/png";
+                    else if (ext == "gif") mimeStr = "image/gif";
+                    else if (ext == "webp") mimeStr = "image/webp";
+                    else mimeStr = "image/jpeg"; // fallback
+                }
+
+                QJsonObject imgPart;
+                imgPart["type"] = "image_url";
+                QJsonObject imgUrlObj;
+                imgUrlObj["url"] = QString("data:%1;base64,%2").arg(mimeStr, b64);
+                imgPart["image_url"] = imgUrlObj;
+                contentParts.append(imgPart);
+            }
+        }
+        if (!text.isEmpty()) {
+            QJsonObject textPart;
+            textPart["type"] = "text";
+            textPart["text"] = text;
+            contentParts.append(textPart);
+        }
+        QJsonObject multimodalMsg;
+        multimodalMsg["role"] = "user";
+        multimodalMsg["content"] = contentParts;
+        apiMessages.append(multimodalMsg);
+    } else {
+        QJsonObject textMsg;
+        textMsg["role"] = "user";
+        textMsg["content"] = displayContent;
+        apiMessages.append(textMsg);
+    }
+
+    processResponse(apiMessages);
 }
 
-void MainWindow::processResponse(const QJsonArray& messages) {
+void MainWindow::processResponse(const QJsonArray& apiMessages) {
     // Cancel any existing worker
     if (m_worker) {
         m_worker->cancel();
@@ -239,25 +322,8 @@ void MainWindow::processResponse(const QJsonArray& messages) {
         m_worker = nullptr;
     }
 
-    // Build message list with system prompt
-    QJsonArray apiMessages;
-    QString sysMsg = m_config["system_message"].toString();
-    if (!sysMsg.isEmpty()) {
-        char* rendered = pengy_config_render(sysMsg.toUtf8().constData());
-        QJsonObject sysObj;
-        sysObj["role"] = "system";
-        sysObj["content"] = QString::fromUtf8(rendered);
-        pengy_free(rendered);
-        apiMessages.append(sysObj);
-    }
-
-    // Clean dangling tool calls
-    QByteArray msgsJson = QJsonDocument(messages).toJson(QJsonDocument::Compact);
-    char* cleaned = pengy_clean_messages(msgsJson.constData());
-    QJsonArray cleanedMsgs = QJsonDocument::fromJson(QByteArray(cleaned)).array();
-    pengy_free(cleaned);
-
-    for (const QJsonValue& v : cleanedMsgs) apiMessages.append(v);
+    // apiMessages is already pre-built by sendMessage with system prompt,
+    // cleaned prior messages, and the current user message (with images if any).
 
     // Start worker on a new thread
     m_worker = new ChatWorker;

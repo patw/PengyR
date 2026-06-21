@@ -182,7 +182,7 @@ pub async fn chat(
                 // Build the assistant message for history
                 let assistant_msg = ChatMessage {
                     role: "assistant".into(),
-                    content: Some(content.clone()),
+                    content: Some(serde_json::Value::String(content.clone())),
                     tool_calls: tool_calls
                         .iter()
                         .map(|tc| crate::chat_manager::ToolCall {
@@ -234,7 +234,7 @@ pub async fn chat(
 
                         current_messages.push(ChatMessage {
                             role: "tool".into(),
-                            content: Some(result.clone()),
+                            content: Some(serde_json::Value::String(result.clone())),
                             tool_calls: vec![],
                             tool_call_id: Some(tc_id.clone()),
                         });
@@ -265,7 +265,7 @@ pub async fn chat(
 
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(result.clone()),
+                                    content: Some(serde_json::Value::String(result.clone())),
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                 });
@@ -283,7 +283,7 @@ pub async fn chat(
                                 let declined_msg = "Tool execution was declined by user.".to_string();
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(declined_msg.clone()),
+                                    content: Some(serde_json::Value::String(declined_msg.clone())),
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                 });

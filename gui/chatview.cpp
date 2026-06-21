@@ -5,6 +5,12 @@
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QUrl>
+#include <QImage>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QEventLoop>
+#include <QTimer>
 
 ChatView::ChatView(QWidget* parent) : QTextBrowser(parent) {
     setOpenLinks(false);
@@ -17,6 +23,7 @@ ChatView::ChatView(QWidget* parent) : QTextBrowser(parent) {
         "table { border: 1px solid #ccc; margin: 6px 0; }"
         "th, td { border: 1px solid #ccc; padding: 4px 10px; }"
         "th { background: #f0f0f0; font-weight: bold; }"
+        "img { max-width: 600px; }"
     );
 }
 
@@ -219,42 +226,59 @@ QString ChatView::renderToolBlock(const QJsonObject& msg) const {
 }
 
 QString ChatView::markdownToHtml(const QString& md) const {
-    // Escape HTML first — prevents literal < > " & in message
-    // text from breaking QTextBrowser's HTML parser.  The Python
-    // markdown library does this internally; our regex approach
-    // must do it explicitly.  Backticks / asterisks / pipes are
-    // untouched so the markdown regexes still match.
+    // ── Phase 1: escape user text ────────────────────────────────────
+    // toHtmlEscaped prevents literal < > " & from user/LLM text from
+    // breaking QTextBrowser's HTML parser.  However it also mangles raw
+    // HTML tags that the LLM legitimately emits (like <img src="...">).
+    // We fix that in phase 3 by unescaping safe inline tags.
     QString result = md.toHtmlEscaped();
 
-    // Convert ``` code blocks to pre/code FIRST — prevents pipe-delimited
-    // lines inside code blocks from being falsely treated as tables.
+    // ── Phase 2: markdown → HTML ─────────────────────────────────────
+    // Convert ``` code blocks FIRST — prevents their contents from
+    // being falsely matched by table / image / link regexes below.
     static QRegularExpression codeBlockRx("```(\\w*)\\n([\\s\\S]*?)```");
     result.replace(codeBlockRx, "<pre><code>\\2</code></pre>");
 
-    // Convert markdown tables (now safe: code blocks already HTML-ified)
-    result = convertMarkdownTables(result);
-
-    // Convert inline code
+    // Inline code BEFORE image/link so `![not-an-image](url)` is safe
     static QRegularExpression inlineCodeRx("`([^`]+)`");
     result.replace(inlineCodeRx, "<code>\\1</code>");
 
-    // Convert **bold**
+    // Images ![alt](url) before links — the ! prefix disambiguates
+    static QRegularExpression imageRx("!\\[([^\\]]*)\\]\\(([^\\)]+)\\)");
+    result.replace(imageRx, "<img src=\"\\2\" alt=\"\\1\">");
+
+    // Links [text](url)
+    static QRegularExpression linkRx("\\[([^\\]]*)\\]\\(([^\\)]+)\\)");
+    result.replace(linkRx, "<a href=\"\\2\">\\1</a>");
+
+    // Markdown tables
+    result = convertMarkdownTables(result);
+
+    // **bold** and *italic*
     static QRegularExpression boldRx("\\*\\*(.+?)\\*\\*");
     result.replace(boldRx, "<b>\\1</b>");
-
-    // Convert *italic*  (must run after bold so **x** doesn't
-    // get partially matched by the single-* pattern)
     static QRegularExpression italicRx("\\*(.+?)\\*");
     result.replace(italicRx, "<i>\\1</i>");
 
-    // Qt doesn't support border-collapse; cellspacing="0" removes
-    // inter-cell gaps so CSS borders read as a single collapsed border.
+    // Qt table spacing hack
     result.replace("<table>", "<table cellspacing=\"0\">");
 
-    // Convert double-newlines to paragraph breaks (matching Python
-    // markdown library behaviour).  Blocks that already start with
-    // a block-level HTML tag are left as-is; everything else gets
-    // single-newlines → <br> and wrapped in <p>…</p>.
+    // ── Phase 3: unescape safe HTML tags ─────────────────────────────
+    // Phase 1 escaped EVERYTHING.  Now we restore known-safe inline
+    // HTML tags that the LLM might emit directly (e.g. <img>, <br>,
+    // <video>, <svg>, <a>).  The regex matches &lt;tagname...&gt;
+    // for a whitelist of inline/media tags.
+    //
+    // [^<]*? is lazy-scan: there are no literal '<' after toHtmlEscaped
+    // (they all became &lt;), so it scans until the first &gt;.  The
+    // trailing /? captures self-closing <br/> <img ... /> etc.
+    static QRegularExpression unescapeRx(
+        "&lt;(/?)(img|br|video|source|audio|svg|path|circle|rect|line|polyline|polygon|"
+        "ellipse|text|g|defs|clipPath|a|b|i|u|em|strong|code|span|sub|sup|mark|hr)"
+        "([^<]*?/?)&gt;");
+    result.replace(unescapeRx, "<\\1\\2\\3>");
+
+    // ── Phase 4: paragraph wrapping ──────────────────────────────────
     result = paragraphize(result);
 
     return result;
@@ -270,7 +294,9 @@ QString ChatView::paragraphize(const QString& html) const {
                     || p.startsWith("<h1")  || p.startsWith("<h2")
                     || p.startsWith("<h3")  || p.startsWith("<h4")
                     || p.startsWith("<ul")  || p.startsWith("<ol")
-                    || p.startsWith("<li")  || p.startsWith("<blockquote");
+                    || p.startsWith("<li")  || p.startsWith("<blockquote")
+                    || p.startsWith("<img")  || p.startsWith("<video")
+                    || p.startsWith("<svg");
         if (!isBlock) {
             p.replace("\n", "<br>");
             parts[i] = "<p>" + p + "</p>";
@@ -384,9 +410,108 @@ QString ChatView::escapeHtml(const QString& text) const {
 }
 
 QVariant ChatView::loadResource(int type, const QUrl& url) {
-    if (url.scheme().startsWith("http")) {
-        QDesktopServices::openUrl(url);
+    if (type != QTextDocument::ImageResource) {
+        return QTextBrowser::loadResource(type, url);
+    }
+
+    QString urlStr = url.toString();
+
+    // ── HTTP/HTTPS images: cached network fetch ──────────────────────
+    if (urlStr.startsWith("http://") || urlStr.startsWith("https://")) {
+        bool shouldFetch = false;
+        {
+            QMutexLocker lock(&m_imageMutex);
+            if (m_imageCache.contains(urlStr)) {
+                QByteArray data = m_imageCache[urlStr];
+                if (!data.isEmpty()) {
+                    QImage image;
+                    if (image.loadFromData(data)) {
+                        if (image.width() > 600) {
+                            image = image.scaledToWidth(600, Qt::SmoothTransformation);
+                        }
+                        return QVariant::fromValue(image);
+                    }
+                }
+                // Empty data = previously failed, don't retry
+                return QVariant();
+            }
+            if (!m_imagePending.contains(urlStr)) {
+                m_imagePending.insert(urlStr);
+                shouldFetch = true;
+            }
+        }
+
+        if (shouldFetch) {
+            fetchImage(urlStr);
+        }
+        // Not yet loaded — Qt leaves a blank space until re-render
         return QVariant();
     }
+
+    // ── Local file images: load directly from disk ───────────────────
+    if (urlStr.startsWith("file://")) {
+        QString localPath = url.toLocalFile();
+        QImage image;
+        if (image.load(localPath)) {
+            if (image.width() > 600) {
+                image = image.scaledToWidth(600, Qt::SmoothTransformation);
+            }
+            return QVariant::fromValue(image);
+        }
+    }
+
+    // ── Base class for anything else (data URIs, etc.) ───────────────
     return QTextBrowser::loadResource(type, url);
+}
+
+void ChatView::fetchImage(const QString& urlStr) {
+    // Use a background thread to fetch the image
+    auto* thread = QThread::create([this, urlStr]() {
+        QByteArray data;
+        {
+            QNetworkAccessManager mgr;
+            QNetworkRequest req{QUrl(urlStr)};
+            req.setHeader(QNetworkRequest::UserAgentHeader, "PengyAgent/1.0");
+            req.setTransferTimeout(10000);
+
+            QNetworkReply* reply = mgr.get(req);
+            QEventLoop loop;
+            QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+
+            QTimer timer;
+            timer.setSingleShot(true);
+            QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+            timer.start(10000);
+
+            loop.exec();
+
+            if (reply->isFinished() && reply->error() == QNetworkReply::NoError) {
+                data = reply->readAll();
+                if (data.size() > 4 * 1024 * 1024) {
+                    data = data.left(4 * 1024 * 1024);
+                }
+            } else {
+                data = QByteArray(); // empty = failed sentinel
+            }
+            reply->deleteLater();
+        }
+
+        {
+            QMutexLocker lock(&m_imageMutex);
+            m_imageCache[urlStr] = data;
+            m_imagePending.remove(urlStr);
+        }
+
+        // Trigger re-render on the main thread if we got data
+        if (!data.isEmpty()) {
+            QMetaObject::invokeMethod(this, "onImageFetched", Qt::QueuedConnection,
+                                      Q_ARG(QString, urlStr), Q_ARG(QByteArray, data));
+        }
+    });
+    connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+void ChatView::onImageFetched(const QString& /*url*/, const QByteArray& /*data*/) {
+    render();
 }

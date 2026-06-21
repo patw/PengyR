@@ -99,12 +99,11 @@ The Rust core is **statically linked** into the Qt6 binary — a single ~13 MB e
 | Settings dialog + Fetch Models | ✅ | ✅ |
 | Tool confirmation (YOLO / Safe / None) | ✅ | ✅ |
 | Sudo password support | ✅ | ✅ |
-| File attachments (GUI) | ✅ | ❌ |
+| File attachments (GUI) | ✅ | ✅ |
+| Image paste from clipboard | ✅ | ✅ |
+| Image download rendering (Qt) | ✅ | ✅ |
 | CLI (rich-based terminal REPL) | ✅ | ❌ |
 | Web UI (Flask + SSE) | ✅ | ❌ |
-| Skills system | ✅ | ❌ |
-| Image download rendering (Qt) | ✅ | ❌ |
-| Context elision (compact old turns) | ✅ | ❌ |
 
 ## Interoperability
 

@@ -5,6 +5,9 @@
 #include <QJsonValue>
 #include <QSet>
 #include <QMouseEvent>
+#include <QMap>
+#include <QMutex>
+#include <QThread>
 
 class ChatView : public QTextBrowser {
     Q_OBJECT
@@ -20,6 +23,9 @@ protected:
     void mousePressEvent(QMouseEvent* event) override;
     QVariant loadResource(int type, const QUrl& url) override;
 
+private slots:
+    void onImageFetched(const QString& url, const QByteArray& data);
+
 private:
     void render();
     QString buildHtml();
@@ -29,7 +35,13 @@ private:
     QString convertMarkdownTables(const QString& md) const;
     QString paragraphize(const QString& html) const;
     QString escapeHtml(const QString& text) const;
+    void fetchImage(const QString& url);
 
     QJsonArray m_messages;
     QSet<QString> m_expandedTools;
+
+    // Image caching for external HTTP images
+    QMap<QString, QByteArray> m_imageCache;  // url -> raw bytes (empty = failed)
+    QSet<QString> m_imagePending;            // urls currently being fetched
+    QMutex m_imageMutex;
 };

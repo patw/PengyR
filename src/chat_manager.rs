@@ -23,7 +23,7 @@ pub struct Chat {
 pub struct ChatMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,7 +176,7 @@ pub fn clean_dangling_tool_calls(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 pending_ids.remove(&missing_id);
                 cleaned.push(ChatMessage {
                     role: "tool".into(),
-                    content: Some("Tool execution was cancelled by user.".into()),
+                    content: Some(serde_json::Value::String("Tool execution was cancelled by user.".into())),
                     tool_calls: vec![],
                     tool_call_id: Some(missing_id),
                 });
@@ -230,7 +230,7 @@ pub fn elide_old_tool_results(messages: &[ChatMessage], keep_turns: usize) -> Ve
         .map(|(idx, msg)| {
             if msg.role == "tool" && !recent_indices.contains(&idx) {
                 ChatMessage {
-                    content: Some("[tool output from earlier turn elided]".into()),
+                    content: Some(serde_json::Value::String("[tool output from earlier turn elided]".into())),
                     ..msg.clone()
                 }
             } else {
