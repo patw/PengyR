@@ -254,6 +254,22 @@ QString ChatView::markdownToHtml(const QString& md) const {
     // Markdown tables
     result = convertMarkdownTables(result);
 
+    // Headings (# … ######) — must be at line start; process back-to-front
+    {
+        static QRegularExpression headingRx("^(#{1,6})\\s+(.+)$",
+                                            QRegularExpression::MultilineOption);
+        QList<QRegularExpressionMatch> matches;
+        QRegularExpressionMatchIterator it = headingRx.globalMatch(result);
+        while (it.hasNext()) matches.append(it.next());
+        for (int i = matches.size() - 1; i >= 0; --i) {
+            const QRegularExpressionMatch &m = matches[i];
+            int level = m.captured(1).length();
+            QString tag = QString("h%1").arg(level);
+            result.replace(m.capturedStart(), m.capturedLength(),
+                           "<" + tag + ">" + m.captured(2) + "</" + tag + ">");
+        }
+    }
+
     // **bold** and *italic*
     static QRegularExpression boldRx("\\*\\*(.+?)\\*\\*");
     result.replace(boldRx, "<b>\\1</b>");
