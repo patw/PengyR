@@ -1,0 +1,44 @@
+#pragma once
+#include <QWidget>
+#include <QListWidget>
+#include <QPushButton>
+#include <QLabel>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QTimer>
+
+class ChatHistoryWidget : public QWidget {
+    Q_OBJECT
+public:
+    explicit ChatHistoryWidget(QWidget* parent = nullptr);
+
+    void loadChats(const QJsonArray& chats);
+    void selectChatById(const QString& id);
+    void updateChatTitle(const QString& id, const QString& title);
+    void updateQuickSettings(const QString& model, const QString& confirm);
+    void updateTokenUsage(int prompt, int completion);
+    void setThinking(bool thinking);
+    void setToolRunning(bool running);
+
+signals:
+    void chatSelected(const QString& id);
+    void newChatRequested();
+    void settingsRequested();
+    void deleteRequested(const QString& id);
+
+private:
+    void setupUi();
+    void onItemClicked(QListWidgetItem* item);
+    void blinkDot();
+
+    QPushButton* m_newChatBtn;
+    QPushButton* m_settingsBtn;
+    QListWidget* m_chatList;
+    QLabel* m_statusDot;
+    QLabel* m_statusText;
+    QLabel* m_modelLabel;
+    QLabel* m_confirmLabel;
+    QLabel* m_tokensLabel;
+    QTimer* m_blinkTimer;
+    bool m_dotPhase = true;
+};

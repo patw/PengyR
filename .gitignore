@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target
+
+# C++ / CMake build
+gui/build/
+
+# AppImage output
+PengyR-x86_64.AppImage
+appimage/PengyR.AppDir/
+appimage/tools/
+
+# macOS
+*.app
+*.dSYM
+
+# Windows
+*.exe
+PengyR-Windows/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+CLAUDE.md
