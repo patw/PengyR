@@ -4,10 +4,10 @@
 //! Events are reported via callback. Tool confirmations block
 //! on a condition variable that the Qt main thread signals.
 
-mod config;
-mod chat_manager;
-mod tools;
-mod llm_client;
+pub mod config;
+pub mod chat_manager;
+pub mod tools;
+pub mod llm_client;
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};

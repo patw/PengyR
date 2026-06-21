@@ -1,0 +1,18 @@
+[package]
+name = "pengy-web"
+version = "2.0.0"
+edition = "2021"
+description = "Pengy Web UI — browser-based interface"
+
+[[bin]]
+name = "pengy-web"
+path = "src/main.rs"
+
+[dependencies]
+pengy_core = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.7"
+futures-util = "0.3"
+regex = "1"

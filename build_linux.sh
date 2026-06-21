@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-echo "==> Building Rust core (release)..."
+echo "==> Building Rust core + CLI + Web (release)..."
 cargo build --release
 
 echo "==> Building Qt6 GUI..."
@@ -16,7 +16,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
 echo ""
-echo "==> Done! Binary: gui/build/pengy"
-echo "==> Run with: ./gui/build/pengy"
+echo "==> Done!"
+echo "    GUI: gui/build/pengy"
+echo "    CLI: target/release/pengy-cli"
+echo "    Web: target/release/pengy-web [port]"
 echo ""
+echo "==> Run with: ./gui/build/pengy"
 echo "==> To create AppImage: cd appimage && ./build.sh"

@@ -1,0 +1,19 @@
+[package]
+name = "pengy-cli"
+version = "2.0.0"
+edition = "2021"
+description = "Pengy CLI — command-line interface"
+
+[[bin]]
+name = "pengy-cli"
+path = "src/main.rs"
+
+[dependencies]
+pengy_core = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+rpassword = "7"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"

@@ -2,7 +2,7 @@
 
 ## Overview
 
-PengyR is an experimental Rust + Qt6 rewrite of Pengy — a local-first AI agent desktop application that connects to any OpenAI-compatible LLM API and gives the model a set of tools to operate on the user's machine.
+PengyR is a Rust rewrite of Pengy — a local-first AI agent application that connects to any OpenAI-compatible LLM API and gives the model a set of tools to operate on the user's machine. Three frontends: Qt6 desktop GUI, CLI, and Web UI.
 
 > PengyR shares `~/.config/pengy/` with the stable Python Pengy. Settings and chat history are fully interoperable between both applications.
 
@@ -12,9 +12,11 @@ PengyR is an experimental Rust + Qt6 rewrite of Pengy — a local-first AI agent
 
 - **Core Language:** Rust (stable, edition 2021)
 - **GUI Framework:** Qt6 via C++17 (CMake build)
+- **CLI:** Rust binary with ANSI terminal output, rpassword for sudo
+- **Web UI:** Axum + SSE streaming, Bootstrap 5 (CDN)
 - **Async Runtime:** tokio (multi-threaded, 4 workers)
 - **LLM Client:** `reqwest` (HTTP/HTTPS) + `serde_json` (OpenAI API types)
-- **Markdown Rendering:** Qt's built-in QTextBrowser markdown subset + custom regex transforms
+- **Markdown Rendering:** Qt's built-in QTextBrowser markdown subset + custom regex transforms (GUI); simple regex-based converter (Web)
 - **FFI Boundary:** Rust `extern "C"` → C++ header `pengy_ffi.h`
 - **Storage:** JSON files in `~/.config/pengy/` (shared with Python Pengy)
 
@@ -23,42 +25,49 @@ PengyR is an experimental Rust + Qt6 rewrite of Pengy — a local-first AI agent
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  Qt6 GUI (C++17)                                     │
-│  ┌─────────────┐  ┌──────────┐  ┌────────────────┐  │
-│  │ ChatHistory │  │ ChatView │  │ ChatInput      │  │
-│  │ (sidebar)   │  │ (QTB)    │  │ (QPlainTextEdit)│  │
-│  └─────────────┘  └──────────┘  └────────────────┘  │
-│  ┌──────────────────────────────────────────────┐   │
-│  │ MainWindow — orchestrates signals/slots      │   │
-│  └──────────────────────────────────────────────┘   │
-│  ┌──────────────────────────────────────────────┐   │
-│  │ ChatWorker (QThread) — calls into Rust FFI   │   │
-│  └──────────────────────────────────────────────┘   │
-├──────────────────────────────────────────────────────┤
-│  C FFI Boundary (lib.rs — 20 extern "C" functions)  │
-├──────────────────────────────────────────────────────┤
-│  Rust Core (static library)                          │
-│  ┌──────────┐ ┌───────────┐ ┌──────────┐           │
-│  │ config   │ │ chat_mgr  │ │ tools    │           │
-│  └──────────┘ └───────────┘ └──────────┘           │
-│  ┌──────────────────────────────────────┐           │
-│  │ llm_client (tokio async chat loop)   │           │
-│  └──────────────────────────────────────┘           │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  Frontends                                                          │
+│                                                                     │
+│  ┌─ Qt6 GUI (C++17) ─────────────┐  ┌─ CLI (Rust) ──────────────┐ │
+│  │ ChatHistory / ChatView /       │  │ Interactive REPL           │ │
+│  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
+│  │ ChatWorker (QThread → FFI)     │  │ 18 slash commands          │ │
+│  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
+│               │ C FFI (20 extern "C")             │ direct Rust    │
+│               │                                    │                │
+│  ┌─ Web UI (Rust/Axum) ──────────┐                │                │
+│  │ Bootstrap 5 + SSE streaming    │                │                │
+│  │ WebWorker per active chat      │                │                │
+│  └────────────┬───────────────────┘                │                │
+│               │ direct Rust                        │                │
+├───────────────┴────────────────────────────────────┴────────────────┤
+│  Rust Core Library (pengy_core)                                     │
+│  ┌──────────┐ ┌──────────────┐ ┌──────────┐                       │
+│  │ config   │ │ chat_manager │ │ tools    │                       │
+│  └──────────┘ └──────────────┘ └──────────┘                       │
+│  ┌──────────────────────────────────────────┐                      │
+│  │ llm_client (tokio async chat loop)       │                      │
+│  └──────────────────────────────────────────┘                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Source Layout
 
 ```
 PengyR/
-├── Cargo.toml                  # Rust library crate definition
+├── Cargo.toml                  # Workspace root + Rust core library
 ├── src/
-│   ├── lib.rs                  # C FFI exports + global tokio runtime
+│   ├── lib.rs                  # Public modules + C FFI exports + global tokio runtime
 │   ├── config.rs               # Settings load/save + system message rendering
 │   ├── chat_manager.rs         # Chat session CRUD + message cleaning
 │   ├── tools.rs                # 11 OpenAI function-calling tools
 │   └── llm_client.rs           # Async LLM chat generator (tokio channels)
+├── cli/                        # CLI binary (pengy-cli)
+│   ├── Cargo.toml
+│   └── src/main.rs             # Interactive REPL + single-shot mode + slash commands
+├── web/                        # Web UI binary (pengy-web)
+│   ├── Cargo.toml
+│   └── src/main.rs             # Axum server + SSE + Bootstrap 5 UI
 ├── gui/
 │   ├── CMakeLists.txt          # Cross-platform CMake (finds Qt6 + Rust lib)
 │   ├── pengy_ffi.h             # C type declarations matching Rust FFI
@@ -69,10 +78,11 @@ PengyR/
 │   ├── chatinput.cpp/h         # Right-bottom — message input
 │   ├── chatworker.cpp/h        # QThread worker — calls pengy_llm_chat_run()
 │   └── settingsdialog.cpp/h    # Settings modal + Fetch Models button
-└── appimage/
-    ├── build.sh                # Bundles PengyR-x86_64.AppImage
-    ├── pengy.desktop           # Linux desktop entry
-    └── pengy.png               # App icon (256×256)
+├── appimage/
+│   ├── build.sh                # Bundles PengyR-x86_64.AppImage
+│   ├── pengy.desktop           # Linux desktop entry
+│   └── pengy.png               # App icon (256×256)
+└── install.sh                  # Install CLI + Web to ~/.local/bin/
 ```
 
 ---
@@ -112,15 +122,20 @@ The Rust core exposes 20 C functions via `extern "C"`. The C++ GUI includes `pen
 
 | Function | Signature |
 |----------|-----------|
-| `pengy_llm_chat_run` | `(base_url, api_key, model, messages_json, tool_confirmation, confirm_state, on_event_cb, userdata) → bool` |
+| `pengy_llm_chat_run` | `(base_url, api_key, model, messages_json, tool_confirmation, confirm_state, sudo_state, on_event_cb, userdata) → bool` |
 
-This is the main conversation driver. Called from a `QThread`, it blocks until the conversation completes. Events (`tool_request`, `tool_result`, `assistant_tool_calls`, `final_response`) are reported via the C callback `on_event`. Tool confirmation uses a shared `ConfirmState` struct that the Qt main thread signals via `sendConfirmation()`.
+This is the FFI conversation driver used by the Qt GUI. Called from a `QThread`, it blocks until the conversation completes. Events (`tool_request`, `tool_result`, `assistant_tool_calls`, `final_response`) are reported via the C callback `on_event`. Tool confirmation uses a shared `ConfirmState` struct that the Qt main thread signals via `sendConfirmation()`. The CLI and Web frontends bypass this FFI layer and call `llm_client::chat()` directly via tokio channels.
 
 ```c
 typedef struct {
     int32_t status;     // 0=idle, 1=pending, 2=confirmed, 3=declined
     bool yolo_turn;     // "Yes to all this turn" flag
 } ConfirmState;
+
+typedef struct {
+    int32_t status;         // 0=idle, 1=pending, 2=provided, 3=cancelled
+    uint8_t password[256];  // null-terminated password buffer
+} SudoState;
 ```
 
 ### Memory Management
@@ -185,6 +200,54 @@ Tool calls are stored as unified `tool_block` messages (not separate `tool_reque
 
 ---
 
+## CLI Interface
+
+The CLI binary (`pengy-cli`) provides an interactive REPL and single-shot mode. It uses the Rust core directly (no FFI).
+
+### Modes
+
+- **Interactive:** `pengy-cli` — loads the most recent chat, enters a read-eval-print loop
+- **Single-shot:** `pengy-cli "question"` — sends one message, prints the response, exits
+- **No-save:** `pengy-cli --no-save "question"` — single-shot without persisting to chat history
+
+### Slash Commands
+
+`/help`, `/new`, `/config`, `/model <name>`, `/models`, `/baseurl <url>`, `/apikey <key>`, `/timeout <sec>`, `/agent <string>`, `/context-keep <n>`, `/yolo [all|safe|none]`, `/system [message]`, `/compact`, `/list`, `/load <index>`, `/delete <index>`, `/attach`, `/quit`
+
+### File Attachments
+
+The `@path/to/file` syntax anywhere in a message reads the file's contents and injects it as a fenced code block before the user's prompt.
+
+---
+
+## Web Interface
+
+The Web binary (`pengy-web [port]`) runs an Axum HTTP server (default port 5000) with a Bootstrap 5 UI.
+
+### Routes
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/` | Redirect to most recent chat |
+| POST | `/chat/new` | Create chat and redirect |
+| GET | `/chat/:id` | Render chat page (server-side) |
+| POST | `/chat/:id/send` | Start LLM processing |
+| GET | `/chat/:id/stream` | SSE event stream |
+| POST | `/chat/:id/confirm` | Tool confirmation response |
+| POST | `/chat/:id/sudo` | Sudo password response |
+| POST | `/chat/:id/delete` | Delete chat |
+| GET/POST | `/settings` | View/save settings |
+
+### SSE Event Types
+
+`tool_request`, `tool_result`, `final_response`, `sudo_request`, `error`
+
+### Worker Model
+
+Each active chat gets a `WebWorker` that spawns a tokio task driving `llm_client::chat()`. The worker forwards `LlmEvent`s to an SSE channel and receives confirmations/sudo passwords via a command channel. Workers are stored in a shared `HashMap<String, Arc<WebWorker>>` and cleaned up when the SSE stream drains.
+
+---
+
 ## Tool Confirmation Flow
 
 ```
@@ -204,7 +267,11 @@ LLM responds with tool_calls
               └── Decline              → "Tool execution was declined by user." → loop
 ```
 
-The `ChatWorker` (on a `QThread`) calls `pengy_llm_chat_run()` which blocks when it needs tool confirmation. The Rust side sets `ConfirmState.status = 1` (pending) and spins. The Qt main thread shows a modal dialog and on user choice sets `status = 2` (confirmed) or `3` (declined). The Rust side unblocks, reads the result, and continues.
+Each frontend handles tool confirmation differently:
+
+- **GUI:** The `ChatWorker` (on a `QThread`) calls `pengy_llm_chat_run()` which blocks when it needs tool confirmation. The Rust side sets `ConfirmState.status = 1` (pending) and spins (5ms). The Qt main thread shows a modal dialog and on user choice sets `status = 2` (confirmed) or `3` (declined).
+- **CLI:** The main thread calls `blocking_recv()` on the event channel. When a `ToolRequest` arrives that needs confirmation, it prompts the user (1/2/3) and sends the result on the confirm channel.
+- **Web:** The `WebWorker` task receives events and forwards them as SSE. When confirmation is needed, it blocks on a command channel. The browser POSTs to `/chat/:id/confirm` which sends the command.
 
 ---
 
@@ -266,10 +333,15 @@ Tool execution runs on the tokio runtime via `tokio::task::spawn_blocking` for C
 
 ```bash
 ./build_linux.sh
-# → gui/build/pengy  (~13 MB, links Rust statically, Qt6 dynamically)
+# → gui/build/pengy          (~13 MB, links Rust statically, Qt6 dynamically)
+# → target/release/pengy-cli  (standalone binary)
+# → target/release/pengy-web  (standalone binary)
+
+# Install CLI + Web to ~/.local/bin/
+./install.sh --prebuilt
 ```
 
-### Linux AppImage
+### Linux AppImage (GUI only)
 
 ```bash
 ./build_linux.sh
@@ -319,24 +391,37 @@ build_windows.bat
 
 **Sudo via `-S`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, pass it to `sudo -S`. Password cached in memory for the session. No PTY complexity.
 
+**Cargo workspace for multi-binary:** The core is a library crate (`lib` + `staticlib` + `cdylib`) at the workspace root. CLI and Web are separate binary crates in `cli/` and `web/` that depend on the core via `path = ".."`. This lets `cargo build --release` produce all three outputs, while CMake still finds `libpengy_core.a` in `target/release/` for the GUI.
+
+**CLI with no TUI framework:** The CLI uses raw ANSI escape codes for colors instead of a TUI library. This keeps the binary small and avoids terminal compatibility issues. Readline-style editing is left to the user's shell.
+
+**Web with embedded templates:** The Web UI embeds all HTML as Rust string-building functions instead of using a template engine. This avoids a build-time dependency and keeps the entire web server in a single file. The HTML/CSS/JS is ported directly from the Python Pengy Flask templates.
+
 ---
 
-## Feature Gaps (vs Python Pengy)
+## Feature Parity (vs Python Pengy)
 
 | Feature | Status | Notes |
 |---------|:---:|-------|
-| File attachments (GUI) | ❌ | Not yet ported |
-| CLI (rich-based terminal REPL) | ❌ | Python-only; would need a Rust CLI frontend |
-| Web UI (Flask + SSE) | ❌ | Python-only |
-| Skills system | ❌ | `skill_index.md` + skill scripts not supported |
-| Image download rendering | ❌ | QTextBrowser `loadResource` not yet connected to async HTTP fetch |
-| Context elision | ❌ | `elide_old_tool_results` exists in Rust but not wired to config |
+| OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
+| 11 tools | ✅ | All tools ported |
+| Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
+| CLI (interactive REPL + single-shot) | ✅ | 18 slash commands, @path attachments |
+| Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |
+| File attachments (GUI) | ✅ | Image + text file support |
+| Image paste from clipboard | ✅ | |
+| Image download rendering | ✅ | Async HTTP fetch in QTextBrowser |
+| Tool confirmation (YOLO/Safe/None) | ✅ | All three frontends |
+| Sudo password support | ✅ | All three frontends |
+| Context elision | ✅ | `elide_old_tool_results` wired to config |
+| Settings dialog + Fetch Models | ✅ | GUI dialog + Web settings page + CLI `/config` |
+| Skills system | N/A | Skills are markdown docs loaded via system message — works if the app works |
 
 ---
 
 ## Dependencies
 
-### Rust (Cargo.toml)
+### Rust Core (Cargo.toml)
 
 | Crate | Purpose |
 |-------|---------|
@@ -344,7 +429,27 @@ build_windows.bat
 | `reqwest` | HTTP client (rustls-tls) |
 | `serde` / `serde_json` | JSON serialization |
 | `scraper` | HTML parsing for `fetch_url` |
-| `sha2` | File hashing for cache keys |
+| `regex` | Pattern matching in tools and markdown |
+| `walkdir` | Directory tree traversal |
+| `chrono` | Date/time for system message templates |
+| `uuid` | Chat session IDs |
+| `dirs` | XDG config directory resolution |
+
+### CLI (cli/Cargo.toml)
+
+| Crate | Purpose |
+|-------|---------|
+| `rpassword` | Secure sudo password input (no echo) |
+| `reqwest` | `/models` endpoint fetch |
+| `regex` | @path file attachment resolution |
+
+### Web (web/Cargo.toml)
+
+| Crate | Purpose |
+|-------|---------|
+| `axum` | HTTP framework (routing, SSE, forms) |
+| `futures-util` | Stream construction for SSE |
+| `regex` | Markdown-to-HTML conversion |
 
 ### C++ (CMakeLists.txt)
 

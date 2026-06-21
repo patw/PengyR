@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "cli", "web"]
+
 [package]
 name = "pengy_core"
 version = "2.0.0"
@@ -5,7 +8,7 @@ edition = "2021"
 description = "Pengy core library — config, chat, tools, LLM client"
 
 [lib]
-crate-type = ["staticlib", "cdylib"]
+crate-type = ["lib", "staticlib", "cdylib"]
 
 # Windows-specific: needed for static linking on MSVC
 [target.'cfg(target_os = "windows")'.dependencies]
