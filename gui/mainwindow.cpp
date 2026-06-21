@@ -311,6 +311,7 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
 void MainWindow::processResponse(const QJsonArray& apiMessages) {
     // Cancel any existing worker
     if (m_worker) {
+        disconnect(m_worker, nullptr, this, nullptr);
         m_worker->cancel();
         if (m_workerThread) {
             m_workerThread->quit();
@@ -352,6 +353,9 @@ void MainWindow::processResponse(const QJsonArray& apiMessages) {
 }
 
 void MainWindow::onWorkerEvent(const QString& eventJson) {
+    auto* s = qobject_cast<ChatWorker*>(sender());
+    if (s && s != m_worker) return;
+
     QJsonObject event = QJsonDocument::fromJson(eventJson.toUtf8()).object();
     QString type = event["type"].toString();
 
@@ -471,6 +475,9 @@ void MainWindow::pollToolConfirmation() {
 }
 
 void MainWindow::onWorkerFinished() {
+    auto* s = qobject_cast<ChatWorker*>(sender());
+    if (s && s != m_worker) return;
+
     m_stopBtn->hide();
     m_chatHistory->setThinking(false);
     m_confirmTimer->stop();
@@ -482,12 +489,16 @@ void MainWindow::onWorkerFinished() {
         m_workerThread = nullptr;
     }
     if (m_worker) {
+        disconnect(m_worker, nullptr, this, nullptr);
         m_worker->deleteLater();
         m_worker = nullptr;
     }
 }
 
 void MainWindow::onWorkerError(const QString& msg) {
+    auto* s = qobject_cast<ChatWorker*>(sender());
+    if (s && s != m_worker) return;
+
     m_chatView->appendMessageText("assistant", "Error: " + msg);
     onWorkerFinished();
 }

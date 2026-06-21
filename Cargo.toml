@@ -41,6 +41,9 @@ url = "2"
 walkdir = "2"
 scraper = "0.21"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 2
 lto = true

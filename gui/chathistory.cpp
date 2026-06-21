@@ -1,8 +1,16 @@
 #include "chathistory.h"
+#include "pengy_ffi.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFrame>
-#include <QFont>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QFileDialog>
+#include <QFile>
+#include <QTextStream>
+#include <QDir>
+#include <QRegularExpression>
 
 ChatHistoryWidget::ChatHistoryWidget(QWidget* parent) : QWidget(parent) {
     setupUi();
@@ -33,13 +41,12 @@ void ChatHistoryWidget::setupUi() {
     layout->addSpacing(4);
 
     m_chatList = new QListWidget;
-    m_chatList->setStyleSheet("QListWidget::item { padding: 4px; }");
+    m_chatList->setStyleSheet("QListWidget::item { padding: 2px; }");
     connect(m_chatList, &QListWidget::itemClicked, this, &ChatHistoryWidget::onItemClicked);
     layout->addWidget(m_chatList, 1);
 
     layout->addSpacing(8);
 
-    // Quick Settings panel
     auto* qsFrame = new QFrame;
     qsFrame->setFrameShape(QFrame::StyledPanel);
     auto* qsLayout = new QVBoxLayout(qsFrame);
@@ -84,13 +91,55 @@ void ChatHistoryWidget::setupUi() {
     connect(m_blinkTimer, &QTimer::timeout, this, &ChatHistoryWidget::blinkDot);
 }
 
+QWidget* ChatHistoryWidget::makeItemWidget(const QString& id, const QString& title) {
+    auto* w = new QWidget;
+    auto* layout = new QHBoxLayout(w);
+    layout->setContentsMargins(4, 2, 2, 2);
+    layout->setSpacing(2);
+
+    auto* label = new QLabel(title);
+    label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    layout->addWidget(label, 1);
+
+    static const char* btnStyle =
+        "QPushButton {"
+        "  background-color: transparent;"
+        "  border: none;"
+        "  border-radius: 4px;"
+        "  font-size: 13px;"
+        "  padding: 0px;"
+        "}"
+        "QPushButton:hover { background-color: #cccccc; }";
+
+    auto* saveBtn = new QPushButton("💾");
+    saveBtn->setFixedSize(24, 24);
+    saveBtn->setToolTip("Save chat as Markdown");
+    saveBtn->setStyleSheet(btnStyle);
+    connect(saveBtn, &QPushButton::clicked, this, [this, id]() { saveChatMarkdown(id); });
+    layout->addWidget(saveBtn);
+
+    auto* delBtn = new QPushButton("🗑");
+    delBtn->setFixedSize(24, 24);
+    delBtn->setToolTip("Delete chat");
+    delBtn->setStyleSheet(btnStyle);
+    connect(delBtn, &QPushButton::clicked, this, [this, id]() { emit deleteRequested(id); });
+    layout->addWidget(delBtn);
+
+    return w;
+}
+
 void ChatHistoryWidget::loadChats(const QJsonArray& chats) {
     m_chatList->clear();
     for (const QJsonValue& v : chats) {
         QJsonObject chat = v.toObject();
-        auto* item = new QListWidgetItem(chat["title"].toString());
-        item->setData(Qt::UserRole, chat["id"].toString());
+        QString id    = chat["id"].toString();
+        QString title = chat["title"].toString();
+        auto* item   = new QListWidgetItem;
+        item->setData(Qt::UserRole, id);
+        auto* widget = makeItemWidget(id, title);
+        item->setSizeHint(QSize(0, qMax(widget->sizeHint().height(), 32)));
         m_chatList->addItem(item);
+        m_chatList->setItemWidget(item, widget);
     }
 }
 
@@ -105,11 +154,54 @@ void ChatHistoryWidget::selectChatById(const QString& id) {
 
 void ChatHistoryWidget::updateChatTitle(const QString& id, const QString& title) {
     for (int i = 0; i < m_chatList->count(); i++) {
-        if (m_chatList->item(i)->data(Qt::UserRole).toString() == id) {
-            m_chatList->item(i)->setText(title);
+        auto* item = m_chatList->item(i);
+        if (item->data(Qt::UserRole).toString() == id) {
+            auto* w = m_chatList->itemWidget(item);
+            if (w) {
+                auto* label = w->findChild<QLabel*>();
+                if (label) label->setText(title);
+            }
             return;
         }
     }
+}
+
+void ChatHistoryWidget::saveChatMarkdown(const QString& id) {
+    char* raw = pengy_chat_get(id.toUtf8().constData());
+    if (!raw) return;
+    QJsonObject chat = QJsonDocument::fromJson(QByteArray(raw)).object();
+    pengy_free(raw);
+    if (chat.isEmpty()) return;
+
+    QString title    = chat["title"].toString();
+    QJsonArray messages = chat["messages"].toArray();
+
+    QString md = "# " + title + "\n\n";
+    for (const QJsonValue& v : messages) {
+        QJsonObject msg  = v.toObject();
+        QString role     = msg["role"].toString();
+        QString content  = msg["content"].toString();
+        if (role == "user" && !content.isEmpty()) {
+            md += "**You**\n\n" + content + "\n\n---\n\n";
+        } else if (role == "assistant" && !content.isEmpty()) {
+            md += "**Assistant**\n\n" + content + "\n\n---\n\n";
+        }
+    }
+
+    QString safe = title;
+    safe.replace(QRegularExpression(R"([/\\:*?"<>|])"), "_");
+    safe = safe.trimmed();
+    if (safe.isEmpty()) safe = "chat";
+
+    QString path = QFileDialog::getSaveFileName(
+        this, "Save Chat as Markdown",
+        QDir::homePath() + "/" + safe + ".md",
+        "Markdown (*.md)");
+    if (path.isEmpty()) return;
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return;
+    QTextStream(&f) << md;
 }
 
 void ChatHistoryWidget::onItemClicked(QListWidgetItem* item) {
@@ -151,16 +243,15 @@ void ChatHistoryWidget::blinkDot() {
 void ChatHistoryWidget::updateQuickSettings(const QString& model, const QString& confirm) {
     m_modelLabel->setText("Model: " + model);
     QString label;
-    if (confirm == "all") label = "Tool Confirm: YOLO";
+    if (confirm == "all")       label = "Tool Confirm: YOLO";
     else if (confirm == "safe") label = "Tool Confirm: Safe";
-    else label = "Tool Confirm: None";
+    else                        label = "Tool Confirm: None";
     m_confirmLabel->setText(label);
 }
 
 void ChatHistoryWidget::updateTokenUsage(int prompt, int completion) {
-    if (prompt || completion) {
+    if (prompt || completion)
         m_tokensLabel->setText(QString("Tokens: %1 in / %2 out").arg(prompt).arg(completion));
-    } else {
+    else
         m_tokensLabel->setText("Tokens: —");
-    }
 }

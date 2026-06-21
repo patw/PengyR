@@ -27,9 +27,11 @@ signals:
     void deleteRequested(const QString& id);
 
 private:
-    void setupUi();
-    void onItemClicked(QListWidgetItem* item);
-    void blinkDot();
+    void     setupUi();
+    QWidget* makeItemWidget(const QString& id, const QString& title);
+    void     saveChatMarkdown(const QString& id);
+    void     onItemClicked(QListWidgetItem* item);
+    void     blinkDot();
 
     QPushButton* m_newChatBtn;
     QPushButton* m_settingsBtn;

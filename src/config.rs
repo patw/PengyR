@@ -213,3 +213,113 @@ fn hostname() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_default_has_expected_values() {
+        let c = Config::default();
+        assert_eq!(c.base_url, "https://api.openai.com/v1");
+        assert_eq!(c.model, "gpt-4o");
+        assert_eq!(c.tool_confirmation, "none");
+        assert_eq!(c.ui_scale, 100);
+        assert_eq!(c.tool_timeout, 60);
+        assert_eq!(c.context_keep_turns, 0);
+        assert!(c.api_key.is_empty());
+    }
+
+    #[test]
+    fn config_serde_round_trip() {
+        let c = Config {
+            base_url: "http://localhost:8080/v1".into(),
+            api_key: "sk-test".into(),
+            model: "llama3".into(),
+            system_message: "You are {username}".into(),
+            tool_confirmation: "safe".into(),
+            context_keep_turns: 5,
+            ui_scale: 150,
+            user_agent: "TestAgent/1.0".into(),
+            tool_timeout: 120,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let c2: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(c2.base_url, c.base_url);
+        assert_eq!(c2.api_key, c.api_key);
+        assert_eq!(c2.model, c.model);
+        assert_eq!(c2.tool_confirmation, c.tool_confirmation);
+        assert_eq!(c2.context_keep_turns, c.context_keep_turns);
+        assert_eq!(c2.ui_scale, c.ui_scale);
+        assert_eq!(c2.tool_timeout, c.tool_timeout);
+    }
+
+    #[test]
+    fn config_deserialize_with_missing_fields_uses_defaults() {
+        let json = r#"{"api_key": "sk-test", "model": "custom-model"}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.api_key, "sk-test");
+        assert_eq!(c.model, "custom-model");
+        assert_eq!(c.base_url, "https://api.openai.com/v1");
+        assert_eq!(c.tool_confirmation, "none");
+        assert_eq!(c.ui_scale, 100);
+        assert_eq!(c.tool_timeout, 60);
+    }
+
+    #[test]
+    fn config_deserialize_empty_object_uses_all_defaults() {
+        let c: Config = serde_json::from_str("{}").unwrap();
+        let d = Config::default();
+        assert_eq!(c.base_url, d.base_url);
+        assert_eq!(c.model, d.model);
+        assert_eq!(c.tool_confirmation, d.tool_confirmation);
+        assert_eq!(c.ui_scale, d.ui_scale);
+    }
+
+    #[test]
+    fn render_system_message_replaces_all_placeholders() {
+        let template = "Date: {date}, User: {username}, Host: {hostname}, OS: {osinfo}";
+        let rendered = render_system_message(template);
+        assert!(!rendered.contains("{date}"));
+        assert!(!rendered.contains("{username}"));
+        assert!(!rendered.contains("{hostname}"));
+        assert!(!rendered.contains("{osinfo}"));
+    }
+
+    #[test]
+    fn render_system_message_no_placeholders_unchanged() {
+        let template = "Hello, world!";
+        assert_eq!(render_system_message(template), "Hello, world!");
+    }
+
+    #[test]
+    fn render_system_message_empty_string() {
+        assert_eq!(render_system_message(""), "");
+    }
+
+    #[test]
+    fn render_system_message_contains_os_info() {
+        let rendered = render_system_message("{osinfo}");
+        assert!(rendered.contains(std::env::consts::OS));
+        assert!(rendered.contains(std::env::consts::ARCH));
+    }
+
+    #[test]
+    fn config_save_and_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let c = Config {
+            base_url: "http://test:1234/v1".into(),
+            api_key: "sk-round-trip".into(),
+            model: "test-model".into(),
+            ..Config::default()
+        };
+        let json = serde_json::to_string_pretty(&c).unwrap();
+        fs::write(&path, &json).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let c2: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(c2.base_url, "http://test:1234/v1");
+        assert_eq!(c2.api_key, "sk-round-trip");
+        assert_eq!(c2.model, "test-model");
+    }
+}

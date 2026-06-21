@@ -63,7 +63,9 @@ void ChatWorker::run() {
         callback, this
     );
 
-    if (!ok && !m_cancelled) {
+    if (m_cancelled) return;
+
+    if (!ok) {
         emit errorOccurred("LLM chat failed");
     }
     emit finished();

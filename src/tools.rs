@@ -1147,3 +1147,489 @@ fn simple_glob_match(name: &str, pattern: &str) -> bool {
         .map(|re| re.is_match(name))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // ── is_readonly_tool ───────────────────────────────────────────
+
+    #[test]
+    fn readonly_tools_classified_correctly() {
+        assert!(is_readonly_tool("read_file"));
+        assert!(is_readonly_tool("read_multiple_files"));
+        assert!(is_readonly_tool("directory_tree"));
+        assert!(is_readonly_tool("search_content"));
+        assert!(is_readonly_tool("web_search"));
+        assert!(is_readonly_tool("fetch_url"));
+    }
+
+    #[test]
+    fn write_tools_not_readonly() {
+        assert!(!is_readonly_tool("write_file"));
+        assert!(!is_readonly_tool("replace_in_file"));
+        assert!(!is_readonly_tool("run_bash"));
+        assert!(!is_readonly_tool("run_python"));
+        assert!(!is_readonly_tool("download_file"));
+    }
+
+    #[test]
+    fn unknown_tool_not_readonly() {
+        assert!(!is_readonly_tool("nonexistent_tool"));
+        assert!(!is_readonly_tool(""));
+    }
+
+    // ── tool_definitions ───────────────────────────────────────────
+
+    #[test]
+    fn tool_definitions_has_eleven_tools() {
+        assert_eq!(tool_definitions().len(), 11);
+    }
+
+    #[test]
+    fn tool_definitions_all_have_function_type() {
+        for td in tool_definitions() {
+            assert_eq!(td.tool_type, "function");
+        }
+    }
+
+    #[test]
+    fn tool_definitions_names_are_unique() {
+        let names: HashSet<String> = tool_definitions()
+            .iter()
+            .map(|t| t.function.name.clone())
+            .collect();
+        assert_eq!(names.len(), 11);
+    }
+
+    #[test]
+    fn tool_definitions_all_have_required_fields() {
+        for td in tool_definitions() {
+            assert!(!td.function.name.is_empty());
+            assert!(!td.function.description.is_empty());
+            assert!(!td.function.parameters.required.is_empty());
+            assert_eq!(td.function.parameters.param_type, "object");
+        }
+    }
+
+    #[test]
+    fn tool_definitions_serializes_to_valid_json() {
+        let defs = tool_definitions();
+        let json = serde_json::to_string(&defs).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_array());
+        assert_eq!(parsed.as_array().unwrap().len(), 11);
+    }
+
+    // ── expand_home ────────────────────────────────────────────────
+
+    #[test]
+    fn expand_home_tilde_slash() {
+        let result = expand_home("~/Documents/test.txt");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home.join("Documents/test.txt"));
+    }
+
+    #[test]
+    fn expand_home_tilde_only() {
+        let result = expand_home("~");
+        assert_eq!(result, dirs::home_dir().unwrap());
+    }
+
+    #[test]
+    fn expand_home_absolute_path_unchanged() {
+        let result = expand_home("/tmp/test.txt");
+        assert_eq!(result, PathBuf::from("/tmp/test.txt"));
+    }
+
+    #[test]
+    fn expand_home_relative_path_unchanged() {
+        let result = expand_home("relative/path.txt");
+        assert_eq!(result, PathBuf::from("relative/path.txt"));
+    }
+
+    // ── format_size ────────────────────────────────────────────────
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_size_kilobytes() {
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn format_size_megabytes() {
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn format_size_gigabytes() {
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    // ── urlencoding ────────────────────────────────────────────────
+
+    #[test]
+    fn urlencoding_plain_text() {
+        assert_eq!(urlencoding("hello"), "hello");
+    }
+
+    #[test]
+    fn urlencoding_spaces_become_plus() {
+        assert_eq!(urlencoding("hello world"), "hello+world");
+    }
+
+    #[test]
+    fn urlencoding_special_chars() {
+        assert_eq!(urlencoding("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn urlencoding_preserves_unreserved() {
+        assert_eq!(urlencoding("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn urlencoding_empty() {
+        assert_eq!(urlencoding(""), "");
+    }
+
+    // ── matches_glob / simple_glob_match ───────────────────────────
+
+    #[test]
+    fn glob_star_extension() {
+        assert!(matches_glob("test.rs", "*.rs"));
+        assert!(!matches_glob("test.py", "*.rs"));
+    }
+
+    #[test]
+    fn glob_question_mark() {
+        assert!(simple_glob_match("a.rs", "?.rs"));
+        assert!(!simple_glob_match("ab.rs", "?.rs"));
+    }
+
+    #[test]
+    fn glob_brace_expansion() {
+        assert!(matches_glob("test.js", "*.{js,ts}"));
+        assert!(matches_glob("test.ts", "*.{js,ts}"));
+        assert!(!matches_glob("test.py", "*.{js,ts}"));
+    }
+
+    #[test]
+    fn glob_exact_match() {
+        assert!(matches_glob("Makefile", "Makefile"));
+        assert!(!matches_glob("makefile", "Makefile"));
+    }
+
+    // ── group_regions ──────────────────────────────────────────────
+
+    #[test]
+    fn group_regions_single_match_no_context() {
+        let matched: HashSet<usize> = [5].into_iter().collect();
+        let regions = group_regions(&matched, 0, 20);
+        assert_eq!(regions, vec![(5, 6)]);
+    }
+
+    #[test]
+    fn group_regions_single_match_with_context() {
+        let matched: HashSet<usize> = [5].into_iter().collect();
+        let regions = group_regions(&matched, 2, 20);
+        assert_eq!(regions, vec![(3, 8)]);
+    }
+
+    #[test]
+    fn group_regions_overlapping_merge() {
+        let matched: HashSet<usize> = [5, 7].into_iter().collect();
+        let regions = group_regions(&matched, 2, 20);
+        assert_eq!(regions, vec![(3, 10)]);
+    }
+
+    #[test]
+    fn group_regions_non_overlapping_separate() {
+        let matched: HashSet<usize> = [2, 15].into_iter().collect();
+        let regions = group_regions(&matched, 1, 20);
+        assert_eq!(regions, vec![(1, 4), (14, 17)]);
+    }
+
+    #[test]
+    fn group_regions_clamps_to_bounds() {
+        let matched: HashSet<usize> = [0, 19].into_iter().collect();
+        let regions = group_regions(&matched, 2, 20);
+        assert_eq!(regions[0].0, 0);
+        assert_eq!(regions.last().unwrap().1, 20);
+    }
+
+    #[test]
+    fn group_regions_empty() {
+        let matched: HashSet<usize> = HashSet::new();
+        let regions = group_regions(&matched, 2, 20);
+        assert!(regions.is_empty());
+    }
+
+    // ── argument helpers ───────────────────────────────────────────
+
+    #[test]
+    fn arg_helper_extracts_string() {
+        let args = serde_json::json!({"path": "/tmp/test"});
+        assert_eq!(a(&args, "path", ""), "/tmp/test");
+    }
+
+    #[test]
+    fn arg_helper_default_on_missing() {
+        let args = serde_json::json!({});
+        assert_eq!(a(&args, "path", "/default"), "/default");
+    }
+
+    #[test]
+    fn arg_helper_optional() {
+        let args = serde_json::json!({"name": "test"});
+        assert_eq!(aopt(&args, "name"), Some("test".into()));
+        assert_eq!(aopt(&args, "missing"), None);
+    }
+
+    #[test]
+    fn arg_helper_usize() {
+        let args = serde_json::json!({"count": 42});
+        assert_eq!(aus(&args, "count", 0), 42);
+        assert_eq!(aus(&args, "missing", 10), 10);
+    }
+
+    #[test]
+    fn arg_helper_bool() {
+        let args = serde_json::json!({"flag": true});
+        assert!(abool(&args, "flag", false));
+        assert!(!abool(&args, "missing", false));
+    }
+
+    // ── tool execution (filesystem-based) ──────────────────────────
+
+    #[tokio::test]
+    async fn read_file_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let result = read_file(path.to_str().unwrap().to_string()).await;
+        assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_not_found() {
+        let result = read_file("/tmp/pengy_nonexistent_file_12345.txt".into()).await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output.txt");
+        let result = write_file(path.to_str().unwrap().to_string(), "content".into()).await;
+        assert!(result.contains("Successfully"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a/b/c/file.txt");
+        let result = write_file(path.to_str().unwrap().to_string(), "nested".into()).await;
+        assert!(result.contains("Successfully"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nested");
+    }
+
+    #[tokio::test]
+    async fn replace_in_file_single_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace.txt");
+        std::fs::write(&path, "hello world foo bar").unwrap();
+        let result = replace_in_file(
+            path.to_str().unwrap().into(),
+            "world".into(),
+            "universe".into(),
+        )
+        .await;
+        assert!(result.contains("Successfully"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hello universe foo bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_in_file_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace.txt");
+        std::fs::write(&path, "hello world").unwrap();
+        let result = replace_in_file(
+            path.to_str().unwrap().into(),
+            "nonexistent".into(),
+            "x".into(),
+        )
+        .await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn replace_in_file_multiple_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace.txt");
+        std::fs::write(&path, "aaa bbb aaa").unwrap();
+        let result = replace_in_file(
+            path.to_str().unwrap().into(),
+            "aaa".into(),
+            "x".into(),
+        )
+        .await;
+        assert!(result.contains("matches 2 locations"));
+    }
+
+    #[tokio::test]
+    async fn replace_in_file_empty_old_str() {
+        let result = replace_in_file("/tmp/x".into(), "".into(), "y".into()).await;
+        assert!(result.contains("old_str is empty"));
+    }
+
+    #[tokio::test]
+    async fn replace_in_file_not_found() {
+        let result = replace_in_file(
+            "/tmp/pengy_nonexistent_12345.txt".into(),
+            "x".into(),
+            "y".into(),
+        )
+        .await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        std::fs::write(dir.path().join("subdir/nested.txt"), "nested").unwrap();
+        let result = directory_tree(dir.path().to_str().unwrap().into(), 3, false).await;
+        assert!(result.contains("subdir/"));
+        assert!(result.contains("file.txt"));
+        assert!(result.contains("nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_not_found() {
+        let result = directory_tree("/tmp/pengy_nonexistent_dir_12345".into(), 3, false).await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_hides_hidden_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden"), "secret").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "public").unwrap();
+        let result = directory_tree(dir.path().to_str().unwrap().into(), 3, false).await;
+        assert!(!result.contains(".hidden"));
+        assert!(result.contains("visible.txt"));
+    }
+
+    #[tokio::test]
+    async fn directory_tree_shows_hidden_when_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden"), "secret").unwrap();
+        let result = directory_tree(dir.path().to_str().unwrap().into(), 3, true).await;
+        assert!(result.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_unknown_tool() {
+        let args = serde_json::json!({});
+        let result = execute_tool("nonexistent_tool", &args).await;
+        assert!(result.contains("Unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_dispatches_read_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dispatch_test.txt");
+        std::fs::write(&path, "dispatch content").unwrap();
+        let args = serde_json::json!({"path": path.to_str().unwrap()});
+        let result = execute_tool("read_file", &args).await;
+        assert_eq!(result, "dispatch content");
+    }
+
+    #[tokio::test]
+    async fn search_content_finds_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.rs");
+        std::fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+        let result = search_content(
+            "println".into(),
+            file_path.to_str().unwrap().into(),
+            None,
+            0,
+            50,
+        )
+        .await;
+        assert!(result.contains("println"));
+    }
+
+    #[tokio::test]
+    async fn search_content_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test.rs"), "fn main() {}").unwrap();
+        let result = search_content(
+            "nonexistent_pattern".into(),
+            dir.path().to_str().unwrap().into(),
+            None,
+            0,
+            50,
+        )
+        .await;
+        assert!(result.contains("No matches"));
+    }
+
+    #[tokio::test]
+    async fn search_content_path_not_found() {
+        let result = search_content(
+            "test".into(),
+            "/tmp/pengy_nonexistent_12345".into(),
+            None,
+            0,
+            50,
+        )
+        .await;
+        assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.txt");
+        let p2 = dir.path().join("b.txt");
+        std::fs::write(&p1, "content a").unwrap();
+        std::fs::write(&p2, "content b").unwrap();
+        let result = read_multiple_files(vec![
+            p1.to_str().unwrap().into(),
+            p2.to_str().unwrap().into(),
+        ])
+        .await;
+        assert!(result.contains("content a"));
+        assert!(result.contains("content b"));
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_empty_paths() {
+        let result = read_multiple_files(vec![]).await;
+        assert!(result.contains("no paths"));
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_too_many() {
+        let paths: Vec<String> = (0..25).map(|i| format!("/tmp/file_{i}.txt")).collect();
+        let result = read_multiple_files(paths).await;
+        assert!(result.contains("too many"));
+    }
+}

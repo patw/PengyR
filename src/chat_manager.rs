@@ -254,3 +254,287 @@ fn backup_corrupt_file(path: &std::path::Path) {
     ));
     let _ = fs::rename(path, &backup);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: Some(serde_json::Value::String(content.into())),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_msg(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some(serde_json::Value::String(content.into())),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }
+    }
+
+    fn assistant_with_tools(tool_ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some(serde_json::Value::String(String::new())),
+            tool_calls: tool_ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: id.to_string(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "test_tool".into(),
+                        arguments: "{}".into(),
+                    },
+                })
+                .collect(),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool_msg(tool_call_id: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Some(serde_json::Value::String(content.into())),
+            tool_calls: vec![],
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    // ── Chat struct tests ──────────────────────────────────────────
+
+    #[test]
+    fn chat_new_generates_unique_ids() {
+        let c1 = Chat::new("Chat 1");
+        let c2 = Chat::new("Chat 2");
+        assert_ne!(c1.id, c2.id);
+        assert_eq!(c1.title, "Chat 1");
+        assert!(c1.messages.is_empty());
+    }
+
+    #[test]
+    fn chat_serde_round_trip() {
+        let mut chat = Chat::new("Test");
+        chat.messages.push(user_msg("hello"));
+        chat.messages.push(assistant_msg("hi there"));
+        let json = serde_json::to_string(&chat).unwrap();
+        let chat2: Chat = serde_json::from_str(&json).unwrap();
+        assert_eq!(chat2.id, chat.id);
+        assert_eq!(chat2.title, "Test");
+        assert_eq!(chat2.messages.len(), 2);
+    }
+
+    #[test]
+    fn chat_message_with_tool_calls_round_trip() {
+        let msg = assistant_with_tools(&["tc-1", "tc-2"]);
+        let json = serde_json::to_string(&msg).unwrap();
+        let msg2: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg2.tool_calls.len(), 2);
+        assert_eq!(msg2.tool_calls[0].id, "tc-1");
+        assert_eq!(msg2.tool_calls[1].id, "tc-2");
+        assert_eq!(msg2.tool_calls[0].function.name, "test_tool");
+    }
+
+    #[test]
+    fn chat_message_without_tool_calls_omits_field() {
+        let msg = user_msg("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("tool_calls"));
+        assert!(!json.contains("tool_call_id"));
+    }
+
+    // ── clean_dangling_tool_calls tests ────────────────────────────
+
+    #[test]
+    fn clean_no_tool_calls_unchanged() {
+        let msgs = vec![user_msg("hi"), assistant_msg("hello")];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        assert_eq!(cleaned.len(), 2);
+    }
+
+    #[test]
+    fn clean_complete_tool_call_unchanged() {
+        let msgs = vec![
+            user_msg("do something"),
+            assistant_with_tools(&["tc-1"]),
+            tool_msg("tc-1", "result"),
+            assistant_msg("done"),
+        ];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2].role, "tool");
+        assert_eq!(
+            cleaned[2].content.as_ref().unwrap().as_str().unwrap(),
+            "result"
+        );
+    }
+
+    #[test]
+    fn clean_dangling_tool_call_synthesizes_cancelled() {
+        let msgs = vec![
+            user_msg("do something"),
+            assistant_with_tools(&["tc-1"]),
+            // missing tool result for tc-1
+            user_msg("next question"),
+        ];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        // Should be: user, assistant_with_tools, synthesized tool result, user
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2].role, "tool");
+        assert_eq!(cleaned[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert!(cleaned[2]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+    }
+
+    #[test]
+    fn clean_orphan_tool_message_dropped() {
+        let msgs = vec![
+            user_msg("hi"),
+            tool_msg("orphan-id", "stale result"),
+            assistant_msg("hello"),
+        ];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        assert_eq!(cleaned.len(), 2);
+        assert_eq!(cleaned[0].role, "user");
+        assert_eq!(cleaned[1].role, "assistant");
+    }
+
+    #[test]
+    fn clean_multiple_tool_calls_partial_results() {
+        let msgs = vec![
+            user_msg("do two things"),
+            assistant_with_tools(&["tc-1", "tc-2"]),
+            tool_msg("tc-1", "result 1"),
+            // tc-2 missing
+        ];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        // user, assistant, tool(tc-1), synthesized tool(tc-2)
+        assert_eq!(cleaned.len(), 4);
+        assert_eq!(cleaned[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(cleaned[3].role, "tool");
+        assert_eq!(cleaned[3].tool_call_id.as_deref(), Some("tc-2"));
+        assert!(cleaned[3]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("cancelled"));
+    }
+
+    #[test]
+    fn clean_multiple_tool_calls_all_satisfied() {
+        let msgs = vec![
+            assistant_with_tools(&["tc-1", "tc-2", "tc-3"]),
+            tool_msg("tc-1", "r1"),
+            tool_msg("tc-2", "r2"),
+            tool_msg("tc-3", "r3"),
+        ];
+        let cleaned = clean_dangling_tool_calls(&msgs);
+        assert_eq!(cleaned.len(), 4);
+        assert!(cleaned.iter().all(|m| m.role == "assistant" || m.role == "tool"));
+    }
+
+    #[test]
+    fn clean_empty_messages() {
+        let cleaned = clean_dangling_tool_calls(&[]);
+        assert!(cleaned.is_empty());
+    }
+
+    // ── elide_old_tool_results tests ───────────────────────────────
+
+    #[test]
+    fn elide_keep_zero_returns_unchanged() {
+        let msgs = vec![
+            user_msg("q1"),
+            assistant_with_tools(&["tc-1"]),
+            tool_msg("tc-1", "long result data"),
+            assistant_msg("done"),
+        ];
+        let elided = elide_old_tool_results(&msgs, 0);
+        assert_eq!(elided.len(), msgs.len());
+        assert_eq!(
+            elided[2].content.as_ref().unwrap().as_str().unwrap(),
+            "long result data"
+        );
+    }
+
+    #[test]
+    fn elide_keeps_recent_turn_intact() {
+        let msgs = vec![
+            user_msg("old question"),
+            assistant_with_tools(&["tc-old"]),
+            tool_msg("tc-old", "old tool output"),
+            assistant_msg("old answer"),
+            user_msg("new question"),
+            assistant_with_tools(&["tc-new"]),
+            tool_msg("tc-new", "new tool output"),
+            assistant_msg("new answer"),
+        ];
+        let elided = elide_old_tool_results(&msgs, 1);
+        // Old tool result should be elided
+        assert!(elided[2]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("elided"));
+        // New tool result should be preserved
+        assert_eq!(
+            elided[6].content.as_ref().unwrap().as_str().unwrap(),
+            "new tool output"
+        );
+    }
+
+    #[test]
+    fn elide_no_user_messages_returns_unchanged() {
+        let msgs = vec![assistant_msg("system init")];
+        let elided = elide_old_tool_results(&msgs, 1);
+        assert_eq!(elided.len(), 1);
+    }
+
+    #[test]
+    fn elide_keep_all_turns() {
+        let msgs = vec![
+            user_msg("q1"),
+            tool_msg("tc-1", "result 1"),
+            user_msg("q2"),
+            tool_msg("tc-2", "result 2"),
+        ];
+        let elided = elide_old_tool_results(&msgs, 10);
+        // All turns kept since keep_turns > actual turns
+        assert_eq!(
+            elided[1].content.as_ref().unwrap().as_str().unwrap(),
+            "result 1"
+        );
+        assert_eq!(
+            elided[3].content.as_ref().unwrap().as_str().unwrap(),
+            "result 2"
+        );
+    }
+
+    #[test]
+    fn elide_non_tool_messages_never_modified() {
+        let msgs = vec![
+            user_msg("old"),
+            assistant_msg("old answer"),
+            user_msg("new"),
+            assistant_msg("new answer"),
+        ];
+        let elided = elide_old_tool_results(&msgs, 1);
+        assert_eq!(
+            elided[1].content.as_ref().unwrap().as_str().unwrap(),
+            "old answer"
+        );
+    }
+}

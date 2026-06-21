@@ -312,3 +312,103 @@ pub async fn chat(
         return;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_confirmation_from_str_all() {
+        assert_eq!(ToolConfirmation::from_str("all"), ToolConfirmation::All);
+    }
+
+    #[test]
+    fn tool_confirmation_from_str_safe() {
+        assert_eq!(ToolConfirmation::from_str("safe"), ToolConfirmation::Safe);
+    }
+
+    #[test]
+    fn tool_confirmation_from_str_none() {
+        assert_eq!(ToolConfirmation::from_str("none"), ToolConfirmation::None);
+    }
+
+    #[test]
+    fn tool_confirmation_from_str_unknown_defaults_to_none() {
+        assert_eq!(ToolConfirmation::from_str(""), ToolConfirmation::None);
+        assert_eq!(ToolConfirmation::from_str("garbage"), ToolConfirmation::None);
+    }
+
+    #[test]
+    fn llm_event_tool_request_serde() {
+        let event = LlmEvent::ToolRequest {
+            name: "read_file".into(),
+            args: serde_json::json!({"path": "/tmp/test"}),
+            tool_call_id: "tc-123".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"tool_request\""));
+        let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            LlmEvent::ToolRequest { name, tool_call_id, .. } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(tool_call_id, "tc-123");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn llm_event_final_response_serde() {
+        let event = LlmEvent::FinalResponse {
+            content: "Hello!".into(),
+            usage: Usage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            LlmEvent::FinalResponse { content, usage } => {
+                assert_eq!(content, "Hello!");
+                assert_eq!(usage.prompt_tokens, 100);
+                assert_eq!(usage.completion_tokens, 50);
+                assert_eq!(usage.total_tokens, 150);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn llm_event_tool_result_serde() {
+        let event = LlmEvent::ToolResult {
+            tool_call_id: "tc-1".into(),
+            name: "run_bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            content: "file.txt\n".into(),
+            declined: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            LlmEvent::ToolResult { declined, content, .. } => {
+                assert!(!declined);
+                assert_eq!(content, "file.txt\n");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn usage_default_values() {
+        let u = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        let parsed: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_tokens, 0);
+    }
+}
