@@ -22,6 +22,11 @@ extern "C" {
         bool yolo_turn;
     };
 
+    struct SudoState {
+        int status;           // 0=idle, 1=pending, 2=provided, 3=cancelled
+        char password[256];
+    };
+
     typedef void (*EventFn)(const char* event_json, void* userdata);
 
     bool pengy_llm_chat_run(
@@ -31,6 +36,7 @@ extern "C" {
         const char* messages_json,
         const char* tool_confirmation,
         ConfirmState* confirm_state,
+        SudoState* sudo_state,
         EventFn on_event,
         void* userdata
     );

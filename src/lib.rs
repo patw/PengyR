@@ -134,6 +134,14 @@ pub struct ConfirmState {
     pub yolo_turn: bool,
 }
 
+/// Shared sudo password state between QThread and Qt main thread.
+#[repr(C)]
+pub struct SudoState {
+    /// 0 = idle, 1 = pending, 2 = provided, 3 = cancelled
+    pub status: i32,
+    pub password: [u8; 256],
+}
+
 #[no_mangle]
 pub extern "C" fn pengy_llm_chat_run(
     base_url: *const c_char,
@@ -142,6 +150,7 @@ pub extern "C" fn pengy_llm_chat_run(
     messages_json: *const c_char,
     tool_confirmation: *const c_char,
     confirm_state: *mut ConfirmState,
+    sudo_state: *mut SudoState,
     on_event: Option<EventFn>,
     userdata: *mut c_void,
 ) -> bool {
@@ -155,26 +164,54 @@ pub extern "C" fn pengy_llm_chat_run(
         serde_json::from_str(&ms).unwrap_or_default();
     let tc_mode = llm_client::ToolConfirmation::from_str(&tc_str);
 
+    // Wire up sudo password provider if a SudoState pointer was given
+    if !sudo_state.is_null() {
+        let sudo_ptr = sudo_state as usize; // safe to send across threads
+        *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(Box::new(move || {
+            let state = sudo_ptr as *mut SudoState;
+            unsafe { std::ptr::write_volatile(&mut (*state).status, 1); } // pending
+            // Busy-wait for Qt main thread to respond
+            loop {
+                let status = unsafe { std::ptr::read_volatile(&(*state).status) };
+                if status == 2 {
+                    // Password provided — read from the buffer
+                    let bytes = unsafe { &(*state).password };
+                    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    let pw = String::from_utf8_lossy(&bytes[..len]).into_owned();
+                    unsafe { std::ptr::write_volatile(&mut (*state).status, 0); } // reset
+                    return Some(pw);
+                }
+                if status == 3 {
+                    // Cancelled
+                    unsafe { std::ptr::write_volatile(&mut (*state).status, 0); } // reset
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }));
+    }
+
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let cancel2 = cancel.clone();
-    let _handle = rt().spawn(async move {
+    let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
             &bu, &ak, &md, messages, tc_mode,
             event_tx, confirm_rx, cancel2,
         ).await;
-    });
+    }));
 
-    loop {
+    let result = 'outer: loop {
         match event_rx.blocking_recv() {
             Some(event) => {
                 // Send event to C++ callback
                 if let Some(ref cb) = on_event {
                     let json = serde_json::to_string(&event).unwrap_or_default();
-                    let cjson = CString::new(json).unwrap();
-                    cb(cjson.as_ptr(), userdata);
+                    if let Ok(cjson) = CString::new(json) {
+                        cb(cjson.as_ptr(), userdata);
+                    }
                 }
 
                 match &event {
@@ -187,11 +224,11 @@ pub extern "C" fn pengy_llm_chat_run(
                         if needs_confirm && !confirm_state.is_null() {
                             // Signal the Qt thread: "we need confirmation"
                             unsafe {
-                                (*confirm_state).status = 1; // pending
+                                std::ptr::write_volatile(&mut (*confirm_state).status, 1);
                             }
                             // Busy-wait for Qt to respond (runs on QThread, not main thread)
                             loop {
-                                let status = unsafe { (*confirm_state).status };
+                                let status = unsafe { std::ptr::read_volatile(&(*confirm_state).status) };
                                 if status == 2 || status == 3 {
                                     break;
                                 }
@@ -201,15 +238,15 @@ pub extern "C" fn pengy_llm_chat_run(
                                         confirmed: false,
                                         yolo_turn: false,
                                     });
-                                    return false;
+                                    break 'outer false;
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(5));
                             }
                             let (confirmed, yolo) = unsafe {
-                                let s = &*confirm_state;
-                                (s.status == 2, s.yolo_turn)
+                                let status = std::ptr::read_volatile(&(*confirm_state).status);
+                                (status == 2, (*confirm_state).yolo_turn)
                             };
-                            unsafe { (*confirm_state).status = 0; }
+                            unsafe { std::ptr::write_volatile(&mut (*confirm_state).status, 0); }
                             let _ = confirm_tx.send(llm_client::Confirmation {
                                 tool_call_id: String::new(),
                                 confirmed,
@@ -219,14 +256,46 @@ pub extern "C" fn pengy_llm_chat_run(
                         // else: auto-confirmed or safe — the generator handles it
                     }
                     llm_client::LlmEvent::FinalResponse { .. } => {
-                        return true;
+                        break true;
                     }
                     _ => {}
                 }
             }
-            None => return false,
+            None => {
+                // Channel closed without FinalResponse — task likely panicked.
+                // Await the handle to get the panic message and forward it.
+                let err_msg = if let Some(h) = task_handle.take() {
+                    match rt().block_on(async { h.await }) {
+                        Ok(()) => "Chat ended unexpectedly".to_string(),
+                        Err(e) => format!("Internal error: {e}"),
+                    }
+                } else {
+                    "Chat ended unexpectedly".to_string()
+                };
+                if let Some(ref cb) = on_event {
+                    let event = llm_client::LlmEvent::FinalResponse {
+                        content: err_msg,
+                        usage: llm_client::Usage {
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            total_tokens: 0,
+                        },
+                    };
+                    let json = serde_json::to_string(&event).unwrap_or_default();
+                    if let Ok(cjson) = CString::new(json) {
+                        cb(cjson.as_ptr(), userdata);
+                    }
+                }
+                break true;
+            }
         }
-    }
+    };
+
+    // Clean up sudo provider
+    *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = None;
+    *tools::CACHED_SUDO_PASSWORD.lock().unwrap() = None;
+
+    result
 }
 
 #[no_mangle]

@@ -326,22 +326,19 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
 
 async fn run_bash(command: String) -> String {
     let timeout = timeout_secs();
-    let mut cmd = std::process::Command::new("bash");
-    cmd.arg("-c").arg(&command);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.stdin(Stdio::piped());
 
     let password_needed = Regex::new(r"\bsudo\b").unwrap().is_match(&command);
     if password_needed {
         let need_pw = { CACHED_SUDO_PASSWORD.lock().unwrap().is_none() };
         if need_pw {
-            let pw = {
-                let provider = SUDO_PASSWORD_PROVIDER.lock().unwrap();
-                match provider.as_ref() {
-                    Some(cb) => cb(),
-                    None => return "Error: sudo detected but no password provider is configured.".into(),
+            let provider = SUDO_PASSWORD_PROVIDER.lock().unwrap().take();
+            let pw = match provider {
+                Some(cb) => {
+                    let result = cb();
+                    *SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(cb);
+                    result
                 }
+                None => return "Error: sudo detected but no password provider is configured.".into(),
             };
             match pw {
                 Some(p) => { *CACHED_SUDO_PASSWORD.lock().unwrap() = Some(p); }
@@ -349,6 +346,19 @@ async fn run_bash(command: String) -> String {
             }
         }
     }
+
+    // Ensure sudo reads password from stdin
+    let command = if password_needed && !command.contains("sudo -S") {
+        command.replacen("sudo", "sudo -S", 1)
+    } else {
+        command
+    };
+
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("-c").arg(&command);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

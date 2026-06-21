@@ -23,6 +23,10 @@ public:
     void cancel();
     void sendConfirmation(bool confirmed, bool yoloTurn);
 
+    bool isSudoPending() const { return m_sudoState.status == 1; }
+    void sendSudoPassword(const QString& password);
+    void cancelSudo();
+
 signals:
     void eventReceived(const QString& eventJson);
     void finished();
@@ -33,6 +37,7 @@ private:
 
     // Shared state with Qt main thread for tool confirmation
     ConfirmState m_confirmState;
+    SudoState m_sudoState;
     QMutex m_mutex;
     QWaitCondition m_cond;
     bool m_cancelled = false;

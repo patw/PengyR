@@ -14,6 +14,8 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMessageBox>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QFile>
 #include <QMimeDatabase>
 #include <QMimeType>
@@ -471,7 +473,24 @@ void MainWindow::handleToolConfirm(const QJsonObject& req) {
 }
 
 void MainWindow::pollToolConfirmation() {
-    // Handled by the QDialog approach above; timer kept for future use
+    if (!m_worker || !m_worker->isSudoPending()) return;
+    if (m_sudoDialogOpen) return;
+
+    m_sudoDialogOpen = true;
+
+    QString password;
+    bool ok = false;
+    password = QInputDialog::getText(
+        this, "sudo Password", "Enter sudo password:",
+        QLineEdit::Password, QString(), &ok);
+
+    m_sudoDialogOpen = false;
+
+    if (ok && !password.isEmpty()) {
+        m_worker->sendSudoPassword(password);
+    } else {
+        m_worker->cancelSudo();
+    }
 }
 
 void MainWindow::onWorkerFinished() {

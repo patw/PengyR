@@ -54,4 +54,5 @@ private:
     QThread* m_workerThread = nullptr;
     QTimer* m_confirmTimer = nullptr;
     bool m_yoloThisTurn = false;
+    bool m_sudoDialogOpen = false;
 };

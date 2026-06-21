@@ -1,9 +1,12 @@
 #include "chatworker.h"
 #include <QDebug>
+#include <cstring>
 
 ChatWorker::ChatWorker(QObject* parent) : QObject(parent) {
     m_confirmState.status = 0;
     m_confirmState.yolo_turn = false;
+    m_sudoState.status = 0;
+    memset(m_sudoState.password, 0, sizeof(m_sudoState.password));
 }
 
 ChatWorker::~ChatWorker() { cancel(); }
@@ -29,10 +32,23 @@ void ChatWorker::cancel() {
     m_cancelled = true;
     pengy_llm_cancel(nullptr);
 
-    // Wake up any waiting confirmation
+    // Wake up any waiting confirmation or sudo prompt
     QMutexLocker lock(&m_mutex);
     m_confirmState.status = 3; // declined
+    m_sudoState.status = 3;    // cancelled
     m_cond.wakeAll();
+}
+
+void ChatWorker::sendSudoPassword(const QString& password) {
+    QByteArray pw = password.toUtf8();
+    int len = qMin(pw.size(), (int)sizeof(m_sudoState.password) - 1);
+    memcpy(m_sudoState.password, pw.constData(), len);
+    m_sudoState.password[len] = '\0';
+    m_sudoState.status = 2; // provided
+}
+
+void ChatWorker::cancelSudo() {
+    m_sudoState.status = 3; // cancelled
 }
 
 void ChatWorker::sendConfirmation(bool confirmed, bool yoloTurn) {
@@ -59,7 +75,7 @@ void ChatWorker::run() {
     bool ok = pengy_llm_chat_run(
         baseUrl.constData(), apiKey.constData(), model.constData(),
         msgs.constData(), tc.constData(),
-        &m_confirmState,
+        &m_confirmState, &m_sudoState,
         callback, this
     );
 
