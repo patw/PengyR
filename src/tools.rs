@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Global state ────────────────────────────────────────────────────
 
@@ -62,7 +62,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         td("run_bash", "Run a bash command in the terminal",
             &[("command", "string", "The bash command to execute")],
             &["command"]),
-        td("web_search", "Search the web using DuckDuckGo",
+        td("web_search", "Search the web using DuckDuckGo (via ddgs multi-engine metasearch)",
             &[("query", "string", "The search query"),
               ("max_results", "integer", "Maximum number of results to return (default: 5)")],
             &["query"]),
@@ -467,71 +467,228 @@ fn wait_timeout(
     }
 }
 
+// ── Rate limiter for web searches ──
+
+static LAST_SEARCH_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+
 async fn web_search(query: String, max_results: usize) -> String {
+    // Rate-limit between searches
+    let wait_ms = {
+        let last = LAST_SEARCH_TIME.lock().unwrap();
+        last.map(|prev| {
+            let elapsed = prev.elapsed();
+            if elapsed < Duration::from_millis(800) {
+                (Duration::from_millis(800) - elapsed).as_millis() as u64
+            } else { 0 }
+        }).unwrap_or(0)
+    };
+    if wait_ms > 0 { tokio::time::sleep(Duration::from_millis(wait_ms)).await; }
+    *LAST_SEARCH_TIME.lock().unwrap() = Some(Instant::now());
+
+    // ── Primary: Python ddgs (10 engines, TLS impersonation, battle-tested) ──
+    let result = search_ddgs_python(&query, max_results).await;
+    if !result.starts_with("ddgs:") && !result.starts_with("No results") {
+        return result;
+    }
+
+    // ── Fallback: Mojeek via reqwest ──
+    let result = search_mojeek(&query, max_results).await;
+    if !result.starts_with("No results")
+        && !result.starts_with("Mojeek returned HTTP")
+        && !result.starts_with("Error searching Mojeek")
+    {
+        return result;
+    }
+
+    // ── Fallback: DDG via primp ──
+    let client = match primp::Client::builder()
+        .impersonate(primp::Impersonate::ChromeV146)
+        .impersonate_os(primp::ImpersonateOS::Linux)
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("Error creating HTTP client: {e}"),
+    };
+    search_ddg(&client, &query, max_results).await
+}
+
+/// Python ddgs subprocess — identical to the proven Python Pengy approach.
+async fn search_ddgs_python(query: &str, max_results: usize) -> String {
+    let safe_query = query.replace('\'', "'\\''");
+    let cmd = format!(
+        "timeout 8 python3 -c 'import json,sys;from ddgs import DDGS;d=DDGS();r=list(d.text(sys.argv[1],max_results=int(sys.argv[2])));print(json.dumps(r))' '{}' {} 2>/dev/null",
+        safe_query, max_results
+    );
+
+    let output = match std::process::Command::new("bash")
+        .arg("-c").arg(&cmd)
+        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("ddgs spawn error: {e}"),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let exit = output.status.code().unwrap_or(-1);
+    if exit == 124 { return "Web search timed out after 8 seconds.".into(); }
+    if stdout.is_empty() { return format!("ddgs: no output (exit {exit})"); }
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(json) => {
+            if let Some(arr) = json.as_array() {
+                if arr.is_empty() { return "No results found.".into(); }
+                let mut lines = Vec::new();
+                for (i, r) in arr.iter().enumerate() {
+                    if i >= max_results { break; }
+                    let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    let href = r.get("href").and_then(|v| v.as_str()).unwrap_or("");
+                    let body = r.get("body").and_then(|v| v.as_str()).unwrap_or("");
+                    if title.is_empty() { continue; }
+                    lines.push(format!("{}. {title}", i + 1));
+                    if !href.is_empty() { lines.push(format!("   URL: {href}")); }
+                    if !body.is_empty() { lines.push(format!("   {body}")); }
+                    lines.push(String::new());
+                }
+                return if lines.is_empty() { "No results found.".into() } else { lines.join("\n").trim().to_string() };
+            }
+            format!("ddgs: unexpected JSON: {}", &stdout[..200.min(stdout.len())])
+        }
+        Err(e) => format!("ddgs JSON error: {e} — raw: {}", &stdout[..200.min(stdout.len())]),
+    }
+}
+
+/// Mojeek search — fast, server-rendered HTML, no rate limiting.
+/// Structure: ul.results-standard > li.rN > h2 > a.title (title+href) + p.s (snippet)
+async fn search_mojeek(query: &str, max_results: usize) -> String {
+    let encoded = urlencoding(query);
+    let url = format!("https://www.mojeek.com/search?q={encoded}");
+
+    let ua = ua();
+    let user_agent = if ua.is_empty() { "Pengy/2.0" } else { &ua };
+
     let client = reqwest::Client::builder()
-        .user_agent(ua())
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_default();
 
-    let encoded = urlencoding(&query);
-    let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
-
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(e) => return format!("Error performing web search: {e}"),
+        Err(e) => return format!("Error searching Mojeek: {e}"),
     };
+
+    if resp.status().as_u16() != 200 {
+        return format!("Mojeek returned HTTP {}.", resp.status().as_u16());
+    }
+
     let html = match resp.text().await {
         Ok(t) => t,
         Err(e) => return format!("Error reading search response: {e}"),
     };
 
     let document = scraper::Html::parse_document(&html);
-    let rs = scraper::Selector::parse(".result").unwrap();
-    let ts = scraper::Selector::parse(".result__title").unwrap();
-    let ls = scraper::Selector::parse(".result__url").unwrap();
-    let ss = scraper::Selector::parse(".result__snippet").unwrap();
+    let mut results: Vec<String> = Vec::new();
 
-    let mut lines = Vec::new();
-    let mut count = 0;
+    // Mojeek: <li class="r1">...<h2><a class="title" href="URL">TITLE</a></h2>...<p class="s">SNIPPET</p></li>
+    let title_sel = scraper::Selector::parse("h2 a.title").unwrap();
+    let snippet_sel = scraper::Selector::parse("p.s").unwrap();
+    let li_sel = scraper::Selector::parse("ul.results-standard > li").unwrap();
 
-    for result in document.select(&rs) {
-        if count >= max_results {
+    for li in document.select(&li_sel) {
+        if results.len() >= max_results {
             break;
         }
-        count += 1;
-        let title = result
-            .select(&ts)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string())
+        let title = li.select(&title_sel).next()
+            .map(|a| a.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
-        let link = result
-            .select(&ls)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-        let snippet = result
-            .select(&ss)
-            .next()
-            .map(|el| el.text().collect::<String>().trim().to_string())
+        let href = li.select(&title_sel).next()
+            .and_then(|a| a.value().attr("href"))
+            .unwrap_or("")
+            .to_string();
+        let snippet = li.select(&snippet_sel).next()
+            .map(|p| p.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
 
-        if !title.is_empty() {
-            lines.push(format!("{count}. {title}"));
-            if !link.is_empty() {
-                lines.push(format!("   URL: {link}"));
-            }
-            if !snippet.is_empty() {
-                lines.push(format!("   {snippet}"));
-            }
-            lines.push(String::new());
+        if title.is_empty() {
+            continue;
         }
+        let mut entry = format!("{}. {title}", results.len() + 1);
+        if !href.is_empty() {
+            entry.push_str(&format!("\n   URL: {href}"));
+        }
+        if !snippet.is_empty() {
+            entry.push_str(&format!("\n   {snippet}"));
+        }
+        results.push(entry);
     }
 
-    if lines.is_empty() {
+    if results.is_empty() {
         "No results found.".into()
     } else {
-        lines.join("\n").trim().to_string()
+        results.join("\n\n")
     }
+}
+
+/// DuckDuckGo HTML search via primp — browser-impersonated POST with form data.
+/// Extracts results from the DDG HTML endpoint using correct CSS selectors.
+async fn search_ddg(client: &primp::Client, query: &str, max_results: usize) -> String {
+    let resp = match client
+        .post("https://html.duckduckgo.com/html/")
+        .form(&[("q", query), ("b", ""), ("l", "us-en")])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return format!("Error searching DuckDuckGo: {e}"),
+    };
+
+    if resp.status().as_u16() != 200 {
+        return format!("DuckDuckGo returned HTTP {}.", resp.status().as_u16());
+    }
+
+    let html = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => return format!("Error reading search response: {e}"),
+    };
+
+    if html.len() < 5000 {
+        return "DuckDuckGo returned a silent block page.".into();
+    }
+
+    let mut results: Vec<String> = Vec::new();
+    let document = scraper::Html::parse_document(&html);
+
+    let rs = scraper::Selector::parse("div.result").unwrap();
+    let ts = scraper::Selector::parse("a.result__a").unwrap();
+    let ss = scraper::Selector::parse("div.result__snippet").unwrap();
+
+    for el in document.select(&rs) {
+        if results.len() >= max_results {
+            break;
+        }
+        let title = el.select(&ts).next()
+            .map(|a| a.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+        let href = el.select(&ts).next()
+            .and_then(|a| a.value().attr("href"))
+            .map(|h| if let Some(p) = h.find("uddg=") { urldecode(&h[p + 5..]) } else { h.to_string() })
+            .unwrap_or_default();
+        let snippet = el.select(&ss).next()
+            .map(|s| s.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+
+        if title.is_empty() { continue; }
+        if href.contains("duckduckgo.com/y.js") { continue; }
+
+        let mut entry = format!("{}. {title}", results.len() + 1);
+        if !href.is_empty() { entry.push_str(&format!("\n   URL: {href}")); }
+        if !snippet.is_empty() { entry.push_str(&format!("\n   {snippet}")); }
+        results.push(entry);
+    }
+
+    if results.is_empty() { "No results found.".into() } else { results.join("\n\n") }
 }
 
 fn urlencoding(s: &str) -> String {
@@ -543,6 +700,27 @@ fn urlencoding(s: &str) -> String {
             }
             b' ' => result.push('+'),
             _ => result.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    result
+}
+
+fn urldecode(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte as char);
+            } else {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else if c == '+' {
+            result.push(' ');
+        } else {
+            result.push(c);
         }
     }
     result
