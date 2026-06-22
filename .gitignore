@@ -14,7 +14,9 @@ appimage/tools/
 # macOS
 *.app
 *.dmg
+*.icns
 .dmg_staging/
+.pengy.iconset/
 *.dSYM
 
 # Windows

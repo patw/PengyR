@@ -33,14 +33,32 @@ make -j$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 echo ""
 echo "==> Done! Binary: gui/build_macos/pengy"
 
+# Generate .icns from pengy.png
+echo "==> Generating app icon..."
+ICONSET="$ROOT/.pengy.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$ICONSET"
+for SIZE in 16 32 128 256 512; do
+    sips -z $SIZE $SIZE "$ROOT/pengy.png" --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null
+    DOUBLE=$((SIZE * 2))
+    sips -z $DOUBLE $DOUBLE "$ROOT/pengy.png" --out "$ICONSET/icon_${SIZE}x${SIZE}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$ROOT/pengy.icns"
+rm -rf "$ICONSET"
+
 # Create .app bundle
 echo "==> Creating Pengy.app bundle..."
 APP_DIR="$ROOT/Pengy.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$ROOT/gui/build_macos/pengy" "$APP_DIR/Contents/MacOS/"
 cp "$ROOT/gui/Info.plist" "$APP_DIR/Contents/"
+cp "$ROOT/pengy.icns" "$APP_DIR/Contents/Resources/"
 # Use macdeployqt to bundle Qt frameworks
 macdeployqt "$APP_DIR" -verbose=2
+
+# macdeployqt modifies dylib load paths which invalidates existing signatures;
+# re-sign everything with an ad-hoc signature so macOS will launch the app
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "==> App bundle: $APP_DIR"
 
@@ -53,12 +71,24 @@ mkdir -p "$DMG_STAGING"
 cp -r "$APP_DIR" "$DMG_STAGING/"
 ln -s /Applications "$DMG_STAGING/Applications"
 
+# Add volume icon to staging area
+cp "$ROOT/pengy.icns" "$DMG_STAGING/.VolumeIcon.icns"
+
 hdiutil create \
     -volname "Pengy" \
     -srcfolder "$DMG_STAGING" \
     -ov \
-    -format UDZO \
+    -format UDRW \
     "$ROOT/$DMG_NAME"
+
+# Set the volume's custom icon bit so Finder uses .VolumeIcon.icns
+DMG_MOUNT=$(hdiutil attach -readwrite -noverify "$ROOT/$DMG_NAME" | grep -oE '/Volumes/.+$')
+SetFile -a C "$DMG_MOUNT"
+hdiutil detach "$DMG_MOUNT" -quiet
+
+# Convert to compressed read-only DMG
+hdiutil convert "$ROOT/$DMG_NAME" -format UDZO -o "$ROOT/${DMG_NAME%.dmg}-compressed.dmg" -ov
+mv "$ROOT/${DMG_NAME%.dmg}-compressed.dmg" "$ROOT/$DMG_NAME"
 
 rm -rf "$DMG_STAGING"
 echo "==> DMG ready: $ROOT/$DMG_NAME"

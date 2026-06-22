@@ -18,6 +18,8 @@
     <string>APPL</string>
     <key>CFBundleSignature</key>
     <string>????</string>
+    <key>CFBundleIconFile</key>
+    <string>pengy</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>

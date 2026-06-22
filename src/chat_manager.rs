@@ -56,8 +56,7 @@ impl Chat {
 }
 
 fn chats_path() -> PathBuf {
-    let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push("pengy");
+    let mut p = crate::config::pengy_config_dir();
     p.push(CHATS_FILE);
     p
 }

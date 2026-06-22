@@ -86,10 +86,19 @@ impl Default for Config {
     }
 }
 
+/// Return the pengy config directory (`~/.config/pengy/`).
+/// Uses `$HOME/.config/pengy` on all platforms so settings are shared with the
+/// Python edition and consistent across macOS / Linux / Windows.
+pub fn pengy_config_dir() -> PathBuf {
+    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".config");
+    p.push(CONFIG_DIR);
+    p
+}
+
 /// Return the path to the config file.
 fn config_path() -> PathBuf {
-    let mut p = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    p.push(CONFIG_DIR);
+    let mut p = pengy_config_dir();
     p.push(CONFIG_FILE);
     p
 }
