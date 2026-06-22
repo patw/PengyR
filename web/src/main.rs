@@ -28,12 +28,12 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/chat/new", post(new_chat))
-        .route("/chat/{chat_id}", get(chat_view))
-        .route("/chat/{chat_id}/send", post(chat_send))
-        .route("/chat/{chat_id}/stream", get(chat_stream))
-        .route("/chat/{chat_id}/confirm", post(chat_confirm))
-        .route("/chat/{chat_id}/sudo", post(chat_sudo))
-        .route("/chat/{chat_id}/delete", post(chat_delete))
+        .route("/chat/:chat_id", get(chat_view))
+        .route("/chat/:chat_id/send", post(chat_send))
+        .route("/chat/:chat_id/stream", get(chat_stream))
+        .route("/chat/:chat_id/confirm", post(chat_confirm))
+        .route("/chat/:chat_id/sudo", post(chat_sudo))
+        .route("/chat/:chat_id/delete", post(chat_delete))
         .route("/settings", get(settings_get).post(settings_post))
         .with_state(state);
 
@@ -741,8 +741,16 @@ fn render_markdown(text: &str) -> String {
     let mut html = String::new();
     let mut in_code_block = false;
     let mut in_paragraph = false;
+    let mut table_lines: Vec<String> = Vec::new();
 
     for line in text.lines() {
+        if !table_lines.is_empty()
+            && !in_code_block
+            && !(line.trim().starts_with('|') && line.trim().ends_with('|'))
+        {
+            html.push_str(&render_table(&table_lines));
+            table_lines.clear();
+        }
         if line.starts_with("```") {
             if in_code_block {
                 html.push_str("</code></pre>\n");
@@ -810,6 +818,13 @@ fn render_markdown(text: &str) -> String {
                 "<li>{}</li>\n",
                 inline_markdown(&trimmed[2..])
             ));
+        } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
+            table_lines.push(trimmed.to_string());
+            continue;
         } else {
             if !in_paragraph {
                 html.push_str("<p>");
@@ -822,6 +837,9 @@ fn render_markdown(text: &str) -> String {
         }
     }
 
+    if !table_lines.is_empty() {
+        html.push_str(&render_table(&table_lines));
+    }
     if in_code_block {
         html.push_str("</code></pre>\n");
     }
@@ -829,6 +847,57 @@ fn render_markdown(text: &str) -> String {
         html.push_str("</p>\n");
     }
 
+    html
+}
+
+fn render_table(lines: &[String]) -> String {
+    fn parse_row(line: &str) -> Vec<String> {
+        let trimmed = line.trim().trim_matches('|');
+        trimmed.split('|').map(|c| c.trim().to_string()).collect()
+    }
+
+    fn is_separator(line: &str) -> bool {
+        let trimmed = line.trim().trim_matches('|');
+        trimmed
+            .split('|')
+            .all(|c| c.trim().chars().all(|ch| ch == '-' || ch == ':') && !c.trim().is_empty())
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut html = String::from("<table>\n");
+
+    let has_header = lines.len() >= 2 && is_separator(&lines[1]);
+
+    if has_header {
+        let cells = parse_row(&lines[0]);
+        html.push_str("<thead><tr>");
+        for cell in &cells {
+            html.push_str(&format!("<th>{}</th>", inline_markdown(cell)));
+        }
+        html.push_str("</tr></thead>\n");
+    }
+
+    let body_start = if has_header { 2 } else { 0 };
+    if body_start < lines.len() {
+        html.push_str("<tbody>\n");
+        for line in &lines[body_start..] {
+            if is_separator(line) {
+                continue;
+            }
+            let cells = parse_row(line);
+            html.push_str("<tr>");
+            for cell in &cells {
+                html.push_str(&format!("<td>{}</td>", inline_markdown(cell)));
+            }
+            html.push_str("</tr>\n");
+        }
+        html.push_str("</tbody>\n");
+    }
+
+    html.push_str("</table>\n");
     html
 }
 
