@@ -3,6 +3,8 @@
 
 # C++ / CMake build
 gui/build/
+gui/build_macos/
+gui/build_windows/
 
 # AppImage output
 PengyR-x86_64.AppImage
@@ -11,6 +13,8 @@ appimage/tools/
 
 # macOS
 *.app
+*.dmg
+.dmg_staging/
 *.dSYM
 
 # Windows

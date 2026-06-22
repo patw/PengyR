@@ -87,7 +87,7 @@ if(PENGY_RUST_STATIC)
       Qt6::Core Qt6::Widgets Qt6::Network
       ${PENGY_CORE_LIB}
       OpenSSL::SSL OpenSSL::Crypto
-      "-framework Security" "-framework CoreFoundation"
+      "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration"
       pthread dl
     )
   else()
