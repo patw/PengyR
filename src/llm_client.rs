@@ -140,23 +140,40 @@ pub async fn chat(
             }
         };
 
+        let status = resp.status();
         let body: serde_json::Value = match resp.json().await {
             Ok(b) => b,
             Err(e) => {
                 let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: format!("Error parsing API response: {e}"),
+                    content: format!("Error parsing API response (HTTP {status}): {e}"),
                     usage: accumulated_usage,
                 });
                 return;
             }
         };
 
+        if !status.is_success() {
+            let detail = body["error"]["message"]
+                .as_str()
+                .or_else(|| body["error"].as_str())
+                .or_else(|| body["message"].as_str())
+                .unwrap_or("unknown error");
+            let _ = event_tx.send(LlmEvent::FinalResponse {
+                content: format!("API error (HTTP {status}): {detail}"),
+                usage: accumulated_usage,
+            });
+            return;
+        }
+
         // Parse the response
         let choice = match body["choices"].as_array().and_then(|a| a.first()) {
             Some(c) => c,
             None => {
                 let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: "No choices in API response.".into(),
+                    content: format!(
+                        "No choices in API response: {}",
+                        serde_json::to_string_pretty(&body).unwrap_or_default()
+                    ),
                     usage: accumulated_usage,
                 });
                 return;

@@ -537,4 +537,31 @@ mod tests {
             "old answer"
         );
     }
+
+    #[test]
+    fn multipart_image_content_roundtrips_through_serialization() {
+        let json = r#"[
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                {"type": "text", "text": "What is this?"}
+            ]}
+        ]"#;
+
+        let msgs: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].content.as_ref().unwrap().is_string());
+        assert!(msgs[1].content.as_ref().unwrap().is_array());
+
+        let payload = serde_json::json!({
+            "model": "test",
+            "messages": msgs,
+        });
+
+        let out = serde_json::to_string(&payload).unwrap();
+        assert!(out.contains(r#""type":"image_url"#));
+        assert!(out.contains("iVBORw0KGgo="));
+        assert!(out.contains(r#""type":"text"#));
+        assert!(!out.contains("tool_calls"));
+    }
 }
