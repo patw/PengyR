@@ -65,7 +65,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         td("run_bash", "Run a bash command in the terminal",
             &[("command", "string", "The bash command to execute")],
             &["command"]),
-        td("web_search", "Search the web using DuckDuckGo (via ddgs multi-engine metasearch)",
+        td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
             &[("query", "string", "The search query"),
               ("max_results", "integer", "Maximum number of results to return (default: 5)")],
             &["query"]),
@@ -498,7 +498,6 @@ async fn run_bash(command: String) -> String {
     }
 }
 
-
 /// Wait for a child process with a timeout, without blocking the async runtime.
 fn wait_timeout_status(
     child: &mut std::process::Child,
@@ -524,10 +523,18 @@ fn temp_output_paths(prefix: &str) -> (PathBuf, PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    out.push(format!("pengy_{prefix}_{}_{}.out", std::process::id(), nanos));
+    out.push(format!(
+        "pengy_{prefix}_{}_{}.out",
+        std::process::id(),
+        nanos
+    ));
 
     let mut err = std::env::temp_dir();
-    err.push(format!("pengy_{prefix}_{}_{}.err", std::process::id(), nanos));
+    err.push(format!(
+        "pengy_{prefix}_{}_{}.err",
+        std::process::id(),
+        nanos
+    ));
     (out, err)
 }
 
@@ -551,13 +558,20 @@ fn remove_output_files(stdout_path: &Path, stderr_path: &Path) {
     let _ = std::fs::remove_file(stderr_path);
 }
 
-
 // ── Rate limiter for web searches ──
 
 static LAST_SEARCH_TIME: Mutex<Option<Instant>> = Mutex::new(None);
 
+#[derive(Clone, Debug)]
+struct WebSearchHit {
+    title: String,
+    href: String,
+    body: String,
+    engine: &'static str,
+}
+
 async fn web_search(query: String, max_results: usize) -> String {
-    // Rate-limit between searches
+    // Rate-limit between searches so repeated tool calls do not hammer public search endpoints.
     let wait_ms = {
         let last = LAST_SEARCH_TIME.lock().unwrap();
         last.map(|prev| {
@@ -575,302 +589,603 @@ async fn web_search(query: String, max_results: usize) -> String {
     }
     *LAST_SEARCH_TIME.lock().unwrap() = Some(Instant::now());
 
-    // ── Primary: Python ddgs (10 engines, TLS impersonation, battle-tested) ──
-    let result = search_ddgs_python(&query, max_results).await;
-    if !result.starts_with("ddgs:") && !result.starts_with("No results") {
-        return result;
+    let max_results = max_results.clamp(1, 25);
+    let q = query.trim().to_string();
+    if q.is_empty() {
+        return "Error: query is empty.".into();
     }
 
-    // ── Fallback: Mojeek via reqwest ──
-    let result = search_mojeek(&query, max_results).await;
-    if !result.starts_with("No results")
-        && !result.starts_with("Mojeek returned HTTP")
-        && !result.starts_with("Error searching Mojeek")
-    {
-        return result;
+    // Native ddgs-inspired metasearch.  DuckDuckGo/Mojeek alone are often not enough;
+    // Brave/Yahoo/Google/Startpage/Yandex provide the coverage that the previous Python
+    // ddgs fallback was giving us.
+    let search_fut = async {
+        tokio::join!(
+            search_brave(&q, max_results),
+            search_ddg_native(&q, max_results),
+            search_mojeek_native(&q, max_results),
+            search_yahoo(&q, max_results),
+            search_google(&q, max_results),
+            search_startpage(&q, max_results),
+            search_yandex(&q, max_results),
+        )
+    };
+
+    let (brave, ddg, mojeek, yahoo, google, startpage, yandex) =
+        match tokio::time::timeout(Duration::from_secs(12), search_fut).await {
+            Ok(results) => results,
+            Err(_) => return format!("Web search timed out for query: {q}"),
+        };
+
+    let backend_results = vec![
+        ("Brave", brave),
+        ("DuckDuckGo", ddg),
+        ("Mojeek", mojeek),
+        ("Yahoo", yahoo),
+        ("Google", google),
+        ("Startpage", startpage),
+        ("Yandex", yandex),
+    ];
+
+    let mut failures = Vec::new();
+    let mut hits = Vec::new();
+    for (name, result) in backend_results {
+        match result {
+            Ok(mut h) => hits.append(&mut h),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
     }
 
-    // ── Fallback: DDG via primp ──
-    let client = match primp::Client::builder()
+    let hits = rank_and_dedupe_hits(hits, &q);
+    if !hits.is_empty() {
+        return format_hits(&hits, max_results);
+    }
+
+    if failures.is_empty() {
+        format!("No results found for query: {q}")
+    } else {
+        format!(
+            "Web search failed for query: {q}\n\nBackends tried:\n- {}",
+            failures.join("\n- ")
+        )
+    }
+}
+
+fn format_hits(hits: &[WebSearchHit], max_results: usize) -> String {
+    let mut lines = Vec::new();
+    for (i, hit) in hits.iter().take(max_results).enumerate() {
+        lines.push(format!("{}. {}", i + 1, hit.title));
+        if !hit.href.is_empty() {
+            lines.push(format!("   URL: {}", hit.href));
+        }
+        if !hit.body.is_empty() {
+            lines.push(format!("   {}", hit.body));
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn rank_and_dedupe_hits(hits: Vec<WebSearchHit>, query: &str) -> Vec<WebSearchHit> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for mut hit in hits {
+        hit.title = normalize_search_text(&hit.title);
+        hit.body = normalize_search_text(&hit.body);
+        hit.href = normalize_search_url(&hit.href);
+        if hit.title.is_empty() || hit.href.is_empty() || !hit.href.starts_with("http") {
+            continue;
+        }
+        let key = canonical_search_url_key(&hit.href);
+        if seen.insert(key) {
+            deduped.push(hit);
+        }
+    }
+
+    let tokens = query_tokens(query);
+    let score = |hit: &WebSearchHit| -> i32 {
+        let href_l = hit.href.to_lowercase();
+        let title_l = hit.title.to_lowercase();
+        let body_l = hit.body.to_lowercase();
+        let mut s = 0;
+        if href_l.contains("wikipedia.org") {
+            s += 100;
+        }
+        if matches!(hit.engine, "brave" | "google" | "yahoo" | "startpage") {
+            s += 5;
+        }
+        let title_hits = tokens.iter().filter(|t| title_l.contains(*t)).count() as i32;
+        let body_hits = tokens.iter().filter(|t| body_l.contains(*t)).count() as i32;
+        if title_hits > 0 && body_hits > 0 {
+            s += 40;
+        } else if title_hits > 0 {
+            s += 25;
+        } else if body_hits > 0 {
+            s += 10;
+        }
+        s + title_hits * 3 + body_hits
+    };
+
+    deduped.sort_by(|a, b| score(b).cmp(&score(a)));
+    deduped
+}
+
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|s| s.to_lowercase())
+        .filter(|s| s.len() >= 3)
+        .collect()
+}
+
+fn canonical_search_url_key(url: &str) -> String {
+    let mut u = url.trim().trim_end_matches('/').to_lowercase();
+    for marker in ["?utm_", "&utm_", "?fbclid=", "&fbclid="] {
+        if let Some(i) = u.find(marker) {
+            u.truncate(i);
+        }
+    }
+    u
+}
+
+fn normalize_search_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_search_url(s: &str) -> String {
+    urldecode(s.trim()).replace(' ', "+")
+}
+
+fn collect_text(el: scraper::ElementRef<'_>, selector: &scraper::Selector) -> String {
+    el.select(selector)
+        .next()
+        .map(|x| normalize_search_text(&x.text().collect::<Vec<_>>().join(" ")))
+        .unwrap_or_default()
+}
+
+fn collect_attr(el: scraper::ElementRef<'_>, selector: &scraper::Selector, attr: &str) -> String {
+    el.select(selector)
+        .next()
+        .and_then(|x| x.value().attr(attr))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn reqwest_search_client() -> Result<reqwest::Client, String> {
+    let ua = ua();
+    let user_agent = if ua.is_empty() {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+    } else {
+        &ua
+    };
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))
+}
+
+async fn search_brave(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest_search_client()?;
+    let resp = client
+        .get("https://search.brave.com/search")
+        .query(&[("q", query), ("source", "web")])
+        .header(
+            reqwest::header::COOKIE,
+            "useLocation=0; safesearch=off; us=us",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("div[data-type='web']").unwrap();
+    let title_sel = scraper::Selector::parse("div.title, .sitename-container").unwrap();
+    let href_sel = scraper::Selector::parse("a[href]").unwrap();
+    let body_sel = scraper::Selector::parse(".snippet .content, .snippet").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &title_sel);
+        let href = collect_attr(item, &href_sel, "href");
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() && href.starts_with("http") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "brave",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+async fn search_ddg_native(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = primp::Client::builder()
         .impersonate(primp::Impersonate::ChromeV146)
         .impersonate_os(primp::ImpersonateOS::Linux)
         .timeout(Duration::from_secs(8))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("Error creating HTTP client: {e}"),
-    };
-    search_ddg(&client, &query, max_results).await
-}
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
 
-/// Python ddgs subprocess — identical to the proven Python Pengy approach.
-async fn search_ddgs_python(query: &str, max_results: usize) -> String {
-    let query = query.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let child = std::process::Command::new(python_interpreter())
-            .arg("-c")
-            .arg(
-                "import json,sys
-try:
-    from ddgs import DDGS
-except Exception as e:
-    print(json.dumps({'__pengy_error__': f'ddgs import failed: {e}'}))
-    sys.exit(0)
-r=list(DDGS().text(sys.argv[1], max_results=int(sys.argv[2])))
-print(json.dumps(r))",
-            )
-            .arg(&query)
-            .arg(max_results.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => return format!("ddgs spawn error: {e}"),
-        };
-
-        match wait_timeout_status(&mut child, Duration::from_secs(8)) {
-            Ok(Some(_)) => match child.wait_with_output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if stdout.is_empty() {
-                        let exit = output.status.code().unwrap_or(-1);
-                        return format!("ddgs: no output (exit {exit})");
-                    }
-                    stdout
-                }
-                Err(e) => format!("ddgs output error: {e}"),
-            },
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                "Web search timed out after 8 seconds.".into()
-            }
-            Err(e) => format!("ddgs wait error: {e}"),
-        }
-    })
-    .await;
-
-    let stdout = match result {
-        Ok(s) => s,
-        Err(e) => return format!("ddgs task error: {e}"),
-    };
-
-    if stdout.starts_with("ddgs ") || stdout.starts_with("Web search timed out") {
-        return stdout;
-    }
-
-    match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(json) => {
-            if let Some(err) = json.get("__pengy_error__").and_then(|v| v.as_str()) {
-                return err.to_string();
-            }
-            if let Some(arr) = json.as_array() {
-                if arr.is_empty() {
-                    return "No results found.".into();
-                }
-                let mut lines = Vec::new();
-                for (i, r) in arr.iter().enumerate() {
-                    if i >= max_results {
-                        break;
-                    }
-                    let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    let href = r.get("href").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = r.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    if title.is_empty() {
-                        continue;
-                    }
-                    lines.push(format!("{}. {title}", i + 1));
-                    if !href.is_empty() {
-                        lines.push(format!("   URL: {href}"));
-                    }
-                    if !body.is_empty() {
-                        lines.push(format!("   {body}"));
-                    }
-                    lines.push(String::new());
-                }
-                return if lines.is_empty() {
-                    "No results found.".into()
-                } else {
-                    lines.join("\n").trim().to_string()
-                };
-            }
-            format!(
-                "ddgs: unexpected JSON: {}",
-                &stdout[..200.min(stdout.len())]
-            )
-        }
-        Err(e) => format!(
-            "ddgs JSON error: {e} — raw: {}",
-            &stdout[..200.min(stdout.len())]
-        ),
-    }
-}
-
-
-/// Mojeek search — fast, server-rendered HTML, no rate limiting.
-/// Structure: ul.results-standard > li.rN > h2 > a.title (title+href) + p.s (snippet)
-async fn search_mojeek(query: &str, max_results: usize) -> String {
-    let encoded = urlencoding(query);
-    let url = format!("https://www.mojeek.com/search?q={encoded}");
-
-    let ua = ua();
-    let user_agent = if ua.is_empty() { "Pengy/2.0" } else { &ua };
-
-    let client = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .timeout(Duration::from_secs(8))
-        .build()
-        .unwrap_or_default();
-
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => return format!("Error searching Mojeek: {e}"),
-    };
-
-    if resp.status().as_u16() != 200 {
-        return format!("Mojeek returned HTTP {}.", resp.status().as_u16());
-    }
-
-    let html = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return format!("Error reading search response: {e}"),
-    };
-
-    let document = scraper::Html::parse_document(&html);
-    let mut results: Vec<String> = Vec::new();
-
-    // Mojeek: <li class="r1">...<h2><a class="title" href="URL">TITLE</a></h2>...<p class="s">SNIPPET</p></li>
-    let title_sel = scraper::Selector::parse("h2 a.title").unwrap();
-    let snippet_sel = scraper::Selector::parse("p.s").unwrap();
-    let li_sel = scraper::Selector::parse("ul.results-standard > li").unwrap();
-
-    for li in document.select(&li_sel) {
-        if results.len() >= max_results {
-            break;
-        }
-        let title = li
-            .select(&title_sel)
-            .next()
-            .map(|a| a.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-        let href = li
-            .select(&title_sel)
-            .next()
-            .and_then(|a| a.value().attr("href"))
-            .unwrap_or("")
-            .to_string();
-        let snippet = li
-            .select(&snippet_sel)
-            .next()
-            .map(|p| p.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-
-        if title.is_empty() {
-            continue;
-        }
-        let mut entry = format!("{}. {title}", results.len() + 1);
-        if !href.is_empty() {
-            entry.push_str(&format!("\n   URL: {href}"));
-        }
-        if !snippet.is_empty() {
-            entry.push_str(&format!("\n   {snippet}"));
-        }
-        results.push(entry);
-    }
-
-    if results.is_empty() {
-        "No results found.".into()
-    } else {
-        results.join("\n\n")
-    }
-}
-
-/// DuckDuckGo HTML search via primp — browser-impersonated POST with form data.
-/// Extracts results from the DDG HTML endpoint using correct CSS selectors.
-async fn search_ddg(client: &primp::Client, query: &str, max_results: usize) -> String {
-    let resp = match client
+    let resp = client
         .post("https://html.duckduckgo.com/html/")
         .form(&[("q", query), ("b", ""), ("l", "us-en")])
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(e) => return format!("Error searching DuckDuckGo: {e}"),
-    };
-
+        .map_err(|e| format!("request failed: {e}"))?;
     if resp.status().as_u16() != 200 {
-        return format!("DuckDuckGo returned HTTP {}.", resp.status().as_u16());
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
     }
-
-    let html = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return format!("Error reading search response: {e}"),
-    };
-
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
     if html.len() < 5000 {
-        return "DuckDuckGo returned a silent block page.".into();
+        return Err("returned a silent block page".into());
     }
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("div.result, div.web-result").unwrap();
+    let title_sel = scraper::Selector::parse("a.result__a").unwrap();
+    let body_sel = scraper::Selector::parse("div.result__snippet").unwrap();
 
-    let mut results: Vec<String> = Vec::new();
-    let document = scraper::Html::parse_document(&html);
-
-    let rs = scraper::Selector::parse("div.result").unwrap();
-    let ts = scraper::Selector::parse("a.result__a").unwrap();
-    let ss = scraper::Selector::parse("div.result__snippet").unwrap();
-
-    for el in document.select(&rs) {
-        if results.len() >= max_results {
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
             break;
         }
-        let title = el
-            .select(&ts)
-            .next()
-            .map(|a| a.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-        let href = el
-            .select(&ts)
-            .next()
-            .and_then(|a| a.value().attr("href"))
-            .map(|h| {
-                if let Some(p) = h.find("uddg=") {
-                    urldecode(&h[p + 5..])
-                } else {
-                    h.to_string()
-                }
-            })
-            .unwrap_or_default();
-        let snippet = el
-            .select(&ss)
-            .next()
-            .map(|s| s.text().collect::<String>().trim().to_string())
-            .unwrap_or_default();
-
-        if title.is_empty() {
-            continue;
+        let title = collect_text(item, &title_sel);
+        let mut href = collect_attr(item, &title_sel, "href");
+        if let Some(p) = href.find("uddg=") {
+            href = urldecode(&href[p + 5..]);
         }
-        if href.contains("duckduckgo.com/y.js") {
-            continue;
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() && !href.contains("duckduckgo.com/y.js") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "duckduckgo",
+            });
         }
-
-        let mut entry = format!("{}. {title}", results.len() + 1);
-        if !href.is_empty() {
-            entry.push_str(&format!("\n   URL: {href}"));
-        }
-        if !snippet.is_empty() {
-            entry.push_str(&format!("\n   {snippet}"));
-        }
-        results.push(entry);
     }
-
-    if results.is_empty() {
-        "No results found.".into()
+    if hits.is_empty() {
+        Err("No results found.".into())
     } else {
-        results.join("\n\n")
+        Ok(hits)
     }
 }
 
+async fn search_mojeek_native(
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest_search_client()?;
+    let resp = client
+        .get("https://www.mojeek.com/search")
+        .query(&[("q", query)])
+        .header(reqwest::header::COOKIE, "arc=us; lb=en")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("ul.results-standard > li, ul.results > li").unwrap();
+    let title_sel = scraper::Selector::parse("h2 a.title, h2 a[href]").unwrap();
+    let body_sel = scraper::Selector::parse("p.s").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &title_sel);
+        let href = collect_attr(item, &title_sel, "href");
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "mojeek",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+async fn search_yahoo(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest_search_client()?;
+    let token_a = uuid::Uuid::new_v4().simple().to_string();
+    let token_b = uuid::Uuid::new_v4().simple().to_string();
+    let url = format!("https://search.yahoo.com/search;_ylt={token_a};_ylu={token_b}");
+    let resp = client
+        .get(&url)
+        .query(&[("p", query)])
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("div[class*='relsrch']").unwrap();
+    let title_sel = scraper::Selector::parse("div[class*='Title'] h3, h3.title, h3").unwrap();
+    let href_sel =
+        scraper::Selector::parse("div[class*='Title'] a[href], h3 a[href], a[href]").unwrap();
+    let body_sel = scraper::Selector::parse("div[class*='Text'], p").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &title_sel);
+        let mut href = collect_attr(item, &href_sel, "href");
+        href = extract_yahoo_url(&href);
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() && href.starts_with("http") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "yahoo",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+fn extract_yahoo_url(raw: &str) -> String {
+    if let Some(start) = raw.find("/RU=") {
+        let rest = &raw[start + 4..];
+        let end = rest
+            .find("/RK=")
+            .or_else(|| rest.find("/RS="))
+            .unwrap_or(rest.len());
+        return urldecode(&rest[..end]);
+    }
+    raw.to_string()
+}
+
+fn google_mobile_ua() -> String {
+    // ddgs uses old-ish Android Chrome UAs plus the NST^WV suffix; keep it deterministic but similar.
+    "Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/56.0.2924.1880 Mobile Safari/537.36NST^WV".into()
+}
+
+async fn search_google(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(google_mobile_ua())
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("failed to create HTTP client: {e}"))?;
+    let resp = client
+        .get("https://www.google.com/search")
+        .query(&[
+            ("q", query),
+            ("filter", "1"),
+            ("start", "0"),
+            ("hl", "en-US"),
+            ("lr", "lang_en"),
+            ("cr", "countryUS"),
+        ])
+        .header(reqwest::header::COOKIE, "CONSENT=YES+")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("div[data-hveid]").unwrap();
+    let h3_sel = scraper::Selector::parse("h3").unwrap();
+    let href_sel = scraper::Selector::parse("a[href]").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &h3_sel);
+        if title.is_empty() {
+            continue;
+        }
+        let mut href = String::new();
+        for a in item.select(&href_sel) {
+            let h = a.value().attr("href").unwrap_or("");
+            if h.starts_with("/url?q=") || h.starts_with("http") {
+                href = h.to_string();
+                break;
+            }
+        }
+        if href.starts_with("/url?q=") {
+            href = href
+                .split("?q=")
+                .nth(1)
+                .unwrap_or("")
+                .split('&')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            href = urldecode(&href);
+        }
+        let all_text = normalize_search_text(&item.text().collect::<Vec<_>>().join(" "));
+        let body = normalize_search_text(all_text.replacen(&title, "", 1).as_str());
+        if href.starts_with("http") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "google",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+async fn search_startpage(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest_search_client()?;
+    let home = client
+        .get("https://www.startpage.com/")
+        .send()
+        .await
+        .map_err(|e| format!("home request failed: {e}"))?;
+    if !home.status().is_success() {
+        return Err(format!("home returned HTTP {}", home.status().as_u16()));
+    }
+    let home_html = home
+        .text()
+        .await
+        .map_err(|e| format!("home read failed: {e}"))?;
+    let sc = {
+        let home_doc = scraper::Html::parse_document(&home_html);
+        let sc_sel =
+            scraper::Selector::parse("form#search input[name='sc'], input[name='sc']").unwrap();
+        home_doc
+            .select(&sc_sel)
+            .next()
+            .and_then(|x| x.value().attr("value"))
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let form = [
+        ("query", query),
+        ("cat", "web"),
+        ("t", "device"),
+        ("sc", sc.as_str()),
+        ("lui", "english"),
+        ("language", "english"),
+        ("abp", "1"),
+        ("abd", "0"),
+        ("abe", "0"),
+        ("qsr", "en_US"),
+        ("qadf", "none"),
+        ("segment", "organic"),
+    ];
+    let resp = client
+        .post("https://www.startpage.com/sp/search")
+        .header(reqwest::header::REFERER, "https://www.startpage.com/")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("div.result").unwrap();
+    let title_sel = scraper::Selector::parse("h2, h3").unwrap();
+    let href_sel = scraper::Selector::parse("a[href]").unwrap();
+    let body_sel = scraper::Selector::parse("p").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &title_sel);
+        let href = collect_attr(item, &href_sel, "href");
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() && href.starts_with("http") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "startpage",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+async fn search_yandex(query: &str, max_results: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest_search_client()?;
+    let searchid = format!(
+        "{}",
+        (Instant::now().elapsed().as_nanos() % 9_000_000) + 1_000_000
+    );
+    let resp = client
+        .get("https://yandex.com/search/site/")
+        .query(&[
+            ("text", query),
+            ("web", "1"),
+            ("searchid", searchid.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("returned HTTP {}", resp.status().as_u16()));
+    }
+    let html = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let doc = scraper::Html::parse_document(&html);
+    let item_sel = scraper::Selector::parse("li.serp-item, li[class*='serp-item']").unwrap();
+    let title_sel = scraper::Selector::parse("h3").unwrap();
+    let href_sel = scraper::Selector::parse("h3 a[href], a[href]").unwrap();
+    let body_sel = scraper::Selector::parse("div[class*='text']").unwrap();
+
+    let mut hits = Vec::new();
+    for item in doc.select(&item_sel) {
+        if hits.len() >= max_results {
+            break;
+        }
+        let title = collect_text(item, &title_sel);
+        let href = collect_attr(item, &href_sel, "href");
+        let body = collect_text(item, &body_sel);
+        if !title.is_empty() && href.starts_with("http") {
+            hits.push(WebSearchHit {
+                title,
+                href,
+                body,
+                engine: "yandex",
+            });
+        }
+    }
+    if hits.is_empty() {
+        Err("No results found.".into())
+    } else {
+        Ok(hits)
+    }
+}
+
+#[allow(dead_code)]
 fn urlencoding(s: &str) -> String {
     let mut result = String::new();
     for byte in s.as_bytes() {
@@ -1126,10 +1441,7 @@ async fn run_python(code: String) -> String {
                 s.push_str(&err);
             }
             if !status.success() {
-                s.push_str(&format!(
-                    "\n[Exit code: {}]",
-                    status.code().unwrap_or(-1)
-                ));
+                s.push_str(&format!("\n[Exit code: {}]", status.code().unwrap_or(-1)));
             }
             if s.is_empty() {
                 "(No output)".into()
@@ -1148,7 +1460,6 @@ async fn run_python(code: String) -> String {
         Err(join_err) => format!("Error: Task panicked: {join_err}"),
     }
 }
-
 
 fn python_interpreter() -> PathBuf {
     if let Ok(path) = std::env::var("PENGY_PYTHON") {
