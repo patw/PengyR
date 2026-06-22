@@ -402,17 +402,22 @@ async fn run_bash(command: String) -> String {
         }
     }
 
-    // Ensure sudo reads password from stdin
+    // Ensure privileged commands read password from stdin
     let command = if password_needed && !command.contains("sudo -S") {
         command.replacen("sudo", "sudo -S", 1)
     } else {
         command
     };
 
+    let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("bash") {
+        Ok(files) => files,
+        Err(e) => return format!("Error creating output files: {e}"),
+    };
+
     let mut cmd = std::process::Command::new("bash");
     cmd.arg("-c").arg(&command);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stdout(Stdio::from(stdout_file));
+    cmd.stderr(Stdio::from(stderr_file));
     cmd.stdin(Stdio::piped());
     #[cfg(unix)]
     {
@@ -422,7 +427,10 @@ async fn run_bash(command: String) -> String {
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return format!("Error running command: {e}"),
+        Err(e) => {
+            remove_output_files(&stdout_path, &stderr_path);
+            return format!("Error running command: {e}");
+        }
     };
 
     let pid = child.id();
@@ -437,102 +445,69 @@ async fn run_bash(command: String) -> String {
         }
     }
 
-    // Use tokio::task::spawn_blocking to avoid blocking the async runtime
+    // Use tokio::task::spawn_blocking to avoid blocking the async runtime.
+    // Output is redirected to files instead of piped: a child that writes more
+    // than an OS pipe buffer can otherwise block forever before it exits.
     let result = tokio::task::spawn_blocking(move || {
-        if timeout > 0 {
-            let dur = Duration::from_secs(timeout);
-            match wait_timeout(&mut child, dur) {
-                Ok(Some(output)) => {
-                    unregister_active_process(pid);
-                    Ok(output)
-                }
+        let wait_result = if timeout > 0 {
+            match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
+                Ok(Some(status)) => Ok(status),
                 Ok(None) => {
                     // Timed out — kill the process group
                     terminate_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
-                    unregister_active_process(pid);
                     Err(format!("Error: Command timed out after {timeout} seconds"))
                 }
                 Err(e) => Err(format!("Error running command: {e}")),
             }
         } else {
-            match child.wait_with_output() {
-                Ok(output) => {
-                    unregister_active_process(pid);
-                    Ok(output)
-                }
-                Err(e) => {
-                    unregister_active_process(pid);
-                    Err(format!("Error running command: {e}"))
-                }
-            }
-        }
-    })
-    .await;
+            child
+                .wait()
+                .map_err(|e| format!("Error running command: {e}"))
+        };
+        unregister_active_process(pid);
 
-    match result {
-        Ok(Ok(output)) => {
-            let mut out = String::from_utf8_lossy(&output.stdout).to_string();
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut out = read_and_remove(&stdout_path);
+        let err = read_and_remove(&stderr_path);
+        wait_result.map(|status| {
             let err = Regex::new(r"^\[sudo[^]]*\].*\n?")
                 .unwrap()
-                .replace_all(&err, "");
+                .replace_all(&err, "")
+                .to_string();
             if !err.is_empty() {
                 out.push('\n');
                 out.push_str(&err);
             }
-            if !output.status.success() {
-                out.push_str(&format!(
-                    "\n[Exit code: {}]",
-                    output.status.code().unwrap_or(-1)
-                ));
+            if !status.success() {
+                out.push_str(&format!("\n[Exit code: {}]", status.code().unwrap_or(-1)));
             }
             if out.is_empty() {
                 "(No output)".into()
             } else {
                 out
             }
-        }
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(out)) => out,
         Ok(Err(e)) => e,
         Err(join_err) => format!("Error: Task panicked: {join_err}"),
     }
 }
 
+
 /// Wait for a child process with a timeout, without blocking the async runtime.
-fn wait_timeout(
+fn wait_timeout_status(
     child: &mut std::process::Child,
     dur: Duration,
-) -> Result<Option<std::process::Output>, std::io::Error> {
+) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
     let start = std::time::Instant::now();
     loop {
         match child.try_wait()? {
-            Some(status) => {
-                // Process exited — collect output
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = Vec::new();
-                        let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = Vec::new();
-                        let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                return Ok(Some(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                }));
-            }
+            Some(status) => return Ok(Some(status)),
             None => {
                 if start.elapsed() >= dur {
                     return Ok(None);
@@ -542,6 +517,40 @@ fn wait_timeout(
         }
     }
 }
+
+fn temp_output_paths(prefix: &str) -> (PathBuf, PathBuf) {
+    let mut out = std::env::temp_dir();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    out.push(format!("pengy_{prefix}_{}_{}.out", std::process::id(), nanos));
+
+    let mut err = std::env::temp_dir();
+    err.push(format!("pengy_{prefix}_{}_{}.err", std::process::id(), nanos));
+    (out, err)
+}
+
+fn create_output_files(
+    prefix: &str,
+) -> Result<(PathBuf, PathBuf, std::fs::File, std::fs::File), std::io::Error> {
+    let (stdout_path, stderr_path) = temp_output_paths(prefix);
+    let stdout_file = std::fs::File::create(&stdout_path)?;
+    let stderr_file = std::fs::File::create(&stderr_path)?;
+    Ok((stdout_path, stderr_path, stdout_file, stderr_file))
+}
+
+fn read_and_remove(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
+    text
+}
+
+fn remove_output_files(stdout_path: &Path, stderr_path: &Path) {
+    let _ = std::fs::remove_file(stdout_path);
+    let _ = std::fs::remove_file(stderr_path);
+}
+
 
 // ── Rate limiter for web searches ──
 
@@ -596,34 +605,67 @@ async fn web_search(query: String, max_results: usize) -> String {
 
 /// Python ddgs subprocess — identical to the proven Python Pengy approach.
 async fn search_ddgs_python(query: &str, max_results: usize) -> String {
-    let safe_query = query.replace('\'', "'\\''");
-    let cmd = format!(
-        "timeout 8 python3 -c 'import json,sys;from ddgs import DDGS;d=DDGS();r=list(d.text(sys.argv[1],max_results=int(sys.argv[2])));print(json.dumps(r))' '{}' {} 2>/dev/null",
-        safe_query, max_results
-    );
+    let query = query.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let child = std::process::Command::new(python_interpreter())
+            .arg("-c")
+            .arg(
+                "import json,sys
+try:
+    from ddgs import DDGS
+except Exception as e:
+    print(json.dumps({'__pengy_error__': f'ddgs import failed: {e}'}))
+    sys.exit(0)
+r=list(DDGS().text(sys.argv[1], max_results=int(sys.argv[2])))
+print(json.dumps(r))",
+            )
+            .arg(&query)
+            .arg(max_results.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
 
-    let output = match std::process::Command::new("bash")
-        .arg("-c")
-        .arg(&cmd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => return format!("ddgs spawn error: {e}"),
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => return format!("ddgs spawn error: {e}"),
+        };
+
+        match wait_timeout_status(&mut child, Duration::from_secs(8)) {
+            Ok(Some(_)) => match child.wait_with_output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if stdout.is_empty() {
+                        let exit = output.status.code().unwrap_or(-1);
+                        return format!("ddgs: no output (exit {exit})");
+                    }
+                    stdout
+                }
+                Err(e) => format!("ddgs output error: {e}"),
+            },
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                "Web search timed out after 8 seconds.".into()
+            }
+            Err(e) => format!("ddgs wait error: {e}"),
+        }
+    })
+    .await;
+
+    let stdout = match result {
+        Ok(s) => s,
+        Err(e) => return format!("ddgs task error: {e}"),
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let exit = output.status.code().unwrap_or(-1);
-    if exit == 124 {
-        return "Web search timed out after 8 seconds.".into();
-    }
-    if stdout.is_empty() {
-        return format!("ddgs: no output (exit {exit})");
+    if stdout.starts_with("ddgs ") || stdout.starts_with("Web search timed out") {
+        return stdout;
     }
 
     match serde_json::from_str::<serde_json::Value>(&stdout) {
         Ok(json) => {
+            if let Some(err) = json.get("__pengy_error__").and_then(|v| v.as_str()) {
+                return err.to_string();
+            }
             if let Some(arr) = json.as_array() {
                 if arr.is_empty() {
                     return "No results found.".into();
@@ -665,6 +707,7 @@ async fn search_ddgs_python(query: &str, max_results: usize) -> String {
         ),
     }
 }
+
 
 /// Mojeek search — fast, server-rendered HTML, no rate limiting.
 /// Structure: ul.results-standard > li.rN > h2 > a.title (title+href) + p.s (snippet)
@@ -1025,8 +1068,18 @@ async fn run_python(code: String) -> String {
         return format!("Error writing temp file: {e}");
     }
 
+    let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("python") {
+        Ok(files) => files,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return format!("Error creating output files: {e}");
+        }
+    };
+
     let mut cmd = std::process::Command::new(python_interpreter());
-    cmd.arg(&tmp).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg(&tmp)
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1037,6 +1090,7 @@ async fn run_python(code: String) -> String {
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
+            remove_output_files(&stdout_path, &stderr_path);
             return format!("Error running Python: {e}");
         }
     };
@@ -1045,8 +1099,8 @@ async fn run_python(code: String) -> String {
 
     let result = tokio::task::spawn_blocking(move || {
         let wait_result = if timeout > 0 {
-            match wait_timeout(&mut child, Duration::from_secs(timeout)) {
-                Ok(Some(output)) => Ok(output),
+            match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
+                Ok(Some(status)) => Ok(status),
                 Ok(None) => {
                     terminate_process_group(pid);
                     let _ = child.kill();
@@ -1059,28 +1113,22 @@ async fn run_python(code: String) -> String {
             }
         } else {
             child
-                .wait_with_output()
+                .wait()
                 .map_err(|e| format!("Error running Python: {e}"))
         };
         unregister_active_process(pid);
-        wait_result
-    })
-    .await;
 
-    let _ = std::fs::remove_file(&tmp);
-
-    match result {
-        Ok(Ok(out)) => {
-            let mut s = String::from_utf8_lossy(&out.stdout).to_string();
-            let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let mut s = read_and_remove(&stdout_path);
+        let err = read_and_remove(&stderr_path);
+        wait_result.map(|status| {
             if !err.is_empty() {
                 s.push('\n');
                 s.push_str(&err);
             }
-            if !out.status.success() {
+            if !status.success() {
                 s.push_str(&format!(
                     "\n[Exit code: {}]",
-                    out.status.code().unwrap_or(-1)
+                    status.code().unwrap_or(-1)
                 ));
             }
             if s.is_empty() {
@@ -1088,11 +1136,19 @@ async fn run_python(code: String) -> String {
             } else {
                 s
             }
-        }
+        })
+    })
+    .await;
+
+    let _ = std::fs::remove_file(&tmp);
+
+    match result {
+        Ok(Ok(out)) => out,
         Ok(Err(e)) => e,
         Err(join_err) => format!("Error: Task panicked: {join_err}"),
     }
 }
+
 
 fn python_interpreter() -> PathBuf {
     if let Ok(path) = std::env::var("PENGY_PYTHON") {
@@ -1780,13 +1836,14 @@ mod tests {
                 .expect("outer safety net should finish before test timeout");
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(
-            result.contains("Python execution timed out after 1 seconds")
-                || result.contains("Tool timed out (outer safety net after 31s)")
+            result.contains("Python execution timed out")
+                || result.contains("Tool timed out (outer safety net")
         );
     }
 
     #[test]
     fn kill_active_process_removes_registered_process_group() {
+        let _guard = test_tool_timeout_guard();
         let mut command = std::process::Command::new("bash");
         command
             .arg("-c")

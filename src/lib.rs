@@ -10,7 +10,7 @@ pub mod llm_client;
 pub mod tools;
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 // ── Global tokio runtime ──────────────────────────────────────────
 
