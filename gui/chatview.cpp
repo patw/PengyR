@@ -20,6 +20,12 @@ ChatView::ChatView(QWidget* parent) : QTextBrowser(parent) {
         "a { color: #a05000; }"
         "pre { background: #f5f5f5; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }"
         "code { background: #f0f0f0; padding: 1px 3px; border-radius: 2px; }"
+        ".code-lang { background: #e8e8e8; color: #555; font-size: 8pt; padding: 2px 6px; margin: 6px 0 0 0; border-radius: 4px 4px 0 0; font-family: monospace; }"
+        ".code-lang + pre { margin-top: 0; border-radius: 0 0 4px 4px; }"
+        "blockquote { border-left: 3px solid #ddd; margin: 6px 0; padding: 2px 0 2px 10px; color: #555; }"
+        "hr { border: 0; border-top: 1px solid #ddd; margin: 10px 0; }"
+        "ul, ol { margin: 4px 0 8px 20px; padding-left: 16px; }"
+        "li { margin: 2px 0; }"
         "table { border: 1px solid #ccc; margin: 6px 0; }"
         "th, td { border: 1px solid #ccc; padding: 4px 10px; }"
         "th { background: #f0f0f0; font-weight: bold; }"
@@ -236,8 +242,23 @@ QString ChatView::markdownToHtml(const QString& md) const {
     // ── Phase 2: markdown → HTML ─────────────────────────────────────
     // Convert ``` code blocks FIRST — prevents their contents from
     // being falsely matched by table / image / link regexes below.
-    static QRegularExpression codeBlockRx("```(\\w*)\\n([\\s\\S]*?)```");
-    result.replace(codeBlockRx, "<pre><code>\\2</code></pre>");
+    static QRegularExpression codeBlockRx("```([A-Za-z0-9_+.-]*)\\n([\\s\\S]*?)```");
+    {
+        QList<QRegularExpressionMatch> matches;
+        QRegularExpressionMatchIterator it = codeBlockRx.globalMatch(result);
+        while (it.hasNext()) matches.append(it.next());
+        for (int i = matches.size() - 1; i >= 0; --i) {
+            const QRegularExpressionMatch& m = matches[i];
+            QString lang = m.captured(1).trimmed();
+            QString code = m.captured(2);
+            QString html;
+            if (!lang.isEmpty()) {
+                html += "<div class='code-lang'>" + lang + "</div>";
+            }
+            html += "<pre><code>" + code + "</code></pre>";
+            result.replace(m.capturedStart(), m.capturedLength(), html);
+        }
+    }
 
     // Inline code BEFORE image/link so `![not-an-image](url)` is safe
     static QRegularExpression inlineCodeRx("`([^`]+)`");
@@ -270,6 +291,9 @@ QString ChatView::markdownToHtml(const QString& md) const {
         }
     }
 
+    // Lists, blockquotes, and horizontal rules
+    result = convertMarkdownBlocks(result);
+
     // **bold** and *italic*
     static QRegularExpression boldRx("\\*\\*(.+?)\\*\\*");
     result.replace(boldRx, "<b>\\1</b>");
@@ -300,6 +324,97 @@ QString ChatView::markdownToHtml(const QString& md) const {
     return result;
 }
 
+
+QString ChatView::convertMarkdownBlocks(const QString& html) const {
+    QStringList lines = html.split('\n');
+    QStringList out;
+    bool inUl = false;
+    bool inOl = false;
+    bool inBlockquote = false;
+    bool inPre = false;
+
+    auto closeLists = [&]() {
+        if (inUl) { out.append("</ul>"); inUl = false; }
+        if (inOl) { out.append("</ol>"); inOl = false; }
+    };
+    auto closeBlockquote = [&]() {
+        if (inBlockquote) { out.append("</blockquote>"); inBlockquote = false; }
+    };
+
+    static QRegularExpression ulRx("^\\s*[-+]\\s+(.+)$");
+    static QRegularExpression starUlRx("^\\s*\\*\\s+(.+)$");
+    static QRegularExpression olRx("^\\s*\\d+[\\.)]\\s+(.+)$");
+    static QRegularExpression bqRx("^\\s*&gt;\\s?(.*)$");
+    static QRegularExpression hrRx("^\\s*(?:-{3,}|\\*{3,}|_{3,})\\s*$");
+
+    for (const QString& rawLine : lines) {
+        QString trimmed = rawLine.trimmed();
+
+        if (rawLine.contains("<pre")) inPre = true;
+        if (inPre) {
+            closeLists();
+            closeBlockquote();
+            out.append(rawLine);
+            if (rawLine.contains("</pre>")) inPre = false;
+            continue;
+        }
+
+        if (trimmed.isEmpty()) {
+            closeLists();
+            closeBlockquote();
+            out.append(rawLine);
+            continue;
+        }
+
+        QRegularExpressionMatch bq = bqRx.match(rawLine);
+        if (bq.hasMatch()) {
+            closeLists();
+            if (!inBlockquote) {
+                out.append("<blockquote>");
+                inBlockquote = true;
+            } else {
+                out.append("<br>");
+            }
+            out.append(bq.captured(1));
+            continue;
+        }
+
+        QRegularExpressionMatch ol = olRx.match(rawLine);
+        if (ol.hasMatch()) {
+            closeBlockquote();
+            if (inUl) { out.append("</ul>"); inUl = false; }
+            if (!inOl) { out.append("<ol>"); inOl = true; }
+            out.append("<li>" + ol.captured(1) + "</li>");
+            continue;
+        }
+
+        QRegularExpressionMatch ul = ulRx.match(rawLine);
+        if (!ul.hasMatch()) ul = starUlRx.match(rawLine);
+        if (ul.hasMatch()) {
+            closeBlockquote();
+            if (inOl) { out.append("</ol>"); inOl = false; }
+            if (!inUl) { out.append("<ul>"); inUl = true; }
+            out.append("<li>" + ul.captured(1) + "</li>");
+            continue;
+        }
+
+        if (hrRx.match(rawLine).hasMatch()) {
+            closeLists();
+            closeBlockquote();
+            out.append("<hr>");
+            continue;
+        }
+
+        closeLists();
+        closeBlockquote();
+        out.append(rawLine);
+    }
+
+    closeLists();
+    closeBlockquote();
+    return out.join("\n");
+}
+
 QString ChatView::paragraphize(const QString& html) const {
     QStringList parts = html.split("\n\n");
     for (int i = 0; i < parts.size(); ++i) {
@@ -311,7 +426,8 @@ QString ChatView::paragraphize(const QString& html) const {
                     || p.startsWith("<h3")  || p.startsWith("<h4")
                     || p.startsWith("<ul")  || p.startsWith("<ol")
                     || p.startsWith("<li")  || p.startsWith("<blockquote")
-                    || p.startsWith("<img")  || p.startsWith("<video")
+                    || p.startsWith("<hr")  || p.startsWith("<img")
+                    || p.startsWith("<video")
                     || p.startsWith("<svg");
         if (!isBlock) {
             p.replace("\n", "<br>");

@@ -4,10 +4,10 @@
 //! Events are reported via callback. Tool confirmations block
 //! on a condition variable that the Qt main thread signals.
 
-pub mod config;
 pub mod chat_manager;
-pub mod tools;
+pub mod config;
 pub mod llm_client;
+pub mod tools;
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -29,7 +29,11 @@ fn rt() -> &'static tokio::runtime::Runtime {
 // ── Helper: C string → Rust string ────────────────────────────────
 
 unsafe fn cstr(s: *const c_char) -> String {
-    if s.is_null() { String::new() } else { CStr::from_ptr(s).to_string_lossy().into_owned() }
+    if s.is_null() {
+        String::new()
+    } else {
+        CStr::from_ptr(s).to_string_lossy().into_owned()
+    }
 }
 
 fn to_c(s: &str) -> *mut c_char {
@@ -96,7 +100,9 @@ pub extern "C" fn pengy_chat_get(id: *const c_char) -> *mut c_char {
 pub extern "C" fn pengy_clean_messages(json: *const c_char) -> *mut c_char {
     let msgs: Vec<chat_manager::ChatMessage> =
         serde_json::from_str(&unsafe { cstr(json) }).unwrap_or_default();
-    to_c(&serde_json::to_string(&chat_manager::clean_dangling_tool_calls(&msgs)).unwrap_or_default())
+    to_c(
+        &serde_json::to_string(&chat_manager::clean_dangling_tool_calls(&msgs)).unwrap_or_default(),
+    )
 }
 
 // ── Tools ─────────────────────────────────────────────────────────
@@ -160,8 +166,7 @@ pub extern "C" fn pengy_llm_chat_run(
     let ms = unsafe { cstr(messages_json) };
     let tc_str = unsafe { cstr(tool_confirmation) };
 
-    let messages: Vec<chat_manager::ChatMessage> =
-        serde_json::from_str(&ms).unwrap_or_default();
+    let messages: Vec<chat_manager::ChatMessage> = serde_json::from_str(&ms).unwrap_or_default();
     let tc_mode = llm_client::ToolConfirmation::from_str(&tc_str);
 
     // Wire up sudo password provider if a SudoState pointer was given
@@ -169,8 +174,10 @@ pub extern "C" fn pengy_llm_chat_run(
         let sudo_ptr = sudo_state as usize; // safe to send across threads
         *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(Box::new(move || {
             let state = sudo_ptr as *mut SudoState;
-            unsafe { std::ptr::write_volatile(&mut (*state).status, 1); } // pending
-            // Busy-wait for Qt main thread to respond
+            unsafe {
+                std::ptr::write_volatile(&mut (*state).status, 1);
+            } // pending
+              // Busy-wait for Qt main thread to respond
             loop {
                 let status = unsafe { std::ptr::read_volatile(&(*state).status) };
                 if status == 2 {
@@ -178,12 +185,16 @@ pub extern "C" fn pengy_llm_chat_run(
                     let bytes = unsafe { &(*state).password };
                     let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                     let pw = String::from_utf8_lossy(&bytes[..len]).into_owned();
-                    unsafe { std::ptr::write_volatile(&mut (*state).status, 0); } // reset
+                    unsafe {
+                        std::ptr::write_volatile(&mut (*state).status, 0);
+                    } // reset
                     return Some(pw);
                 }
                 if status == 3 {
                     // Cancelled
-                    unsafe { std::ptr::write_volatile(&mut (*state).status, 0); } // reset
+                    unsafe {
+                        std::ptr::write_volatile(&mut (*state).status, 0);
+                    } // reset
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -198,9 +209,9 @@ pub extern "C" fn pengy_llm_chat_run(
     let cancel2 = cancel.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
-            &bu, &ak, &md, messages, tc_mode,
-            event_tx, confirm_rx, cancel2,
-        ).await;
+            &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+        )
+        .await;
     }));
 
     let result = 'outer: loop {
@@ -228,7 +239,8 @@ pub extern "C" fn pengy_llm_chat_run(
                             }
                             // Busy-wait for Qt to respond (runs on QThread, not main thread)
                             loop {
-                                let status = unsafe { std::ptr::read_volatile(&(*confirm_state).status) };
+                                let status =
+                                    unsafe { std::ptr::read_volatile(&(*confirm_state).status) };
                                 if status == 2 || status == 3 {
                                     break;
                                 }
@@ -246,7 +258,9 @@ pub extern "C" fn pengy_llm_chat_run(
                                 let status = std::ptr::read_volatile(&(*confirm_state).status);
                                 (status == 2, (*confirm_state).yolo_turn)
                             };
-                            unsafe { std::ptr::write_volatile(&mut (*confirm_state).status, 0); }
+                            unsafe {
+                                std::ptr::write_volatile(&mut (*confirm_state).status, 0);
+                            }
                             let _ = confirm_tx.send(llm_client::Confirmation {
                                 tool_call_id: String::new(),
                                 confirmed,
@@ -301,7 +315,9 @@ pub extern "C" fn pengy_llm_chat_run(
 #[no_mangle]
 pub extern "C" fn pengy_llm_cancel(cancel_flag: *mut bool) {
     if !cancel_flag.is_null() {
-        unsafe { *cancel_flag = true; }
+        unsafe {
+            *cancel_flag = true;
+        }
     }
     tools::kill_active_process();
 }
@@ -310,5 +326,9 @@ pub extern "C" fn pengy_llm_cancel(cancel_flag: *mut bool) {
 
 #[no_mangle]
 pub extern "C" fn pengy_free(s: *mut c_char) {
-    if !s.is_null() { unsafe { drop(CString::from_raw(s)); } }
+    if !s.is_null() {
+        unsafe {
+            drop(CString::from_raw(s));
+        }
+    }
 }

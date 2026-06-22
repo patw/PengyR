@@ -16,9 +16,7 @@ use tokio::sync::mpsc;
 #[serde(tag = "type")]
 pub enum LlmEvent {
     #[serde(rename = "assistant_tool_calls")]
-    AssistantToolCalls {
-        message: ChatMessage,
-    },
+    AssistantToolCalls { message: ChatMessage },
     #[serde(rename = "tool_request")]
     ToolRequest {
         name: String,
@@ -34,10 +32,7 @@ pub enum LlmEvent {
         declined: bool,
     },
     #[serde(rename = "final_response")]
-    FinalResponse {
-        content: String,
-        usage: Usage,
-    },
+    FinalResponse { content: String, usage: Usage },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,12 +177,18 @@ pub async fn chat(
 
         // Accumulate usage
         if let Some(usage) = body["usage"].as_object() {
-            accumulated_usage.prompt_tokens +=
-                usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            accumulated_usage.completion_tokens +=
-                usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            accumulated_usage.total_tokens +=
-                usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            accumulated_usage.prompt_tokens += usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            accumulated_usage.completion_tokens += usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            accumulated_usage.total_tokens += usage
+                .get("total_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
         }
 
         let msg = &choice["message"];
@@ -207,7 +208,10 @@ pub async fn chat(
                             call_type: "function".into(),
                             function: crate::chat_manager::FunctionCall {
                                 name: tc["function"]["name"].as_str().unwrap_or("").into(),
-                                arguments: tc["function"]["arguments"].as_str().unwrap_or("{}").into(),
+                                arguments: tc["function"]["arguments"]
+                                    .as_str()
+                                    .unwrap_or("{}")
+                                    .into(),
                             },
                         })
                         .collect(),
@@ -231,7 +235,8 @@ pub async fn chat(
                     let tc_id = tc["id"].as_str().unwrap_or("").to_string();
                     let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                     let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                    let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
+                    let args: serde_json::Value =
+                        serde_json::from_str(args_str).unwrap_or_default();
 
                     // Decide if we need user confirmation
                     let skip_confirm = tool_confirmation == ToolConfirmation::All
@@ -297,7 +302,8 @@ pub async fn chat(
                             }
                             _ => {
                                 // Declined or channel closed
-                                let declined_msg = "Tool execution was declined by user.".to_string();
+                                let declined_msg =
+                                    "Tool execution was declined by user.".to_string();
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
@@ -352,7 +358,10 @@ mod tests {
     #[test]
     fn tool_confirmation_from_str_unknown_defaults_to_none() {
         assert_eq!(ToolConfirmation::from_str(""), ToolConfirmation::None);
-        assert_eq!(ToolConfirmation::from_str("garbage"), ToolConfirmation::None);
+        assert_eq!(
+            ToolConfirmation::from_str("garbage"),
+            ToolConfirmation::None
+        );
     }
 
     #[test]
@@ -366,7 +375,9 @@ mod tests {
         assert!(json.contains("\"type\":\"tool_request\""));
         let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            LlmEvent::ToolRequest { name, tool_call_id, .. } => {
+            LlmEvent::ToolRequest {
+                name, tool_call_id, ..
+            } => {
                 assert_eq!(name, "read_file");
                 assert_eq!(tool_call_id, "tc-123");
             }
@@ -409,7 +420,9 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            LlmEvent::ToolResult { declined, content, .. } => {
+            LlmEvent::ToolResult {
+                declined, content, ..
+            } => {
                 assert!(!declined);
                 assert_eq!(content, "file.txt\n");
             }

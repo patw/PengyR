@@ -1,0 +1,4 @@
+set(__QT_DEPLOY_TARGET_pengy_FILE /Users/patw/dev/PengyR/gui/build_test/pengy)
+set(__QT_DEPLOY_TARGET_pengy_TYPE EXECUTABLE)
+set(__QT_DEPLOY_TARGET_pengy_chatview_markdown_test_FILE /Users/patw/dev/PengyR/gui/build_test/pengy_chatview_markdown_test)
+set(__QT_DEPLOY_TARGET_pengy_chatview_markdown_test_TYPE EXECUTABLE)

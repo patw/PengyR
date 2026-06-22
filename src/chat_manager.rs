@@ -175,7 +175,9 @@ pub fn clean_dangling_tool_calls(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 pending_ids.remove(&missing_id);
                 cleaned.push(ChatMessage {
                     role: "tool".into(),
-                    content: Some(serde_json::Value::String("Tool execution was cancelled by user.".into())),
+                    content: Some(serde_json::Value::String(
+                        "Tool execution was cancelled by user.".into(),
+                    )),
                     tool_calls: vec![],
                     tool_call_id: Some(missing_id),
                 });
@@ -229,7 +231,9 @@ pub fn elide_old_tool_results(messages: &[ChatMessage], keep_turns: usize) -> Ve
         .map(|(idx, msg)| {
             if msg.role == "tool" && !recent_indices.contains(&idx) {
                 ChatMessage {
-                    content: Some(serde_json::Value::String("[tool output from earlier turn elided]".into())),
+                    content: Some(serde_json::Value::String(
+                        "[tool output from earlier turn elided]".into(),
+                    )),
                     ..msg.clone()
                 }
             } else {
@@ -440,7 +444,9 @@ mod tests {
         ];
         let cleaned = clean_dangling_tool_calls(&msgs);
         assert_eq!(cleaned.len(), 4);
-        assert!(cleaned.iter().all(|m| m.role == "assistant" || m.role == "tool"));
+        assert!(cleaned
+            .iter()
+            .all(|m| m.role == "assistant" || m.role == "tool"));
     }
 
     #[test]

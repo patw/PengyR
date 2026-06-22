@@ -19,6 +19,10 @@ public:
     }
     void clear();
 
+#ifdef PENGY_UNIT_TEST
+    QString testMarkdownToHtml(const QString& md) const { return markdownToHtml(md); }
+#endif
+
 protected:
     void mousePressEvent(QMouseEvent* event) override;
     QVariant loadResource(int type, const QUrl& url) override;
@@ -33,6 +37,7 @@ private:
     QString renderToolBlock(const QJsonObject& msg) const;
     QString markdownToHtml(const QString& md) const;
     QString convertMarkdownTables(const QString& md) const;
+    QString convertMarkdownBlocks(const QString& html) const;
     QString paragraphize(const QString& html) const;
     QString escapeHtml(const QString& text) const;
     void fetchImage(const QString& url);

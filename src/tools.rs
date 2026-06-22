@@ -2,6 +2,7 @@
 //!
 //! Defines 11 OpenAI function-calling tools and their implementations.
 
+use futures_util::StreamExt;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -13,13 +14,15 @@ use std::time::{Duration, Instant};
 
 // ── Global state ────────────────────────────────────────────────────
 
-pub static SUDO_PASSWORD_PROVIDER: Mutex<
-    Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
-> = Mutex::new(None);
+pub static SUDO_PASSWORD_PROVIDER: Mutex<Option<Box<dyn Fn() -> Option<String> + Send + Sync>>> =
+    Mutex::new(None);
 
 pub static CACHED_SUDO_PASSWORD: Mutex<Option<String>> = Mutex::new(None);
 pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(60);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
+
+static ACTIVE_PROCESS_GROUPS: once_cell::sync::Lazy<Mutex<HashSet<u32>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashSet::new()));
 
 // ── Tool schema definitions ─────────────────────────────────────────
 
@@ -94,18 +97,15 @@ pub fn tool_definitions() -> Vec<ToolDef> {
     ]
 }
 
-fn td(
-    name: &str,
-    desc: &str,
-    props: &[(&str, &str, &str)],
-    required: &[&str],
-) -> ToolDef {
+fn td(name: &str, desc: &str, props: &[(&str, &str, &str)], required: &[&str]) -> ToolDef {
     let mut properties = serde_json::Map::new();
     for (pname, ptype, pdesc) in props {
-        properties.insert(
-            pname.to_string(),
-            serde_json::json!({"type": ptype, "description": pdesc}),
-        );
+        let schema = if *ptype == "array" {
+            serde_json::json!({"type": ptype, "items": {"type": "string"}, "description": pdesc})
+        } else {
+            serde_json::json!({"type": ptype, "description": pdesc})
+        };
+        properties.insert(pname.to_string(), schema);
     }
     ToolDef {
         tool_type: "function".into(),
@@ -136,6 +136,22 @@ pub fn is_readonly_tool(name: &str) -> bool {
 // ── Tool execution dispatcher ───────────────────────────────────────
 
 pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
+    let timeout = timeout_secs();
+    if timeout == 0 {
+        return execute_tool_inner(name, arguments).await;
+    }
+
+    let outer = Duration::from_secs(timeout.saturating_add(30));
+    match tokio::time::timeout(outer, execute_tool_inner(name, arguments)).await {
+        Ok(result) => result,
+        Err(_) => format!(
+            "Tool timed out (outer safety net after {}s)",
+            outer.as_secs()
+        ),
+    }
+}
+
+async fn execute_tool_inner(name: &str, arguments: &serde_json::Value) -> String {
     match name {
         "read_file" => read_file(a(arguments, "path", "")).await,
         "write_file" => write_file(a(arguments, "path", ""), a(arguments, "content", "")).await,
@@ -148,7 +164,9 @@ pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
             .await
         }
         "run_bash" => run_bash(a(arguments, "command", "")).await,
-        "web_search" => web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await,
+        "web_search" => {
+            web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
+        }
         "download_file" => {
             download_file(a(arguments, "url", ""), aopt(arguments, "filename")).await
         }
@@ -166,7 +184,11 @@ pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
             let paths: Vec<String> = arguments
                 .get("paths")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             read_multiple_files(paths).await
         }
@@ -185,9 +207,39 @@ pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
 }
 
 pub fn kill_active_process() {
-    // Process killing is handled by the calling code via tokio's abort handle
-    // This is a no-op in the Rust port since we use tokio tasks, not raw processes
-    // (individual tool subprocesses handle their own cleanup)
+    let pids: Vec<u32> = ACTIVE_PROCESS_GROUPS
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect();
+    for pid in pids {
+        terminate_process_group(pid);
+    }
+}
+
+fn register_active_process(pid: u32) {
+    ACTIVE_PROCESS_GROUPS.lock().unwrap().insert(pid);
+}
+
+fn unregister_active_process(pid: u32) {
+    ACTIVE_PROCESS_GROUPS.lock().unwrap().remove(&pid);
+}
+
+fn terminate_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pid}"))
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
 }
 
 // ── Argument helpers ────────────────────────────────────────────────
@@ -294,8 +346,7 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
         let mut pos = 0;
         for _ in 0..count {
             if let Some(idx) = content[pos..].find(&old_str) {
-                let line_num =
-                    content[..pos + idx].chars().filter(|&c| c == '\n').count() + 1;
+                let line_num = content[..pos + idx].chars().filter(|&c| c == '\n').count() + 1;
                 found_lines.push(line_num);
                 pos += idx + 1;
             }
@@ -338,10 +389,14 @@ async fn run_bash(command: String) -> String {
                     *SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(cb);
                     result
                 }
-                None => return "Error: sudo detected but no password provider is configured.".into(),
+                None => {
+                    return "Error: sudo detected but no password provider is configured.".into()
+                }
             };
             match pw {
-                Some(p) => { *CACHED_SUDO_PASSWORD.lock().unwrap() = Some(p); }
+                Some(p) => {
+                    *CACHED_SUDO_PASSWORD.lock().unwrap() = Some(p);
+                }
                 None => return "Cancelled: sudo password not provided.".into(),
             }
         }
@@ -359,6 +414,11 @@ async fn run_bash(command: String) -> String {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.stdin(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -366,6 +426,7 @@ async fn run_bash(command: String) -> String {
     };
 
     let pid = child.id();
+    register_active_process(pid);
 
     if password_needed {
         let pw_guard = CACHED_SUDO_PASSWORD.lock().unwrap();
@@ -381,23 +442,30 @@ async fn run_bash(command: String) -> String {
         if timeout > 0 {
             let dur = Duration::from_secs(timeout);
             match wait_timeout(&mut child, dur) {
-                Ok(Some(output)) => Ok(output),
+                Ok(Some(output)) => {
+                    unregister_active_process(pid);
+                    Ok(output)
+                }
                 Ok(None) => {
                     // Timed out — kill the process group
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg(format!("-{pid}"))
-                        .output();
+                    terminate_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
+                    unregister_active_process(pid);
                     Err(format!("Error: Command timed out after {timeout} seconds"))
                 }
                 Err(e) => Err(format!("Error running command: {e}")),
             }
         } else {
             match child.wait_with_output() {
-                Ok(output) => Ok(output),
-                Err(e) => Err(format!("Error running command: {e}")),
+                Ok(output) => {
+                    unregister_active_process(pid);
+                    Ok(output)
+                }
+                Err(e) => {
+                    unregister_active_process(pid);
+                    Err(format!("Error running command: {e}"))
+                }
             }
         }
     })
@@ -441,16 +509,24 @@ fn wait_timeout(
         match child.try_wait()? {
             Some(status) => {
                 // Process exited — collect output
-                let stdout = child.stdout.take().map(|mut s| {
-                    let mut buf = Vec::new();
-                    let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-                    buf
-                }).unwrap_or_default();
-                let stderr = child.stderr.take().map(|mut s| {
-                    let mut buf = Vec::new();
-                    let _ = std::io::Read::read_to_end(&mut s, &mut buf);
-                    buf
-                }).unwrap_or_default();
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = Vec::new();
+                        let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut s| {
+                        let mut buf = Vec::new();
+                        let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
                 return Ok(Some(std::process::Output {
                     status,
                     stdout,
@@ -479,10 +555,15 @@ async fn web_search(query: String, max_results: usize) -> String {
             let elapsed = prev.elapsed();
             if elapsed < Duration::from_millis(800) {
                 (Duration::from_millis(800) - elapsed).as_millis() as u64
-            } else { 0 }
-        }).unwrap_or(0)
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0)
     };
-    if wait_ms > 0 { tokio::time::sleep(Duration::from_millis(wait_ms)).await; }
+    if wait_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+    }
     *LAST_SEARCH_TIME.lock().unwrap() = Some(Instant::now());
 
     // ── Primary: Python ddgs (10 engines, TLS impersonation, battle-tested) ──
@@ -522,8 +603,10 @@ async fn search_ddgs_python(query: &str, max_results: usize) -> String {
     );
 
     let output = match std::process::Command::new("bash")
-        .arg("-c").arg(&cmd)
-        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .arg("-c")
+        .arg(&cmd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .output()
     {
         Ok(o) => o,
@@ -532,30 +615,54 @@ async fn search_ddgs_python(query: &str, max_results: usize) -> String {
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let exit = output.status.code().unwrap_or(-1);
-    if exit == 124 { return "Web search timed out after 8 seconds.".into(); }
-    if stdout.is_empty() { return format!("ddgs: no output (exit {exit})"); }
+    if exit == 124 {
+        return "Web search timed out after 8 seconds.".into();
+    }
+    if stdout.is_empty() {
+        return format!("ddgs: no output (exit {exit})");
+    }
 
     match serde_json::from_str::<serde_json::Value>(&stdout) {
         Ok(json) => {
             if let Some(arr) = json.as_array() {
-                if arr.is_empty() { return "No results found.".into(); }
+                if arr.is_empty() {
+                    return "No results found.".into();
+                }
                 let mut lines = Vec::new();
                 for (i, r) in arr.iter().enumerate() {
-                    if i >= max_results { break; }
+                    if i >= max_results {
+                        break;
+                    }
                     let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
                     let href = r.get("href").and_then(|v| v.as_str()).unwrap_or("");
                     let body = r.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    if title.is_empty() { continue; }
+                    if title.is_empty() {
+                        continue;
+                    }
                     lines.push(format!("{}. {title}", i + 1));
-                    if !href.is_empty() { lines.push(format!("   URL: {href}")); }
-                    if !body.is_empty() { lines.push(format!("   {body}")); }
+                    if !href.is_empty() {
+                        lines.push(format!("   URL: {href}"));
+                    }
+                    if !body.is_empty() {
+                        lines.push(format!("   {body}"));
+                    }
                     lines.push(String::new());
                 }
-                return if lines.is_empty() { "No results found.".into() } else { lines.join("\n").trim().to_string() };
+                return if lines.is_empty() {
+                    "No results found.".into()
+                } else {
+                    lines.join("\n").trim().to_string()
+                };
             }
-            format!("ddgs: unexpected JSON: {}", &stdout[..200.min(stdout.len())])
+            format!(
+                "ddgs: unexpected JSON: {}",
+                &stdout[..200.min(stdout.len())]
+            )
         }
-        Err(e) => format!("ddgs JSON error: {e} — raw: {}", &stdout[..200.min(stdout.len())]),
+        Err(e) => format!(
+            "ddgs JSON error: {e} — raw: {}",
+            &stdout[..200.min(stdout.len())]
+        ),
     }
 }
 
@@ -600,14 +707,20 @@ async fn search_mojeek(query: &str, max_results: usize) -> String {
         if results.len() >= max_results {
             break;
         }
-        let title = li.select(&title_sel).next()
+        let title = li
+            .select(&title_sel)
+            .next()
             .map(|a| a.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
-        let href = li.select(&title_sel).next()
+        let href = li
+            .select(&title_sel)
+            .next()
             .and_then(|a| a.value().attr("href"))
             .unwrap_or("")
             .to_string();
-        let snippet = li.select(&snippet_sel).next()
+        let snippet = li
+            .select(&snippet_sel)
+            .next()
             .map(|p| p.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
 
@@ -668,27 +781,51 @@ async fn search_ddg(client: &primp::Client, query: &str, max_results: usize) -> 
         if results.len() >= max_results {
             break;
         }
-        let title = el.select(&ts).next()
+        let title = el
+            .select(&ts)
+            .next()
             .map(|a| a.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
-        let href = el.select(&ts).next()
+        let href = el
+            .select(&ts)
+            .next()
             .and_then(|a| a.value().attr("href"))
-            .map(|h| if let Some(p) = h.find("uddg=") { urldecode(&h[p + 5..]) } else { h.to_string() })
+            .map(|h| {
+                if let Some(p) = h.find("uddg=") {
+                    urldecode(&h[p + 5..])
+                } else {
+                    h.to_string()
+                }
+            })
             .unwrap_or_default();
-        let snippet = el.select(&ss).next()
+        let snippet = el
+            .select(&ss)
+            .next()
             .map(|s| s.text().collect::<String>().trim().to_string())
             .unwrap_or_default();
 
-        if title.is_empty() { continue; }
-        if href.contains("duckduckgo.com/y.js") { continue; }
+        if title.is_empty() {
+            continue;
+        }
+        if href.contains("duckduckgo.com/y.js") {
+            continue;
+        }
 
         let mut entry = format!("{}. {title}", results.len() + 1);
-        if !href.is_empty() { entry.push_str(&format!("\n   URL: {href}")); }
-        if !snippet.is_empty() { entry.push_str(&format!("\n   {snippet}")); }
+        if !href.is_empty() {
+            entry.push_str(&format!("\n   URL: {href}"));
+        }
+        if !snippet.is_empty() {
+            entry.push_str(&format!("\n   {snippet}"));
+        }
         results.push(entry);
     }
 
-    if results.is_empty() { "No results found.".into() } else { results.join("\n\n") }
+    if results.is_empty() {
+        "No results found.".into()
+    } else {
+        results.join("\n\n")
+    }
 }
 
 fn urlencoding(s: &str) -> String {
@@ -742,42 +879,60 @@ async fn download_file(url: String, filename: Option<String>) -> String {
     downloads.push("Downloads");
     let _ = std::fs::create_dir_all(&downloads);
 
-    let fname = filename.unwrap_or_else(|| {
-        url.split('?')
-            .next()
-            .unwrap_or(&url)
-            .rsplit('/')
-            .next()
-            .unwrap_or("download")
-            .to_string()
-    });
+    let fname = filename
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            parsed
+                .path_segments()
+                .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
+                .unwrap_or("download")
+                .to_string()
+        });
     let dest = downloads.join(&fname);
 
-    let client = reqwest::Client::builder()
-        .user_agent(ua())
-        .build()
-        .unwrap_or_default();
+    let mut builder = reqwest::Client::builder().user_agent(ua());
+    let timeout = timeout_secs();
+    if timeout > 0 {
+        builder = builder.timeout(Duration::from_secs(timeout));
+    }
+    let client = builder.build().unwrap_or_default();
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => return format!("Error downloading file: {e}"),
     };
+    if !resp.status().is_success() {
+        return format!("Error downloading file: HTTP {}", resp.status());
+    }
 
     let max_size: usize = 100 * 1024 * 1024;
-    // Download to bytes with a size cap
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return format!("Error downloading: {e}"),
+    let mut total: usize = 0;
+    let mut out = match std::fs::File::create(&dest) {
+        Ok(f) => f,
+        Err(e) => return format!("Error writing file: {e}"),
     };
-    if bytes.len() > max_size {
-        return format!("Error: Download exceeds maximum size of {max_size} bytes.");
-    }
-    let total = bytes.len();
 
-    match std::fs::write(&dest, &bytes) {
-        Ok(_) => format!("Downloaded to {} ({total} bytes)", dest.display()),
-        Err(e) => format!("Error writing file: {e}"),
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                return format!("Error downloading: {e}");
+            }
+        };
+        total += chunk.len();
+        if total > max_size {
+            let _ = std::fs::remove_file(&dest);
+            return format!("Error: Download exceeds maximum size of {max_size} bytes.");
+        }
+        if let Err(e) = out.write_all(&chunk) {
+            let _ = std::fs::remove_file(&dest);
+            return format!("Error writing file: {e}");
+        }
     }
+
+    format!("Downloaded to {} ({total} bytes)", dest.display())
 }
 
 async fn fetch_url(url_str: String) -> String {
@@ -792,15 +947,26 @@ async fn fetch_url(url_str: String) -> String {
         );
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(ua())
-        .build()
-        .unwrap_or_default();
+    let mut builder = reqwest::Client::builder().user_agent(ua());
+    let timeout = timeout_secs();
+    if timeout > 0 {
+        builder = builder.timeout(Duration::from_secs(timeout));
+    }
+    let client = builder.build().unwrap_or_default();
 
     let resp = match client.get(&url_str).send().await {
         Ok(r) => r,
         Err(e) => return format!("Error fetching URL: {e}"),
     };
+    if !resp.status().is_success() {
+        return format!("Error fetching URL: HTTP {}", resp.status());
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     let raw = match resp.bytes().await {
         Ok(b) => b,
@@ -813,15 +979,25 @@ async fn fetch_url(url_str: String) -> String {
     };
 
     let text = String::from_utf8_lossy(&raw).to_string();
-    let is_html =
-        text.to_lowercase().contains("<html") || text.to_lowercase().contains("<!doctype");
+    let is_html = content_type.contains("html")
+        || text.to_lowercase().contains("<html")
+        || text.to_lowercase().contains("<!doctype");
 
     let text = if is_html {
         let document = scraper::Html::parse_document(&text);
-        let body_text = document.root_element().text().collect::<String>();
+        let body_text = if let Ok(body_sel) = scraper::Selector::parse("body") {
+            document
+                .select(&body_sel)
+                .next()
+                .map(|body| body.text().collect::<Vec<_>>().join(""))
+                .unwrap_or_else(|| document.root_element().text().collect::<String>())
+        } else {
+            document.root_element().text().collect::<String>()
+        };
         Regex::new(r"\n{3,}")
             .unwrap()
             .replace_all(&body_text, "\n\n")
+            .trim()
             .to_string()
     } else {
         text
@@ -829,7 +1005,7 @@ async fn fetch_url(url_str: String) -> String {
 
     if text.len() > 50_000 {
         format!(
-            "{}...\n\n[... truncated at 50,000 characters ...]",
+            "{}\n\n[... truncated at 50,000 characters ...]",
             &text[..50_000]
         )
     } else {
@@ -838,23 +1014,63 @@ async fn fetch_url(url_str: String) -> String {
 }
 
 async fn run_python(code: String) -> String {
-    let _timeout = timeout_secs();
+    let timeout = timeout_secs();
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("pengy_py_{}.py", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    tmp.push(format!("pengy_py_{}_{}.py", std::process::id(), nanos));
     if let Err(e) = std::fs::write(&tmp, &code) {
         return format!("Error writing temp file: {e}");
     }
 
-    let output = std::process::Command::new("python3")
-        .arg(&tmp)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let mut cmd = std::process::Command::new(python_interpreter());
+    cmd.arg(&tmp).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return format!("Error running Python: {e}");
+        }
+    };
+    let pid = child.id();
+    register_active_process(pid);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let wait_result = if timeout > 0 {
+            match wait_timeout(&mut child, Duration::from_secs(timeout)) {
+                Ok(Some(output)) => Ok(output),
+                Ok(None) => {
+                    terminate_process_group(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(format!(
+                        "Error: Python execution timed out after {timeout} seconds"
+                    ))
+                }
+                Err(e) => Err(format!("Error running Python: {e}")),
+            }
+        } else {
+            child
+                .wait_with_output()
+                .map_err(|e| format!("Error running Python: {e}"))
+        };
+        unregister_active_process(pid);
+        wait_result
+    })
+    .await;
 
     let _ = std::fs::remove_file(&tmp);
 
-    match output {
-        Ok(out) => {
+    match result {
+        Ok(Ok(out)) => {
             let mut s = String::from_utf8_lossy(&out.stdout).to_string();
             let err = String::from_utf8_lossy(&out.stderr).to_string();
             if !err.is_empty() {
@@ -873,8 +1089,28 @@ async fn run_python(code: String) -> String {
                 s
             }
         }
-        Err(e) => format!("Error running Python: {e}"),
+        Ok(Err(e)) => e,
+        Err(join_err) => format!("Error: Task panicked: {join_err}"),
     }
+}
+
+fn python_interpreter() -> PathBuf {
+    if let Ok(path) = std::env::var("PENGY_PYTHON") {
+        if !path.trim().is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        if !venv.trim().is_empty() {
+            let mut p = PathBuf::from(venv);
+            #[cfg(windows)]
+            p.push("Scripts\\python.exe");
+            #[cfg(not(windows))]
+            p.push("bin/python");
+            return p;
+        }
+    }
+    PathBuf::from("python3")
 }
 
 async fn directory_tree(path: String, max_depth: usize, show_hidden: bool) -> String {
@@ -991,8 +1227,17 @@ fn build_tree(
 use once_cell::sync::Lazy;
 static ALWAYS_SKIP_DIRS: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
-        "node_modules", ".git", ".svn", ".hg", "__pycache__", ".mypy_cache",
-        ".pytest_cache", ".ruff_cache", ".tox", ".eggs", ".DS_Store",
+        "node_modules",
+        ".git",
+        ".svn",
+        ".hg",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".eggs",
+        ".DS_Store",
     ]
     .iter()
     .copied()
@@ -1070,7 +1315,10 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
         if total_chars + block.len() > MAX_TOTAL {
             let remaining = MAX_TOTAL - total_chars;
             if remaining > 200 {
-                let short_block = format!("{header}\n{}...", &content[..remaining.saturating_sub(header.len() + 4)]);
+                let short_block = format!(
+                    "{header}\n{}...",
+                    &content[..remaining.saturating_sub(header.len() + 4)]
+                );
                 parts.push(short_block);
             } else {
                 parts.push(format!(
@@ -1224,7 +1472,11 @@ fn search_one_file(
         return false;
     }
     let display = match root {
-        Some(r) => filepath.strip_prefix(r).unwrap_or(filepath).display().to_string(),
+        Some(r) => filepath
+            .strip_prefix(r)
+            .unwrap_or(filepath)
+            .display()
+            .to_string(),
         None => filepath.display().to_string(),
     };
     let regions = group_regions(&matched_lines, context_lines, lines.len());
@@ -1272,7 +1524,9 @@ fn should_skip_dir(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|name| name.starts_with('.') || name.ends_with(".egg-info") || ALWAYS_SKIP_DIRS.contains(name))
+        .map(|name| {
+            name.starts_with('.') || name.ends_with(".egg-info") || ALWAYS_SKIP_DIRS.contains(name)
+        })
         .unwrap_or(false)
 }
 
@@ -1283,13 +1537,73 @@ fn is_likely_text(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
         let lower = ext.to_lowercase();
         let text_exts = [
-            "py", "pyi", "pyx", "c", "cpp", "cc", "cxx", "h", "hpp", "hxx", "rs",
-            "go", "java", "kt", "scala", "swift", "js", "jsx", "ts", "tsx", "mjs",
-            "cjs", "rb", "rake", "php", "pl", "pm", "sh", "bash", "zsh", "fish",
-            "html", "htm", "css", "scss", "sass", "less", "json", "yaml", "yml",
-            "toml", "ini", "cfg", "conf", "xml", "svg", "rss", "md", "markdown",
-            "rst", "txt", "tex", "sql", "r", "jl", "lua", "zig", "nim", "ex", "exs",
-            "cmake", "make", "mk", "dockerfile", "env", "gitignore", "editorconfig",
+            "py",
+            "pyi",
+            "pyx",
+            "c",
+            "cpp",
+            "cc",
+            "cxx",
+            "h",
+            "hpp",
+            "hxx",
+            "rs",
+            "go",
+            "java",
+            "kt",
+            "scala",
+            "swift",
+            "js",
+            "jsx",
+            "ts",
+            "tsx",
+            "mjs",
+            "cjs",
+            "rb",
+            "rake",
+            "php",
+            "pl",
+            "pm",
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "html",
+            "htm",
+            "css",
+            "scss",
+            "sass",
+            "less",
+            "json",
+            "yaml",
+            "yml",
+            "toml",
+            "ini",
+            "cfg",
+            "conf",
+            "xml",
+            "svg",
+            "rss",
+            "md",
+            "markdown",
+            "rst",
+            "txt",
+            "tex",
+            "sql",
+            "r",
+            "jl",
+            "lua",
+            "zig",
+            "nim",
+            "ex",
+            "exs",
+            "cmake",
+            "make",
+            "mk",
+            "dockerfile",
+            "env",
+            "gitignore",
+            "editorconfig",
         ];
         if text_exts.contains(&lower.as_str()) {
             return true;
@@ -1297,7 +1611,12 @@ fn is_likely_text(path: &Path) -> bool {
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         let text_files = [
-            "makefile", "dockerfile", "license", "changelog", "authors", "todo",
+            "makefile",
+            "dockerfile",
+            "license",
+            "changelog",
+            "authors",
+            "todo",
         ];
         if text_files.contains(&name.to_lowercase().as_str()) {
             return true;
@@ -1308,10 +1627,7 @@ fn is_likely_text(path: &Path) -> bool {
 
 fn matches_glob(name: &str, glob: &str) -> bool {
     // Handle brace expansion like *.{js,ts}
-    if let Some(caps) = Regex::new(r"^(.*)\{([^}]+)\}(.*)$")
-        .unwrap()
-        .captures(glob)
-    {
+    if let Some(caps) = Regex::new(r"^(.*)\{([^}]+)\}(.*)$").unwrap().captures(glob) {
         let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let choices = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -1339,7 +1655,17 @@ fn simple_glob_match(name: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
     use std::collections::HashSet;
+    use std::sync::Mutex as TestMutex;
+
+    static TEST_TOOL_TIMEOUT_LOCK: Lazy<TestMutex<()>> = Lazy::new(|| TestMutex::new(()));
+
+    fn test_tool_timeout_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_TOOL_TIMEOUT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     // ── is_readonly_tool ───────────────────────────────────────────
 
@@ -1408,6 +1734,95 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_array());
         assert_eq!(parsed.as_array().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn read_multiple_files_schema_includes_string_items() {
+        let defs = tool_definitions();
+        let read_multi = defs
+            .iter()
+            .find(|t| t.function.name == "read_multiple_files")
+            .expect("read_multiple_files tool definition");
+        let paths = &read_multi.function.parameters.properties["paths"];
+        assert_eq!(paths["type"], "array");
+        assert_eq!(paths["items"]["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn run_python_uses_configured_timeout() {
+        let _guard = test_tool_timeout_guard();
+        let old = *TOOL_TIMEOUT.lock().unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = 1;
+        let result = run_python("import time; time.sleep(5)".into()).await;
+        *TOOL_TIMEOUT.lock().unwrap() = old;
+        assert!(result.contains("Python execution timed out after 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn run_bash_uses_configured_timeout() {
+        let _guard = test_tool_timeout_guard();
+        let old = *TOOL_TIMEOUT.lock().unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = 1;
+        let result = run_bash("sleep 5".into()).await;
+        *TOOL_TIMEOUT.lock().unwrap() = old;
+        assert!(result.contains("Command timed out after 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_outer_safety_timeout_fires() {
+        let _guard = test_tool_timeout_guard();
+        let old = *TOOL_TIMEOUT.lock().unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = 1;
+        let args = serde_json::json!({"code": "import time; time.sleep(60)"});
+        let result =
+            tokio::time::timeout(Duration::from_secs(35), execute_tool("run_python", &args))
+                .await
+                .expect("outer safety net should finish before test timeout");
+        *TOOL_TIMEOUT.lock().unwrap() = old;
+        assert!(
+            result.contains("Python execution timed out after 1 seconds")
+                || result.contains("Tool timed out (outer safety net after 31s)")
+        );
+    }
+
+    #[test]
+    fn kill_active_process_removes_registered_process_group() {
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        register_active_process(pid);
+        kill_active_process();
+        let _ = child.kill();
+        let _ = child.wait();
+        unregister_active_process(pid);
+        assert!(!ACTIVE_PROCESS_GROUPS.lock().unwrap().contains(&pid));
+    }
+
+    #[test]
+    fn python_interpreter_prefers_pengy_python_env() {
+        let _guard = test_tool_timeout_guard();
+        let old = std::env::var("PENGY_PYTHON").ok();
+        std::env::set_var("PENGY_PYTHON", "/tmp/pengy-python-test");
+        assert_eq!(
+            python_interpreter(),
+            PathBuf::from("/tmp/pengy-python-test")
+        );
+        if let Some(v) = old {
+            std::env::set_var("PENGY_PYTHON", v);
+        } else {
+            std::env::remove_var("PENGY_PYTHON");
+        }
     }
 
     // ── expand_home ────────────────────────────────────────────────
@@ -1669,12 +2084,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replace.txt");
         std::fs::write(&path, "aaa bbb aaa").unwrap();
-        let result = replace_in_file(
-            path.to_str().unwrap().into(),
-            "aaa".into(),
-            "x".into(),
-        )
-        .await;
+        let result = replace_in_file(path.to_str().unwrap().into(), "aaa".into(), "x".into()).await;
         assert!(result.contains("matches 2 locations"));
     }
 

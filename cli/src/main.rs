@@ -62,10 +62,7 @@ impl PengyCli {
 
     fn run_interactive(&mut self) {
         println!();
-        println!(
-            "{}{}Pengy CLI{}",
-            BOLD, BLUE, RESET
-        );
+        println!("{}{}Pengy CLI{}", BOLD, BLUE, RESET);
         println!(
             "Type your message and press Enter.  {}Try /help for available commands.{}",
             DIM, RESET
@@ -76,7 +73,11 @@ impl PengyCli {
             self.current_chat = Some(chats[0].clone());
             println!(
                 "{}Resumed chat:{} {}{}{}",
-                DIM, RESET, BOLD, self.current_chat.as_ref().unwrap().title, RESET
+                DIM,
+                RESET,
+                BOLD,
+                self.current_chat.as_ref().unwrap().title,
+                RESET
             );
         } else {
             self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
@@ -186,8 +187,10 @@ impl PengyCli {
         let cancel2 = cancel.clone();
 
         self.rt.spawn(async move {
-            llm_client::chat(&bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2)
-                .await;
+            llm_client::chat(
+                &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+            )
+            .await;
         });
 
         self.yolo_this_turn = false;
@@ -216,8 +219,7 @@ impl PengyCli {
                     expecting_api = false;
 
                     let needs_confirm = tc_mode != ToolConfirmation::All
-                        && !(tc_mode == ToolConfirmation::Safe
-                            && tools::is_readonly_tool(&name))
+                        && !(tc_mode == ToolConfirmation::Safe && tools::is_readonly_tool(&name))
                         && !self.yolo_this_turn;
 
                     self.render_tool_request(&name, &args);
@@ -328,7 +330,12 @@ impl PengyCli {
         println!();
         println!(
             "{}--- Tool: {}{}{} [{}] ---{}",
-            YELLOW, BOLD, name, RESET, truncate(&preview, 60), RESET
+            YELLOW,
+            BOLD,
+            name,
+            RESET,
+            truncate(&preview, 60),
+            RESET
         );
         if args_str.len() <= 2000 {
             println!("{}{}{}", DIM, args_str, RESET);
@@ -350,10 +357,7 @@ impl PengyCli {
             content.to_string()
         };
 
-        println!(
-            "{}--- Output ---{}",
-            DIM, RESET
-        );
+        println!("{}--- Output ---{}", DIM, RESET);
         println!("{}", display);
     }
 
@@ -362,10 +366,7 @@ impl PengyCli {
             println!("{}(empty response){}", DIM, RESET);
         } else {
             println!();
-            println!(
-                "{}--- Assistant ---{}",
-                GREEN, RESET
-            );
+            println!("{}--- Assistant ---{}", GREEN, RESET);
             println!("{}", content);
         }
 
@@ -443,11 +444,7 @@ impl PengyCli {
     fn cmd_help(&self) {
         println!();
         println!("{}Slash Commands{}", BOLD, RESET);
-        println!("{}{}{}",
-            DIM,
-            "-".repeat(60),
-            RESET
-        );
+        println!("{}{}{}", DIM, "-".repeat(60), RESET);
         let cmds = [
             ("/help", "Show this help"),
             ("/new", "Start a new chat"),
@@ -633,7 +630,10 @@ impl PengyCli {
         let idx: usize = match args[0].parse::<usize>() {
             Ok(i) if i >= 1 => i - 1,
             _ => {
-                println!("{}Invalid index. Use /list to see available chats.{}", RED, RESET);
+                println!(
+                    "{}Invalid index. Use /list to see available chats.{}",
+                    RED, RESET
+                );
                 return;
             }
         };
@@ -652,7 +652,12 @@ impl PengyCli {
         let c = self.current_chat.as_ref().unwrap();
         println!(
             "{}Loaded:{} {}{}{} ({} messages)",
-            GREEN, RESET, BOLD, c.title, RESET, c.messages.len()
+            GREEN,
+            RESET,
+            BOLD,
+            c.title,
+            RESET,
+            c.messages.len()
         );
     }
 
@@ -722,20 +727,18 @@ impl PengyCli {
         self.save_config();
         println!(
             "{}Tool Confirmation:{} {}{}{}",
-            GREEN, RESET, BOLD, self.confirm_display(), RESET
+            GREEN,
+            RESET,
+            BOLD,
+            self.confirm_display(),
+            RESET
         );
     }
 
     fn cmd_baseurl(&mut self, args: &[&str]) {
         if args.is_empty() {
-            println!(
-                "{}Current base URL:{} {}",
-                DIM, RESET, self.config.base_url
-            );
-            println!(
-                "{}Usage: /baseurl <url>{}",
-                DIM, RESET
-            );
+            println!("{}Current base URL:{} {}", DIM, RESET, self.config.base_url);
+            println!("{}Usage: /baseurl <url>{}", DIM, RESET);
             return;
         }
         let old = self.config.base_url.clone();
@@ -789,10 +792,7 @@ impl PengyCli {
                     GREEN, RESET, old, BOLD, secs, RESET
                 );
             }
-            _ => println!(
-                "{}Invalid number. Usage: /timeout <seconds>{}",
-                RED, RESET
-            ),
+            _ => println!("{}Invalid number. Usage: /timeout <seconds>{}", RED, RESET),
         }
     }
 
@@ -923,7 +923,11 @@ impl PengyCli {
         let mut line = String::new();
         match io::stdin().read_line(&mut line) {
             Ok(0) => None,
-            Ok(_) => Some(line.trim_end_matches('\n').trim_end_matches('\r').to_string()),
+            Ok(_) => Some(
+                line.trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string(),
+            ),
             Err(_) => None,
         }
     }
@@ -936,9 +940,9 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
     if !config.system_message.is_empty() {
         messages.push(ChatMessage {
             role: "system".into(),
-            content: Some(serde_json::Value::String(
-                config::render_system_message(&config.system_message),
-            )),
+            content: Some(serde_json::Value::String(config::render_system_message(
+                &config.system_message,
+            ))),
             tool_calls: vec![],
             tool_call_id: None,
         });
@@ -992,7 +996,5 @@ fn uuid_v4() -> String {
 }
 
 fn chrono_now() -> String {
-    chrono::Local::now()
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string()
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
 }

@@ -115,31 +115,49 @@ pub fn load_config() -> Config {
                 // Merge saved values over defaults
                 if let Some(obj) = raw.as_object() {
                     if let Some(v) = obj.get("base_url") {
-                        if let Some(s) = v.as_str() { config.base_url = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.base_url = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("api_key") {
-                        if let Some(s) = v.as_str() { config.api_key = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.api_key = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("model") {
-                        if let Some(s) = v.as_str() { config.model = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.model = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("system_message") {
-                        if let Some(s) = v.as_str() { config.system_message = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.system_message = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("tool_confirmation") {
-                        if let Some(s) = v.as_str() { config.tool_confirmation = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.tool_confirmation = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("context_keep_turns") {
-                        if let Some(n) = v.as_u64() { config.context_keep_turns = n as usize; }
+                        if let Some(n) = v.as_u64() {
+                            config.context_keep_turns = n as usize;
+                        }
                     }
                     if let Some(v) = obj.get("ui_scale") {
-                        if let Some(n) = v.as_u64() { config.ui_scale = n as u32; }
+                        if let Some(n) = v.as_u64() {
+                            config.ui_scale = n as u32;
+                        }
                     }
                     if let Some(v) = obj.get("user_agent") {
-                        if let Some(s) = v.as_str() { config.user_agent = s.to_string(); }
+                        if let Some(s) = v.as_str() {
+                            config.user_agent = s.to_string();
+                        }
                     }
                     if let Some(v) = obj.get("tool_timeout") {
-                        if let Some(n) = v.as_u64() { config.tool_timeout = n; }
+                        if let Some(n) = v.as_u64() {
+                            config.tool_timeout = n;
+                        }
                     }
                 }
                 config

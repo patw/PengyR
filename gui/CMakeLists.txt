@@ -122,3 +122,17 @@ if(WIN32)
     COMMAND ${CMAKE_COMMAND} -E echo "Run windeployqt pengy.exe to bundle Qt DLLs"
   )
 endif()
+
+
+# ── Optional GUI unit tests ───────────────────────────────────────
+option(PENGY_BUILD_TESTS "Build lightweight Qt GUI tests" OFF)
+if(PENGY_BUILD_TESTS)
+  enable_testing()
+  add_executable(pengy_chatview_markdown_test
+    tests/test_chatview_markdown.cpp chatview.cpp
+  )
+  target_compile_definitions(pengy_chatview_markdown_test PRIVATE PENGY_UNIT_TEST)
+  target_link_libraries(pengy_chatview_markdown_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
+  target_include_directories(pengy_chatview_markdown_test PRIVATE ${CMAKE_SOURCE_DIR})
+  add_test(NAME pengy_chatview_markdown_test COMMAND pengy_chatview_markdown_test)
+endif()

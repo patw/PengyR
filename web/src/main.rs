@@ -163,7 +163,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
 }
 
 impl WebWorker {
-    fn start(chat: Chat, config: Config, sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>) -> Arc<Self> {
+    fn start(
+        chat: Chat,
+        config: Config,
+        sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>,
+    ) -> Arc<Self> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
@@ -208,8 +212,10 @@ impl WebWorker {
             let cancel2 = cancel.clone();
 
             tokio::spawn(async move {
-                llm_client::chat(&bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2)
-                    .await;
+                llm_client::chat(
+                    &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+                )
+                .await;
             });
 
             let mut yolo_this_turn = false;
@@ -438,42 +444,39 @@ fn async_stream(
     workers: Arc<Mutex<HashMap<String, Arc<WebWorker>>>>,
     chat_id: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    futures_util::stream::unfold(
-        (sse_rx, false),
-        move |(mut rx, done)| {
-            let workers = workers.clone();
-            let chat_id = chat_id.clone();
-            async move {
-                if done {
-                    return None;
-                }
+    futures_util::stream::unfold((sse_rx, false), move |(mut rx, done)| {
+        let workers = workers.clone();
+        let chat_id = chat_id.clone();
+        async move {
+            if done {
+                return None;
+            }
 
-                let rx_ref = rx.as_mut()?;
+            let rx_ref = rx.as_mut()?;
 
-                match rx_ref.recv().await {
-                    Some(event) => {
-                        let json = sse_event_to_json(&event);
-                        let is_final = matches!(
-                            event,
-                            SseEvent::FinalResponse { .. } | SseEvent::Error { .. }
-                        );
+            match rx_ref.recv().await {
+                Some(event) => {
+                    let json = sse_event_to_json(&event);
+                    let is_final = matches!(
+                        event,
+                        SseEvent::FinalResponse { .. } | SseEvent::Error { .. }
+                    );
 
-                        if is_final {
-                            workers.lock().unwrap().remove(&chat_id);
-                        }
-
-                        Some((Ok(Event::default().data(json)), (rx, is_final)))
-                    }
-                    None => {
+                    if is_final {
                         workers.lock().unwrap().remove(&chat_id);
-                        let event = Event::default()
-                            .data(r#"{"type":"error","message":"Worker disconnected"}"#);
-                        Some((Ok(event), (rx, true)))
                     }
+
+                    Some((Ok(Event::default().data(json)), (rx, is_final)))
+                }
+                None => {
+                    workers.lock().unwrap().remove(&chat_id);
+                    let event = Event::default()
+                        .data(r#"{"type":"error","message":"Worker disconnected"}"#);
+                    Some((Ok(event), (rx, true)))
                 }
             }
-        },
-    )
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -614,15 +617,9 @@ struct Turn {
 }
 
 enum TurnType {
-    User {
-        content: String,
-    },
-    Assistant {
-        html: String,
-    },
-    ToolUse {
-        events: Vec<ToolEvent>,
-    },
+    User { content: String },
+    Assistant { html: String },
+    ToolUse { events: Vec<ToolEvent> },
 }
 
 struct ToolEvent {
@@ -787,37 +784,25 @@ fn render_markdown(text: &str) -> String {
                 html.push_str("</p>\n");
                 in_paragraph = false;
             }
-            html.push_str(&format!(
-                "<h3>{}</h3>\n",
-                inline_markdown(&trimmed[4..])
-            ));
+            html.push_str(&format!("<h3>{}</h3>\n", inline_markdown(&trimmed[4..])));
         } else if trimmed.starts_with("## ") {
             if in_paragraph {
                 html.push_str("</p>\n");
                 in_paragraph = false;
             }
-            html.push_str(&format!(
-                "<h2>{}</h2>\n",
-                inline_markdown(&trimmed[3..])
-            ));
+            html.push_str(&format!("<h2>{}</h2>\n", inline_markdown(&trimmed[3..])));
         } else if trimmed.starts_with("# ") {
             if in_paragraph {
                 html.push_str("</p>\n");
                 in_paragraph = false;
             }
-            html.push_str(&format!(
-                "<h1>{}</h1>\n",
-                inline_markdown(&trimmed[2..])
-            ));
+            html.push_str(&format!("<h1>{}</h1>\n", inline_markdown(&trimmed[2..])));
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             if in_paragraph {
                 html.push_str("</p>\n");
                 in_paragraph = false;
             }
-            html.push_str(&format!(
-                "<li>{}</li>\n",
-                inline_markdown(&trimmed[2..])
-            ));
+            html.push_str(&format!("<li>{}</li>\n", inline_markdown(&trimmed[2..])));
         } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
             if in_paragraph {
                 html.push_str("</p>\n");
@@ -907,9 +892,7 @@ fn inline_markdown(text: &str) -> String {
 
     // Inline code
     let code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
-    result = code_re
-        .replace_all(&result, "<code>$1</code>")
-        .to_string();
+    result = code_re.replace_all(&result, "<code>$1</code>").to_string();
 
     // Bold
     let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
@@ -919,9 +902,7 @@ fn inline_markdown(text: &str) -> String {
 
     // Italic
     let italic_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
-    result = italic_re
-        .replace_all(&result, "<em>$1</em>")
-        .to_string();
+    result = italic_re.replace_all(&result, "<em>$1</em>").to_string();
 
     // Links
     let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
@@ -946,9 +927,9 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
     if !config.system_message.is_empty() {
         messages.push(ChatMessage {
             role: "system".into(),
-            content: Some(serde_json::Value::String(
-                config::render_system_message(&config.system_message),
-            )),
+            content: Some(serde_json::Value::String(config::render_system_message(
+                &config.system_message,
+            ))),
             tool_calls: vec![],
             tool_call_id: None,
         });
@@ -1601,10 +1582,26 @@ function submitSudo(override) {{
             ""
         };
 
-        let tc_none_sel = if config.tool_confirmation == "none" { " selected" } else { "" };
-        let tc_safe_sel = if config.tool_confirmation == "safe" { " selected" } else { "" };
-        let tc_all_sel = if config.tool_confirmation == "all" { " selected" } else { "" };
-        let api_key_status = if config.api_key.is_empty() { "not set" } else { "set" };
+        let tc_none_sel = if config.tool_confirmation == "none" {
+            " selected"
+        } else {
+            ""
+        };
+        let tc_safe_sel = if config.tool_confirmation == "safe" {
+            " selected"
+        } else {
+            ""
+        };
+        let tc_all_sel = if config.tool_confirmation == "all" {
+            " selected"
+        } else {
+            ""
+        };
+        let api_key_status = if config.api_key.is_empty() {
+            "not set"
+        } else {
+            "set"
+        };
 
         let main_content = format!(
             r##"<div class="overflow-y-auto flex-grow-1 p-4">
@@ -1667,13 +1664,6 @@ function submitSudo(override) {{
             system_message = escape_html(&config.system_message),
         );
 
-        base(
-            "Settings — Pengy",
-            &sidebar,
-            "",
-            &main_content,
-            "",
-            "",
-        )
+        base("Settings — Pengy", &sidebar, "", &main_content, "", "")
     }
 }
