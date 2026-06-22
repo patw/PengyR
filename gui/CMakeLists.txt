@@ -69,6 +69,7 @@ message(STATUS "Pengy core: ${PENGY_CORE_LIB} (static=${PENGY_RUST_STATIC})")
 add_executable(pengy
   main.cpp mainwindow.cpp chathistory.cpp chatview.cpp
   chatinput.cpp chatworker.cpp settingsdialog.cpp
+  resources.qrc
 )
 
 # ── Link ──────────────────────────────────────────────────────────
