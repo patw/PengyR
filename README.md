@@ -79,7 +79,7 @@ cd appimage && ./build.sh
 ### macOS
 
 ```bash
-brew install qt@6 cmake
+brew install qt@6 cmake rust
 
 ./build_macos.sh [arm64|x86_64]
 # → gui/build_macos/pengy
