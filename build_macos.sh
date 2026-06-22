@@ -14,9 +14,9 @@ MACOS_ARCH="${1:-$(uname -m)}"  # arm64 or x86_64 (macOS / clang naming)
 export CMAKE_PREFIX_PATH="$(brew --prefix qt@6 2>/dev/null || echo '/opt/homebrew/opt/qt@6')"
 export PATH="$CMAKE_PREFIX_PATH/bin:$PATH"
 
-echo "==> Building Rust core for $RUST_ARCH-apple-darwin..."
+echo "==> Building Rust workspace for $RUST_ARCH-apple-darwin..."
 cd "$ROOT"
-cargo build --release --target "$RUST_ARCH-apple-darwin"
+cargo build --release --workspace --target "$RUST_ARCH-apple-darwin"
 
 echo "==> Building Qt6 GUI..."
 mkdir -p gui/build_macos
@@ -51,6 +51,9 @@ echo "==> Creating Pengy.app bundle..."
 APP_DIR="$ROOT/Pengy.app"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$ROOT/gui/build_macos/pengy" "$APP_DIR/Contents/MacOS/"
+cp "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-cli" "$APP_DIR/Contents/MacOS/"
+cp "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-web" "$APP_DIR/Contents/MacOS/"
+chmod +x "$APP_DIR/Contents/MacOS/pengy" "$APP_DIR/Contents/MacOS/pengy-cli" "$APP_DIR/Contents/MacOS/pengy-web"
 cp "$ROOT/gui/Info.plist" "$APP_DIR/Contents/"
 cp "$ROOT/pengy.icns" "$APP_DIR/Contents/Resources/"
 # Use macdeployqt to bundle Qt frameworks
@@ -69,6 +72,8 @@ DMG_STAGING="$ROOT/.dmg_staging"
 rm -rf "$DMG_STAGING"
 mkdir -p "$DMG_STAGING"
 cp -r "$APP_DIR" "$DMG_STAGING/"
+cp "$ROOT/install_macos_cli.sh" "$DMG_STAGING/Install CLI Tools.command"
+chmod +x "$DMG_STAGING/Install CLI Tools.command"
 ln -s /Applications "$DMG_STAGING/Applications"
 
 # Add volume icon to staging area
