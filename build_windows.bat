@@ -19,36 +19,79 @@ REM Remove trailing backslash from %~dp0
 if "%ROOT:~-1%"=="\" set ROOT=%ROOT:~0,-1%
 cd /d "%ROOT%"
 
-REM ── Auto-detect Visual Studio 2022 (if not already in a Developer Prompt) ──
-if not defined VSCMD_VER (
-    where vswhere >nul 2>nul
-    if !ERRORLEVEL! equ 0 (
-        for /f "usebackq delims=" %%i in (`vswhere -latest -productId Microsoft.VisualStudio.Product.Community -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
-        if not defined VSINSTALLDIR (
-            for /f "usebackq delims=" %%i in (`vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
-        )
-        if defined VSINSTALLDIR (
-            echo Found Visual Studio: !VSINSTALLDIR!
-            call "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" x64
-        ) else (
-            echo WARNING: Could not find Visual Studio 2022 installation via vswhere.
-        )
-    ) else (
-        REM fallback: check some common paths
-        if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
-        ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" x64
-        ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" (
-            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-        ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
-            call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
-        ) else (
-            echo WARNING: Could not find vswhere or a VS 2022 installation.
-            echo          Make sure to run from a "Developer Command Prompt for VS 2022".
-        )
+REM ── Try to locate vswhere (ships with Visual Studio) ──
+set VSWHERE=
+for %%p in (
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    "%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+) do if exist %%p set VSWHERE=%%p
+
+REM ── Find any Visual Studio installation ──
+set VSINSTALLDIR=
+set VS_VERSION_MAJOR=
+
+if defined VSWHERE (
+    for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
+    if defined VSINSTALLDIR (
+        for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property catalog_productLineVersion`) do set VS_VERSION_MAJOR=%%i
     )
 )
+
+REM Fallback: try common install paths if vswhere didn't work
+if not defined VSINSTALLDIR (
+    for %%p in (
+        "C:\Program Files\Microsoft Visual Studio\2022\Community"
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional"
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+        "C:\Program Files\Microsoft Visual Studio\2022\BuildTools"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\Professional"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+        "C:\Program Files\Microsoft Visual Studio\2019\Community"
+        "C:\Program Files\Microsoft Visual Studio\2019\Professional"
+        "C:\Program Files\Microsoft Visual Studio\2019\Enterprise"
+        "C:\Program Files\Microsoft Visual Studio\2019\BuildTools"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community"
+        "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools"
+    ) do if exist "%%~p\VC\Auxiliary\Build\vcvarsall.bat" set VSINSTALLDIR=%%~p
+)
+
+if not defined VSINSTALLDIR (
+    echo WARNING: Could not find Visual Studio.
+    echo          Install it from: https://visualstudio.microsoft.com/downloads/
+    echo          Or run from a "Developer Command Prompt for VS 2022".
+) else (
+    echo Found Visual Studio: !VSINSTALLDIR!
+    REM Set up the MSVC compiler environment
+    call "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" x64
+    if !ERRORLEVEL! neq 0 (
+        echo ERROR: vcvarsall.bat failed to set up the build environment.
+    )
+)
+
+REM ── Determine CMake generator based on VS version ──
+if "%VS_VERSION_MAJOR%"=="17" (
+    set CMAKE_GENERATOR="Visual Studio 17 2022"
+) else if "%VS_VERSION_MAJOR%"=="16" (
+    set CMAKE_GENERATOR="Visual Studio 16 2019"
+) else if not "%VSINSTALLDIR%"=="" (
+    REM Detect version from path
+    echo !VSINSTALLDIR! | findstr /C:"2022" >nul
+    if !ERRORLEVEL! equ 0 (
+        set CMAKE_GENERATOR="Visual Studio 17 2022"
+    ) else (
+        echo !VSINSTALLDIR! | findstr /C:"2019" >nul
+        if !ERRORLEVEL! equ 0 (
+            set CMAKE_GENERATOR="Visual Studio 16 2019"
+        ) else (
+            set CMAKE_GENERATOR="Visual Studio 17 2022"
+        )
+    )
+) else (
+    set CMAKE_GENERATOR="Visual Studio 17 2022"
+)
+echo CMake generator: !CMAKE_GENERATOR!
 
 REM Set Qt6 path — adjust this to your Qt installation
 if "%QT6_DIR%"=="" (
@@ -80,7 +123,7 @@ cd gui\build_windows
 
 REM The CMake file will find libpengy_core.lib in target/release/
 cmake .. ^
-    -G "Visual Studio 17 2022" ^
+    -G !CMAKE_GENERATOR! ^
     -A x64 ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_PREFIX_PATH="%QT6_DIR%" ^
