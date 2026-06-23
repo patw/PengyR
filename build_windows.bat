@@ -13,12 +13,16 @@ REM
 REM Then run this script from a Developer Command Prompt for VS 2022.
 
 setlocal enabledelayedexpansion
-set ROOT=%~dp0..
+set ROOT=%~dp0
+REM Remove trailing backslash from %~dp0
+if "%ROOT:~-1%"=="\" set ROOT=%ROOT:~0,-1%
 cd /d "%ROOT%"
 
 REM Set Qt6 path — adjust this to your Qt installation
 if "%QT6_DIR%"=="" (
     REM Common default locations
+    if exist "C:\Qt\6.11.1\msvc2022_64" set QT6_DIR=C:\Qt\6.11.1\msvc2022_64
+    if exist "C:\Qt\6.11.0\msvc2022_64" set QT6_DIR=C:\Qt\6.11.0\msvc2022_64
     if exist "C:\Qt\6.10.0\msvc2022_64" set QT6_DIR=C:\Qt\6.10.0\msvc2022_64
     if exist "C:\Qt\6.10.1\msvc2022_64" set QT6_DIR=C:\Qt\6.10.1\msvc2022_64
     if exist "C:\Qt\6.9.0\msvc2022_64"  set QT6_DIR=C:\Qt\6.9.0\msvc2022_64
