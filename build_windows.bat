@@ -10,13 +10,45 @@ REM      (select "Desktop development with C++")
 REM   4. Install CMake: https://cmake.org/download/
 REM      (or: winget install Kitware.CMake)
 REM
-REM Then run this script from a Developer Command Prompt for VS 2022.
+REM The script auto-detects VS 2022, so you can run it from any
+REM terminal (cmd.exe, PowerShell, etc.).
 
 setlocal enabledelayedexpansion
 set ROOT=%~dp0
 REM Remove trailing backslash from %~dp0
 if "%ROOT:~-1%"=="\" set ROOT=%ROOT:~0,-1%
 cd /d "%ROOT%"
+
+REM ── Auto-detect Visual Studio 2022 (if not already in a Developer Prompt) ──
+if not defined VSCMD_VER (
+    where vswhere >nul 2>nul
+    if !ERRORLEVEL! equ 0 (
+        for /f "usebackq delims=" %%i in (`vswhere -latest -productId Microsoft.VisualStudio.Product.Community -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
+        if not defined VSINSTALLDIR (
+            for /f "usebackq delims=" %%i in (`vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
+        )
+        if defined VSINSTALLDIR (
+            echo Found Visual Studio: !VSINSTALLDIR!
+            call "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" x64
+        ) else (
+            echo WARNING: Could not find Visual Studio 2022 installation via vswhere.
+        )
+    ) else (
+        REM fallback: check some common paths
+        if exist "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+        ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat" x64
+        ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" (
+            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+        ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" (
+            call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+        ) else (
+            echo WARNING: Could not find vswhere or a VS 2022 installation.
+            echo          Make sure to run from a "Developer Command Prompt for VS 2022".
+        )
+    )
+)
 
 REM Set Qt6 path — adjust this to your Qt installation
 if "%QT6_DIR%"=="" (
