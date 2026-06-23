@@ -26,20 +26,26 @@ for %%p in (
     "%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
 ) do if exist %%p set VSWHERE=%%p
 
-REM ── Find any Visual Studio installation ──
+REM ── Find any Visual Studio installation via vswhere ──
 set VSINSTALLDIR=
 set VS_VERSION_MAJOR=
+set VS_CHROOT=
 
 if defined VSWHERE (
     for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set VSINSTALLDIR=%%i
     if defined VSINSTALLDIR (
         for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property catalog_productLineVersion`) do set VS_VERSION_MAJOR=%%i
+        for /f "usebackq delims=" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion`) do set VS_VERSION_FULL=%%i
     )
 )
 
 REM Fallback: try common install paths if vswhere didn't work
 if not defined VSINSTALLDIR (
     for %%p in (
+        "C:\Program Files\Microsoft Visual Studio\18\Community"
+        "C:\Program Files\Microsoft Visual Studio\18\Professional"
+        "C:\Program Files\Microsoft Visual Studio\18\Enterprise"
+        "C:\Program Files\Microsoft Visual Studio\18\BuildTools"
         "C:\Program Files\Microsoft Visual Studio\2022\Community"
         "C:\Program Files\Microsoft Visual Studio\2022\Professional"
         "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
@@ -61,37 +67,55 @@ if not defined VSINSTALLDIR (
     echo WARNING: Could not find Visual Studio.
     echo          Install it from: https://visualstudio.microsoft.com/downloads/
     echo          Or run from a "Developer Command Prompt for VS 2022".
+    set VS_FOUND=0
 ) else (
-    echo Found Visual Studio: !VSINSTALLDIR!
-    REM Set up the MSVC compiler environment
-    call "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" x64
-    if !ERRORLEVEL! neq 0 (
-        echo ERROR: vcvarsall.bat failed to set up the build environment.
-    )
-)
+    echo Found Visual Studio: !VSINSTALLDIR!  (version: !VS_VERSION_FULL!)
+    set VS_FOUND=1
 
-REM ── Determine CMake generator based on VS version ──
-if "%VS_VERSION_MAJOR%"=="17" (
-    set CMAKE_GENERATOR="Visual Studio 17 2022"
-) else if "%VS_VERSION_MAJOR%"=="16" (
-    set CMAKE_GENERATOR="Visual Studio 16 2019"
-) else if not "%VSINSTALLDIR%"=="" (
-    REM Detect version from path
-    echo !VSINSTALLDIR! | findstr /C:"2022" >nul
-    if !ERRORLEVEL! equ 0 (
-        set CMAKE_GENERATOR="Visual Studio 17 2022"
+    REM ── Set up the MSVC compiler environment ──
+    REM Try vcvarsall.bat first, then VsDevCmd.bat
+    if exist "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" (
+        REM Suppress VsDevCmd.bat telemetry errors in non-interactive shells
+        set VSCMD_SKIP_SENDERROR=1
+        call "!VSINSTALLDIR!\VC\Auxiliary\Build\vcvarsall.bat" x64
+        if !ERRORLEVEL! neq 0 (
+            echo [INFO] vcvarsall.bat reported issues, but compiler may still be usable.
+        )
+    ) else if exist "!VSINSTALLDIR!\Common7\Tools\VsDevCmd.bat" (
+        set VSCMD_SKIP_SENDERROR=1
+        call "!VSINSTALLDIR!\Common7\Tools\VsDevCmd.bat" -arch=x64
     ) else (
-        echo !VSINSTALLDIR! | findstr /C:"2019" >nul
+        echo WARNING: Could not find vcvarsall.bat or VsDevCmd.bat.
+    )
+
+    REM ── Determine CMake generator based on VS version ──
+    if "%VS_VERSION_MAJOR%"=="18" (
+        set CMAKE_GENERATOR="Visual Studio 17 2022"
+    ) else if "%VS_VERSION_MAJOR%"=="17" (
+        set CMAKE_GENERATOR="Visual Studio 17 2022"
+    ) else if "%VS_VERSION_MAJOR%"=="16" (
+        set CMAKE_GENERATOR="Visual Studio 16 2019"
+    ) else (
+        REM Try to detect from path
+        echo !VSINSTALLDIR! | findstr /C:"\18\" >nul
         if !ERRORLEVEL! equ 0 (
-            set CMAKE_GENERATOR="Visual Studio 16 2019"
-        ) else (
             set CMAKE_GENERATOR="Visual Studio 17 2022"
+        ) else (
+            echo !VSINSTALLDIR! | findstr /C:"2022" >nul
+            if !ERRORLEVEL! equ 0 (
+                set CMAKE_GENERATOR="Visual Studio 17 2022"
+            ) else (
+                echo !VSINSTALLDIR! | findstr /C:"2019" >nul
+                if !ERRORLEVEL! equ 0 (
+                    set CMAKE_GENERATOR="Visual Studio 16 2019"
+                ) else (
+                    set CMAKE_GENERATOR="Visual Studio 17 2022"
+                )
+            )
         )
     )
-) else (
-    set CMAKE_GENERATOR="Visual Studio 17 2022"
+    echo CMake generator: !CMAKE_GENERATOR!
 )
-echo CMake generator: !CMAKE_GENERATOR!
 
 REM Set Qt6 path — adjust this to your Qt installation
 if "%QT6_DIR%"=="" (
@@ -122,12 +146,17 @@ if not exist gui\build_windows mkdir gui\build_windows
 cd gui\build_windows
 
 REM The CMake file will find libpengy_core.lib in target/release/
+set CMAKE_EXTRA_ARGS=
+if defined VSINSTALLDIR (
+    set CMAKE_EXTRA_ARGS=-DCMAKE_GENERATOR_INSTANCE="!VSINSTALLDIR!"
+)
 cmake .. ^
     -G !CMAKE_GENERATOR! ^
     -A x64 ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_PREFIX_PATH="%QT6_DIR%" ^
-    -DRUST_TARGET_DIR="%ROOT%\target\x86_64-pc-windows-msvc\release"
+    -DRUST_TARGET_DIR="%ROOT%\target\x86_64-pc-windows-msvc\release" ^
+    !CMAKE_EXTRA_ARGS!
 
 cmake --build . --config Release
 
