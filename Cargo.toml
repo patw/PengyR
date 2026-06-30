@@ -3,9 +3,11 @@ members = [".", "cli", "web"]
 
 [package]
 name = "pengy_core"
-version = "2.0.0"
+version = "1.2.3"
 edition = "2021"
+authors = ["Pat Wendorf <dungeons@gmail.com>"]
 description = "Pengy core library — config, chat, tools, LLM client"
+repository = "https://github.com/patw/PengyR"
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
