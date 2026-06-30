@@ -18,8 +18,25 @@ use std::sync::{Arc, Condvar, Mutex};
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
+        println!("Pengy Web — chat with LLMs from your browser");
+        println!();
+        println!("Usage: pengy-web [PORT]");
+        println!();
+        println!("Arguments:");
+        println!("  PORT  Bind port (default: 5000)");
+        println!();
+        println!("Options:");
+        println!("  -h, --help  Show this help message and exit");
+        println!();
+        println!("Pengy Web UI runs at http://0.0.0.0:PORT");
+        return;
+    }
+
+    let port: u16 = args
+        .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5000);
 
