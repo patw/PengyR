@@ -387,6 +387,20 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
     )
 }
 
+/// Rewrite the first word-boundary `sudo` that isn't already followed by
+/// `-S` into `sudo -S`. Mirrors the reference's
+/// `re.sub(r'\bsudo\b(?!\s+-S)', 'sudo -S', command, count=1)`.
+fn rewrite_first_sudo(command: &str) -> String {
+    let sudo_word = Regex::new(r"\bsudo\b").unwrap();
+    let followed_by_s = Regex::new(r"^\s+-S").unwrap();
+    for m in sudo_word.find_iter(command) {
+        if !followed_by_s.is_match(&command[m.end()..]) {
+            return format!("{}sudo -S{}", &command[..m.start()], &command[m.end()..]);
+        }
+    }
+    command.to_string()
+}
+
 async fn run_bash(command: String) -> String {
     let timeout = timeout_secs();
 
@@ -414,12 +428,14 @@ async fn run_bash(command: String) -> String {
         }
     }
 
-    // Ensure privileged commands read password from stdin
-    let command = if password_needed && !command.contains("sudo -S") {
-        command.replacen("sudo", "sudo -S", 1)
-    } else {
-        command
-    };
+    // Ensure privileged commands read password from stdin. Rewrite only the
+    // first `sudo` that isn't already followed by `-S` (word-boundary match,
+    // not a substring match, so `sudoku`/`pseudo-tty` are left untouched;
+    // and only one occurrence, since the piped password is consumed once —
+    // rewriting every `sudo` would leave later invocations blocked on an
+    // interactive prompt). The `regex` crate has no lookahead support, so
+    // this is done as a manual scan instead of a single regex substitution.
+    let command = rewrite_first_sudo(&command);
 
     let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("bash") {
         Ok(files) => files,
@@ -2047,6 +2063,42 @@ mod tests {
         TEST_TOOL_TIMEOUT_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ── rewrite_first_sudo ──────────────────────────────────────────
+
+    #[test]
+    fn sudo_rewrite_plain_command() {
+        assert_eq!(rewrite_first_sudo("sudo apt update"), "sudo -S apt update");
+    }
+
+    #[test]
+    fn sudo_rewrite_already_dash_s_unchanged() {
+        assert_eq!(
+            rewrite_first_sudo("sudo -S apt update"),
+            "sudo -S apt update"
+        );
+    }
+
+    #[test]
+    fn sudo_rewrite_sudoku_unchanged() {
+        assert_eq!(rewrite_first_sudo("echo sudoku"), "echo sudoku");
+    }
+
+    #[test]
+    fn sudo_rewrite_pseudo_tty_unchanged() {
+        assert_eq!(
+            rewrite_first_sudo("ls /dev/pseudo-tty"),
+            "ls /dev/pseudo-tty"
+        );
+    }
+
+    #[test]
+    fn sudo_rewrite_only_first_of_two() {
+        assert_eq!(
+            rewrite_first_sudo("sudo apt update && sudo apt upgrade"),
+            "sudo -S apt update && sudo apt upgrade"
+        );
     }
 
     // ── is_readonly_tool ───────────────────────────────────────────

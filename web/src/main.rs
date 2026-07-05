@@ -20,25 +20,42 @@ use std::sync::{Arc, Condvar, Mutex};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() > 1 && (args[1] == "--help" || args[1] == "-h") {
-        println!("Pengy Web — chat with LLMs from your browser");
-        println!();
-        println!("Usage: pengy-web [PORT]");
-        println!();
-        println!("Arguments:");
-        println!("  PORT  Bind port (default: 5000)");
-        println!();
-        println!("Options:");
-        println!("  -h, --help  Show this help message and exit");
-        println!();
-        println!("Pengy Web UI runs at http://0.0.0.0:PORT");
-        return;
+    let mut host = String::from("127.0.0.1");
+    let mut port: u16 = 5000;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("Pengy Web — chat with LLMs from your browser");
+                println!();
+                println!("Usage: pengy-web [PORT] [--host HOST]");
+                println!();
+                println!("Arguments:");
+                println!("  PORT          Bind port (default: 5000)");
+                println!();
+                println!("Options:");
+                println!("  --host HOST   Bind host (default: 127.0.0.1). Pass");
+                println!("                --host 0.0.0.0 to expose beyond localhost —");
+                println!("                this app has no authentication and exposes");
+                println!("                run_bash/run_python tools, so only do this");
+                println!("                on a trusted network.");
+                println!("  -h, --help    Show this help message and exit");
+                return;
+            }
+            "--host" => {
+                i += 1;
+                if let Some(h) = args.get(i) {
+                    host = h.clone();
+                }
+            }
+            other => {
+                if let Ok(p) = other.parse() {
+                    port = p;
+                }
+            }
+        }
+        i += 1;
     }
-
-    let port: u16 = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5000);
 
     let state = AppState::new();
 
@@ -54,8 +71,8 @@ async fn main() {
         .route("/settings", get(settings_get).post(settings_post))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", port);
-    println!("Pengy Web UI running at http://localhost:{}", port);
+    let addr = format!("{}:{}", host, port);
+    println!("Pengy Web UI running at http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -949,6 +966,7 @@ fn escape_html(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
 }
 
 // ── Build messages ───────────────────────────────────────────────
@@ -1724,10 +1742,23 @@ mod tests {
     }
 
     #[test]
+    fn escape_html_single_quote() {
+        assert_eq!(escape_html("it's"), "it&#x27;s");
+    }
+
+    #[test]
     fn escape_html_combined() {
         assert_eq!(
             escape_html(r#"<script>alert("xss&stuff")</script>"#),
             "&lt;script&gt;alert(&quot;xss&amp;stuff&quot;)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn escape_html_combined_with_single_quote() {
+        assert_eq!(
+            escape_html(r#"<img src=x onerror='alert(1)'>"#),
+            "&lt;img src=x onerror=&#x27;alert(1)&#x27;&gt;"
         );
     }
 
