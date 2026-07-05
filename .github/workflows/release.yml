@@ -15,6 +15,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   linux:
     name: Linux (.deb + AppImage)
@@ -67,7 +70,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
-        run: brew install qt@6 cmake
+        run: |
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew install qt@6 cmake
 
       - name: Build DMG
         run: ./build_macos.sh
@@ -91,15 +96,29 @@ jobs:
       - name: Install Qt6
         uses: jurplel/install-qt-action@v4
         with:
-          aqtversion: '==3.*'
-          version: '6.7.3'
+          version: '6.8.2'
           host: 'windows'
           target: 'desktop'
           arch: 'win64_msvc2022_64'
 
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build
         shell: cmd
-        run: build_windows.bat
+        run: |
+          @echo on
+          echo Using Qt: %QT_ROOT_DIR%
+          cargo build --release --target x86_64-pc-windows-msvc
+          mkdir gui\build_windows
+          cd gui\build_windows
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%" -DRUST_TARGET_DIR="%CD%\..\..\target\x86_64-pc-windows-msvc\release"
+          cmake --build .
+          cd ..\..
+          mkdir PengyR-Windows
+          copy gui\build_windows\pengy.exe PengyR-Windows\
+          cd PengyR-Windows
+          windeployqt pengy.exe
 
       - name: Zip artifacts
         shell: powershell

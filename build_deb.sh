@@ -6,7 +6,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.2.4"
+VERSION="${VERSION:-$(grep -oP 'version\s*=\s*"\K[\d.]+' Cargo.toml | head -1)}"
 ARCH="$(dpkg --print-architecture)"
 PKG_NAME="pengy_${VERSION}_${ARCH}"
 STAGING="$ROOT/.deb_staging/$PKG_NAME"
