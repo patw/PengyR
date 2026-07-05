@@ -1,5 +1,6 @@
 #include "chatworker.h"
 #include <QDebug>
+#include <QJsonDocument>
 #include <cstring>
 
 ChatWorker::ChatWorker(QObject* parent) : QObject(parent) {
