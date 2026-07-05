@@ -291,7 +291,10 @@ impl WebWorker {
                         ..
                     }) => {
                         let display = if content.len() > 3000 {
-                            format!("{}\n... [truncated]", &content[..3000])
+                            format!(
+                                "{}\n... [truncated]",
+                                truncate_on_char_boundary(&content, 3000)
+                            )
                         } else {
                             content.clone()
                         };
@@ -415,7 +418,7 @@ async fn chat_send(
 
     if chat.title == "New Chat" {
         chat.title = if content.len() > 50 {
-            format!("{}...", &content[..47])
+            format!("{}...", truncate_on_char_boundary(&content, 47))
         } else {
             content.clone()
         };
@@ -930,6 +933,17 @@ fn inline_markdown(text: &str) -> String {
     result
 }
 
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1193,7 +1207,7 @@ mod templates {
                             }
                             Some(r) => {
                                 let display = if r.len() > 3000 {
-                                    format!("{}...", &r[..3000])
+                                    format!("{}...", truncate_on_char_boundary(r, 3000))
                                 } else {
                                     r.clone()
                                 };
@@ -1682,5 +1696,66 @@ function submitSudo(override) {{
         );
 
         base("Settings — Pengy", &sidebar, "", &main_content, "", "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_html_ampersand() {
+        assert_eq!(escape_html("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn escape_html_less_than() {
+        assert_eq!(escape_html("<tag>"), "&lt;tag&gt;");
+    }
+
+    #[test]
+    fn escape_html_greater_than() {
+        assert_eq!(escape_html("x>y"), "x&gt;y");
+    }
+
+    #[test]
+    fn escape_html_double_quote() {
+        assert_eq!(escape_html(r#"say "hi""#), "say &quot;hi&quot;");
+    }
+
+    #[test]
+    fn escape_html_combined() {
+        assert_eq!(
+            escape_html(r#"<script>alert("xss&stuff")</script>"#),
+            "&lt;script&gt;alert(&quot;xss&amp;stuff&quot;)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_within_limit() {
+        assert_eq!(truncate_on_char_boundary("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_ascii_truncates() {
+        assert_eq!(truncate_on_char_boundary("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_multibyte_backs_up() {
+        // 🐧 is 4 bytes; starts at byte 2999 → straddles 3000
+        let base = "a".repeat(2999);
+        let s = format!("{base}🐧tail");
+        let result = truncate_on_char_boundary(&s, 3000);
+        assert_eq!(result.len(), 2999);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn chat_title_truncation_emoji_start_does_not_panic() {
+        // Simulates the &content[..47] site: emoji at position 0
+        let content = "🐧".repeat(20);
+        let result = truncate_on_char_boundary(&content, 47);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 }

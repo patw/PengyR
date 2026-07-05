@@ -244,6 +244,18 @@ fn terminate_process_group(pid: u32) {
 
 // ── Argument helpers ────────────────────────────────────────────────
 
+/// Truncate `s` to at most `max_bytes`, backing up to the nearest char boundary.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn a(args: &serde_json::Value, key: &str, default: &str) -> String {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -1364,7 +1376,7 @@ async fn fetch_url(url_str: String) -> String {
     if text.len() > 50_000 {
         format!(
             "{}\n\n[... truncated at 50,000 characters ...]",
-            &text[..50_000]
+            truncate_on_char_boundary(&text, 50_000)
         )
     } else {
         text
@@ -1509,7 +1521,7 @@ async fn directory_tree(path: String, max_depth: usize, show_hidden: bool) -> St
     if result.len() > 40_000 {
         format!(
             "{}...\n\n[... truncated at 40,000 characters ...]",
-            &result[..40_000]
+            truncate_on_char_boundary(&result, 40_000)
         )
     } else {
         result
@@ -1668,7 +1680,7 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
         };
 
         let content = if content.len() > MAX_PER_FILE {
-            let truncated = &content[..MAX_PER_FILE];
+            let truncated = truncate_on_char_boundary(&content, MAX_PER_FILE);
             let fsize = p.metadata().map(|m| m.len()).unwrap_or(0);
             format!(
                 "{truncated}\n\n[... truncated at {MAX_PER_FILE} characters \
@@ -1684,7 +1696,10 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
             if remaining > 200 {
                 let short_block = format!(
                     "{header}\n{}...",
-                    &content[..remaining.saturating_sub(header.len() + 4)]
+                    truncate_on_char_boundary(
+                        &content,
+                        remaining.saturating_sub(header.len() + 4)
+                    )
                 );
                 parts.push(short_block);
             } else {
@@ -2597,5 +2612,60 @@ mod tests {
         let paths: Vec<String> = (0..25).map(|i| format!("/tmp/file_{i}.txt")).collect();
         let result = read_multiple_files(paths).await;
         assert!(result.contains("too many"));
+    }
+
+    // ── UTF-8 boundary truncation ───────────────────────────────────
+
+    #[test]
+    fn truncate_on_char_boundary_ascii_within_limit() {
+        let s = "hello";
+        assert_eq!(truncate_on_char_boundary(s, 10), "hello");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_ascii_exact() {
+        let s = "hello";
+        assert_eq!(truncate_on_char_boundary(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_ascii_truncates() {
+        let s = "hello world";
+        assert_eq!(truncate_on_char_boundary(s, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_multibyte_at_boundary() {
+        // 🐧 is 4 bytes; placing it so it straddles byte 3000
+        let base = "a".repeat(2999);
+        let s = format!("{base}🐧tail");
+        // byte 3000 lands inside the 4-byte penguin — must back up to 2999
+        let result = truncate_on_char_boundary(&s, 3000);
+        assert_eq!(result.len(), 2999);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_multibyte_exactly_fits() {
+        // 🐧 is 4 bytes starting at offset 2999 — doesn't fit in 3000
+        // but fits at 3003 (2999 ascii + 4 bytes penguin)
+        let base = "a".repeat(2999);
+        let s = format!("{base}🐧tail");
+        let result = truncate_on_char_boundary(&s, 3003);
+        assert_eq!(result, format!("{base}🐧"));
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_truncates_on_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        // write a file where a multibyte char straddles the 50_000-byte limit
+        let content = "a".repeat(49_999) + "🐧extra";
+        std::fs::write(&path, &content).unwrap();
+        let result = read_multiple_files(vec![path.to_str().unwrap().into()]).await;
+        // must not panic, must contain truncation marker, must be valid UTF-8
+        assert!(result.contains("[... truncated"));
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 }
