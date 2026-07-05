@@ -20,23 +20,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake qt6-base-dev libgl-dev libssl-dev
+            build-essential cmake qt6-base-dev libgl-dev libegl-dev libssl-dev pkg-config
+          # Check Qt version
+          qmake6 --version 2>/dev/null || echo "qmake6 not found"
 
       - name: Build Rust workspace
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace 2>&1
+
+      - name: Run Rust tests
+        run: cargo test 2>&1
 
       - name: Build GUI
         run: |
           mkdir -p gui/build
           cd gui/build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Run Rust tests
-        run: cargo test
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_VERBOSE_MAKEFILE=ON 2>&1
+          make -j$(nproc) 2>&1
 
       - name: Verify binaries exist
         run: |
+          echo "=== Checking binaries ==="
+          ls -lh gui/build/pengy target/release/pengy-cli target/release/pengy-web 2>&1
           test -f gui/build/pengy && echo "pengy (GUI) ✅"
           test -f target/release/pengy-cli && echo "pengy-cli ✅"
           test -f target/release/pengy-web && echo "pengy-web ✅"
