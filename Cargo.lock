@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "pengy-cli"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "chrono",
  "pengy_core",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "pengy-web"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "axum",
  "futures-util",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "pengy_core"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "chrono",
  "dirs",
