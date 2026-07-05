@@ -1,6 +1,6 @@
 [package]
 name = "pengy-cli"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
 description = "Pengy CLI — command-line interface"

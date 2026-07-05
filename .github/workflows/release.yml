@@ -86,7 +86,7 @@ jobs:
 
   windows:
     name: Windows (Zip)
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -110,14 +110,14 @@ jobs:
         run: |
           @echo on
           echo Using Qt: %QT_ROOT_DIR%
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc || exit /b 1
           mkdir gui\build_windows
           cd gui\build_windows
-          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%" -DRUST_TARGET_DIR="%CD%\..\..\target\x86_64-pc-windows-msvc\release"
-          cmake --build .
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%" -DRUST_TARGET_DIR="%CD%\..\..\target\x86_64-pc-windows-msvc\release" || exit /b 1
+          cmake --build . || exit /b 1
           cd ..\..
           mkdir PengyR-Windows
-          copy gui\build_windows\pengy.exe PengyR-Windows\
+          copy gui\build_windows\pengy.exe PengyR-Windows\ || exit /b 1
           cd PengyR-Windows
           windeployqt pengy.exe
 
