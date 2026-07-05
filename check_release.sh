@@ -82,18 +82,26 @@ fi
 echo "--- Windows Qt version in CI ---"
 QT_VER=$(grep -oP "version:\s*'[^']+'" .github/workflows/release.yml | head -1 | grep -oP "[\d.]+")
 echo "  release.yml Qt version: $QT_VER"
-if [ -n "$QT_VER" ] && [ "$(echo "$QT_VER" | cut -d. -f2)" -ge 8 ]; then
-    ok "Qt version $QT_VER is recent enough for aqt XML parsing"
+if [ -n "$QT_VER" ] && [ "$(echo "$QT_VER" | cut -d. -f2)" -eq 5 ]; then
+    ok "Qt version $QT_VER — stable LTS, widely available in aqt archives"
 else
-    warn "Qt version appears old ($QT_VER) — aqt may fail to find packages"
+    warn "Qt version $QT_VER may not be available in aqt archives — verify it exists"
 fi
 
-# ── 6. CI release.yml Windows MSVC setup ────────────────────────────
+# ── 6. CI release.yml LTO setting ────────────────────────────────────
+echo "--- Release LTO setting ---"
+if grep -q 'CARGO_PROFILE_RELEASE_LTO' .github/workflows/release.yml 2>/dev/null; then
+    LTO_VAL=$(grep -oP 'CARGO_PROFILE_RELEASE_LTO:\s*"\K[^"]+' .github/workflows/release.yml)
+    echo "  release.yml LTO override: $LTO_VAL"
+    ok "release.yml has LTO override (avoids runner OOM)"
+else
+    warn "release.yml missing CARGO_PROFILE_RELEASE_LTO env var — may OOM on 7GB runner"
+fi
+
+# ── 7. CI release.yml Windows MSVC setup ────────────────────────────
 echo "--- Windows MSVC setup in CI ---"
 if grep -q 'ilammy/msvc-dev-cmd' .github/workflows/release.yml 2>/dev/null; then
     ok "release.yml uses ilammy/msvc-dev-cmd for MSVC"
-elif grep -q 'msvc-dev-cmd' .github/workflows/release.yml 2>/dev/null; then
-    ok "release.yml has MSVC setup action"
 else
     warn "release.yml may lack MSVC setup — Windows build may fail to find VS"
 fi

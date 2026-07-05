@@ -54,4 +54,10 @@ tempfile = "3"
 
 [profile.release]
 opt-level = 2
-lto = true
+lto = "thin"
+
+# CI profile: skip LTO entirely to avoid OOM on 7GB runners
+[profile.ci]
+inherits = "release"
+lto = false
+incremental = true

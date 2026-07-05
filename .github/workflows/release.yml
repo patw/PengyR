@@ -22,6 +22,8 @@ jobs:
   linux:
     name: Linux (.deb + AppImage)
     runs-on: ubuntu-24.04
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "thin"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,8 +43,6 @@ jobs:
 
       - name: Build AppImage
         run: |
-          # Build Rust core + GUI first (AppImage script does this too,
-          # but we need targets already built — build_deb.sh already did it)
           mkdir -p appimage/tools
           wget -q -P appimage/tools \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
@@ -62,6 +62,8 @@ jobs:
   macos:
     name: macOS (DMG)
     runs-on: macos-latest
+    env:
+      HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,7 +73,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew install qt@6 cmake
 
       - name: Build DMG
@@ -96,10 +97,10 @@ jobs:
       - name: Install Qt6
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.2'
+          version: '6.5.3'
           host: 'windows'
           target: 'desktop'
-          arch: 'win64_msvc2022_64'
+          arch: 'win64_msvc2019_64'
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
