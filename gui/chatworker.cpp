@@ -14,12 +14,15 @@ ChatWorker::~ChatWorker() { cancel(); }
 
 void ChatWorker::start(const QString& baseUrl, const QString& apiKey,
                        const QString& model, const QJsonArray& messages,
-                       const QString& toolConfirmation) {
+                       const QString& toolConfirmation, const QString& reasoningEffort,
+                       bool preserveReasoning) {
     m_baseUrl = baseUrl;
     m_apiKey = apiKey;
     m_model = model;
     m_messagesJson = QJsonDocument(messages).toJson(QJsonDocument::Compact);
     m_toolConfirmation = toolConfirmation;
+    m_reasoningEffort = reasoningEffort;
+    m_preserveReasoning = preserveReasoning;
     m_cancelled = false;
     m_confirmState.status = 0;
 
@@ -72,10 +75,11 @@ void ChatWorker::run() {
     QByteArray model = m_model.toUtf8();
     QByteArray msgs = m_messagesJson.toUtf8();
     QByteArray tc = m_toolConfirmation.toUtf8();
+    QByteArray re = m_reasoningEffort.toUtf8();
 
     bool ok = pengy_llm_chat_run(
         baseUrl.constData(), apiKey.constData(), model.constData(),
-        msgs.constData(), tc.constData(),
+        msgs.constData(), tc.constData(), re.constData(), m_preserveReasoning,
         &m_confirmState, &m_sudoState,
         callback, this
     );

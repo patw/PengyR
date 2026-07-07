@@ -29,6 +29,14 @@ pub struct Config {
     #[serde(default = "default_tool_confirmation")]
     pub tool_confirmation: String,
 
+    /// Optional reasoning effort. Empty string = provider default / omit.
+    #[serde(default)]
+    pub reasoning_effort: String,
+
+    /// Preserve provider-returned reasoning fields in message history.
+    #[serde(default)]
+    pub preserve_reasoning: bool,
+
     /// Number of recent turns to keep when compacting context. 0 = keep all.
     #[serde(default)]
     pub context_keep_turns: usize,
@@ -78,6 +86,8 @@ impl Default for Config {
             model: default_model(),
             system_message: default_system_message(),
             tool_confirmation: default_tool_confirmation(),
+            reasoning_effort: String::new(),
+            preserve_reasoning: false,
             context_keep_turns: 0,
             ui_scale: default_ui_scale(),
             user_agent: default_user_agent(),
@@ -137,6 +147,16 @@ pub fn load_config() -> Config {
                     if let Some(v) = obj.get("tool_confirmation") {
                         if let Some(s) = v.as_str() {
                             config.tool_confirmation = s.to_string();
+                        }
+                    }
+                    if let Some(v) = obj.get("reasoning_effort") {
+                        if let Some(s) = v.as_str() {
+                            config.reasoning_effort = s.to_string();
+                        }
+                    }
+                    if let Some(v) = obj.get("preserve_reasoning") {
+                        if let Some(b) = v.as_bool() {
+                            config.preserve_reasoning = b;
                         }
                     }
                     if let Some(v) = obj.get("context_keep_turns") {
@@ -251,8 +271,12 @@ mod tests {
         assert_eq!(c.base_url, "https://api.openai.com/v1");
         assert_eq!(c.model, "gpt-4o");
         assert_eq!(c.tool_confirmation, "none");
+        assert_eq!(c.reasoning_effort, "");
+        assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 60);
+        assert_eq!(c.reasoning_effort, "");
+        assert!(!c.preserve_reasoning);
         assert_eq!(c.context_keep_turns, 0);
         assert!(c.api_key.is_empty());
     }
@@ -265,6 +289,8 @@ mod tests {
             model: "llama3".into(),
             system_message: "You are {username}".into(),
             tool_confirmation: "safe".into(),
+            reasoning_effort: "high".into(),
+            preserve_reasoning: true,
             context_keep_turns: 5,
             ui_scale: 150,
             user_agent: "TestAgent/1.0".into(),
@@ -276,6 +302,8 @@ mod tests {
         assert_eq!(c2.api_key, c.api_key);
         assert_eq!(c2.model, c.model);
         assert_eq!(c2.tool_confirmation, c.tool_confirmation);
+        assert_eq!(c2.reasoning_effort, c.reasoning_effort);
+        assert_eq!(c2.preserve_reasoning, c.preserve_reasoning);
         assert_eq!(c2.context_keep_turns, c.context_keep_turns);
         assert_eq!(c2.ui_scale, c.ui_scale);
         assert_eq!(c2.tool_timeout, c.tool_timeout);
@@ -289,6 +317,8 @@ mod tests {
         assert_eq!(c.model, "custom-model");
         assert_eq!(c.base_url, "https://api.openai.com/v1");
         assert_eq!(c.tool_confirmation, "none");
+        assert_eq!(c.reasoning_effort, "");
+        assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 60);
     }
@@ -300,6 +330,8 @@ mod tests {
         assert_eq!(c.base_url, d.base_url);
         assert_eq!(c.model, d.model);
         assert_eq!(c.tool_confirmation, d.tool_confirmation);
+        assert_eq!(c.reasoning_effort, d.reasoning_effort);
+        assert_eq!(c.preserve_reasoning, d.preserve_reasoning);
         assert_eq!(c.ui_scale, d.ui_scale);
     }
 

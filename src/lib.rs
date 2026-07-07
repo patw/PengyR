@@ -155,6 +155,8 @@ pub extern "C" fn pengy_llm_chat_run(
     model: *const c_char,
     messages_json: *const c_char,
     tool_confirmation: *const c_char,
+    reasoning_effort: *const c_char,
+    preserve_reasoning: bool,
     confirm_state: *mut ConfirmState,
     sudo_state: *mut SudoState,
     on_event: Option<EventFn>,
@@ -165,6 +167,7 @@ pub extern "C" fn pengy_llm_chat_run(
     let md = unsafe { cstr(model) };
     let ms = unsafe { cstr(messages_json) };
     let tc_str = unsafe { cstr(tool_confirmation) };
+    let re_str = unsafe { cstr(reasoning_effort) };
 
     let messages: Vec<chat_manager::ChatMessage> = serde_json::from_str(&ms).unwrap_or_default();
     let tc_mode = llm_client::ToolConfirmation::from_str(&tc_str);
@@ -209,7 +212,7 @@ pub extern "C" fn pengy_llm_chat_run(
     let cancel2 = cancel.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
-            &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+            &bu, &ak, &md, messages, tc_mode, &re_str, preserve_reasoning, event_tx, confirm_rx, cancel2,
         )
         .await;
     }));
@@ -289,6 +292,7 @@ pub extern "C" fn pengy_llm_chat_run(
                 if let Some(ref cb) = on_event {
                     let event = llm_client::LlmEvent::FinalResponse {
                         content: err_msg,
+                        message: None,
                         usage: llm_client::Usage {
                             prompt_tokens: 0,
                             completion_tokens: 0,

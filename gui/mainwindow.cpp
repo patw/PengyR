@@ -339,7 +339,9 @@ void MainWindow::processResponse(const QJsonArray& apiMessages) {
             m_config["api_key"].toString(),
             m_config["model"].toString(),
             apiMessages,
-            m_config["tool_confirmation"].toString("none")
+            m_config["tool_confirmation"].toString("none"),
+            m_config["reasoning_effort"].toString(""),
+            m_config["preserve_reasoning"].toBool(false)
         );
     });
 

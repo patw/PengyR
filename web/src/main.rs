@@ -243,11 +243,13 @@ impl WebWorker {
             let bu = config.base_url.clone();
             let ak = config.api_key.clone();
             let md = config.model.clone();
+            let re = config.reasoning_effort.clone();
+            let pr = config.preserve_reasoning;
             let cancel2 = cancel.clone();
 
             tokio::spawn(async move {
                 llm_client::chat(
-                    &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+                    &bu, &ak, &md, messages, tc_mode, &re, pr, event_tx, confirm_rx, cancel2,
                 )
                 .await;
             });
@@ -320,6 +322,9 @@ impl WebWorker {
                             content: Some(serde_json::Value::String(content)),
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id.clone()),
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
                         });
                         let _ = sse_tx2.send(SseEvent::ToolResult {
                             tool_call_id: tool_call_id.clone(),
@@ -329,13 +334,16 @@ impl WebWorker {
                             declined,
                         });
                     }
-                    Some(LlmEvent::FinalResponse { content, usage }) => {
-                        chat.messages.push(ChatMessage {
+                    Some(LlmEvent::FinalResponse { content, message, usage }) => {
+                        chat.messages.push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
                             content: Some(serde_json::Value::String(content.clone())),
                             tool_calls: vec![],
                             tool_call_id: None,
-                        });
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
+                        }));
                         let _ = sse_tx2.send(SseEvent::FinalResponse {
                             html: render_markdown(&content),
                             usage,
@@ -431,6 +439,9 @@ async fn chat_send(
         content: Some(serde_json::Value::String(content.clone())),
         tool_calls: vec![],
         tool_call_id: None,
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_details: None,
     });
 
     if chat.title == "New Chat" {
@@ -600,6 +611,8 @@ struct SettingsForm {
     user_agent: Option<String>,
     api_key: Option<String>,
     tool_confirmation: Option<String>,
+    reasoning_effort: Option<String>,
+    preserve_reasoning: Option<String>,
     tool_timeout: Option<String>,
     context_keep_turns: Option<String>,
 }
@@ -630,6 +643,12 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
             config.tool_confirmation = v.clone();
         }
     }
+    if let Some(v) = &form.reasoning_effort {
+        if ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&v.as_str()) {
+            config.reasoning_effort = v.clone();
+        }
+    }
+    config.preserve_reasoning = form.preserve_reasoning.is_some();
     if let Some(v) = &form.tool_timeout {
         if let Ok(n) = v.parse::<u64>() {
             config.tool_timeout = n.max(1);
@@ -981,6 +1000,9 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
             ))),
             tool_calls: vec![],
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         });
     }
     let raw = chat_manager::clean_dangling_tool_calls(&chat.messages);
@@ -1646,6 +1668,15 @@ function submitSudo(override) {{
         } else {
             ""
         };
+        let reasoning_default_sel = if config.reasoning_effort.is_empty() { " selected" } else { "" };
+        let reasoning_none_sel = if config.reasoning_effort == "none" { " selected" } else { "" };
+        let reasoning_minimal_sel = if config.reasoning_effort == "minimal" { " selected" } else { "" };
+        let reasoning_low_sel = if config.reasoning_effort == "low" { " selected" } else { "" };
+        let reasoning_medium_sel = if config.reasoning_effort == "medium" { " selected" } else { "" };
+        let reasoning_high_sel = if config.reasoning_effort == "high" { " selected" } else { "" };
+        let reasoning_xhigh_sel = if config.reasoning_effort == "xhigh" { " selected" } else { "" };
+        let reasoning_max_sel = if config.reasoning_effort == "max" { " selected" } else { "" };
+        let preserve_reasoning_checked = if config.preserve_reasoning { " checked" } else { "" };
         let api_key_status = if config.api_key.is_empty() {
             "not set"
         } else {
@@ -1681,6 +1712,25 @@ function submitSudo(override) {{
         </select>
       </div>
       <div class="mb-3">
+        <label class="form-label fw-semibold">Reasoning Effort</label>
+        <select name="reasoning_effort" class="form-select">
+          <option value=""{reasoning_default_sel}>Provider default — do not send</option>
+          <option value="none"{reasoning_none_sel}>Off / none</option>
+          <option value="minimal"{reasoning_minimal_sel}>Minimal</option>
+          <option value="low"{reasoning_low_sel}>Low</option>
+          <option value="medium"{reasoning_medium_sel}>Medium</option>
+          <option value="high"{reasoning_high_sel}>High</option>
+          <option value="xhigh"{reasoning_xhigh_sel}>Extra high</option>
+          <option value="max"{reasoning_max_sel}>Max</option>
+        </select>
+        <div class="form-text">Optional best-effort parameter. Provider default omits it.</div>
+      </div>
+      <div class="form-check mb-3">
+        <input type="checkbox" name="preserve_reasoning" value="1" class="form-check-input" id="preserve_reasoning"{preserve_reasoning_checked}>
+        <label class="form-check-label" for="preserve_reasoning">Preserve returned reasoning fields</label>
+        <div class="form-text">Keeps reasoning_content/reasoning/reasoning_details when providers return them.</div>
+      </div>
+      <div class="mb-3">
         <label class="form-label fw-semibold">Tool Timeout (seconds)</label>
         <input type="number" name="tool_timeout" class="form-control" value="{tool_timeout}" min="1" max="3600">
       </div>
@@ -1711,6 +1761,15 @@ function submitSudo(override) {{
             context_keep_turns = config.context_keep_turns,
             user_agent = escape_html(&config.user_agent),
             system_message = escape_html(&config.system_message),
+            reasoning_default_sel = reasoning_default_sel,
+            reasoning_none_sel = reasoning_none_sel,
+            reasoning_minimal_sel = reasoning_minimal_sel,
+            reasoning_low_sel = reasoning_low_sel,
+            reasoning_medium_sel = reasoning_medium_sel,
+            reasoning_high_sel = reasoning_high_sel,
+            reasoning_xhigh_sel = reasoning_xhigh_sel,
+            reasoning_max_sel = reasoning_max_sel,
+            preserve_reasoning_checked = preserve_reasoning_checked,
         );
 
         base("Settings — Pengy", &sidebar, "", &main_content, "", "")

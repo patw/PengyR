@@ -70,6 +70,30 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     }
     form->addRow("Tool Confirmation:", m_toolConfirm);
 
+    m_reasoningEffort = new QComboBox;
+    m_reasoningEffort->addItem("Provider default — do not send", "");
+    m_reasoningEffort->addItem("Off / none", "none");
+    m_reasoningEffort->addItem("Minimal", "minimal");
+    m_reasoningEffort->addItem("Low", "low");
+    m_reasoningEffort->addItem("Medium", "medium");
+    m_reasoningEffort->addItem("High", "high");
+    m_reasoningEffort->addItem("Extra high", "xhigh");
+    m_reasoningEffort->addItem("Max", "max");
+    QString re = config["reasoning_effort"].toString("");
+    for (int i = 0; i < m_reasoningEffort->count(); i++) {
+        if (m_reasoningEffort->itemData(i).toString() == re) {
+            m_reasoningEffort->setCurrentIndex(i);
+            break;
+        }
+    }
+    m_reasoningEffort->setToolTip("Optional best-effort reasoning depth. Provider default omits the parameter.");
+    form->addRow("Reasoning effort:", m_reasoningEffort);
+
+    m_preserveReasoning = new QCheckBox("Preserve returned reasoning fields");
+    m_preserveReasoning->setChecked(config["preserve_reasoning"].toBool(false));
+    m_preserveReasoning->setToolTip("Keeps reasoning_content/reasoning/reasoning_details when providers return them.");
+    form->addRow("Reasoning preservation:", m_preserveReasoning);
+
     m_contextKeep = new QSpinBox;
     m_contextKeep->setRange(0, 999);
     m_contextKeep->setSpecialValueText("Keep all");
@@ -107,6 +131,8 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["user_agent"] = m_userAgent->text();
         m_config["system_message"] = m_systemMsg->toPlainText();
         m_config["tool_confirmation"] = m_toolConfirm->currentData().toString();
+        m_config["reasoning_effort"] = m_reasoningEffort->currentData().toString();
+        m_config["preserve_reasoning"] = m_preserveReasoning->isChecked();
         m_config["context_keep_turns"] = m_contextKeep->value();
         m_config["ui_scale"] = m_uiScale->currentData().toInt();
         m_config["tool_timeout"] = m_toolTimeout->value();

@@ -14,8 +14,9 @@ const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
-const BLUE: &str = "\x1b[34m";
 const CYAN: &str = "\x1b[36m";
+const MAX_PANEL_WIDTH: usize = 140;
+const MIN_PANEL_WIDTH: usize = 60;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,10 +63,13 @@ impl PengyCli {
 
     fn run_interactive(&mut self) {
         println!();
-        println!("{}{}Pengy CLI{}", BOLD, BLUE, RESET);
-        println!(
-            "Type your message and press Enter.  {}Try /help for available commands.{}",
-            DIM, RESET
+        print_box(
+            "",
+            &[
+                "🐧 Pengy CLI".to_string(),
+                "Type your message and press Enter.  Try /help for available commands.".to_string(),
+            ],
+            Some(71),
         );
 
         let chats = chat_manager::load_chats();
@@ -95,7 +99,7 @@ impl PengyCli {
         self.set_sudo_provider();
 
         loop {
-            let line = match self.prompt(&format!("\n{}{}You{} ", BOLD, BLUE, RESET)) {
+            let line = match self.prompt("\nYou: ") {
                 Some(l) => l,
                 None => break,
             };
@@ -125,6 +129,9 @@ impl PengyCli {
                 content: Some(serde_json::Value::String(final_text.clone())),
                 tool_calls: vec![],
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_details: None,
             });
 
             if chat.title == "New Chat" {
@@ -135,7 +142,7 @@ impl PengyCli {
         }
 
         self.clear_sudo_provider();
-        println!("\n{}Goodbye!{}", DIM, RESET);
+        println!("\nGoodbye!");
     }
 
     fn run_single_shot(&mut self, prompt_text: &str) {
@@ -150,6 +157,9 @@ impl PengyCli {
                     content: Some(serde_json::Value::String(prompt_text.to_string())),
                     tool_calls: vec![],
                     tool_call_id: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 }],
                 created_at: chrono_now(),
             };
@@ -161,6 +171,9 @@ impl PengyCli {
                 content: Some(serde_json::Value::String(prompt_text.to_string())),
                 tool_calls: vec![],
                 tool_call_id: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_details: None,
             });
             chat_manager::save_chat(&chat).ok();
             self.current_chat = Some(chat);
@@ -184,11 +197,13 @@ impl PengyCli {
         let bu = self.config.base_url.clone();
         let ak = self.config.api_key.clone();
         let md = self.config.model.clone();
+        let re = self.config.reasoning_effort.clone();
+        let pr = self.config.preserve_reasoning;
         let cancel2 = cancel.clone();
 
         self.rt.spawn(async move {
             llm_client::chat(
-                &bu, &ak, &md, messages, tc_mode, event_tx, confirm_rx, cancel2,
+                &bu, &ak, &md, messages, tc_mode, &re, pr, event_tx, confirm_rx, cancel2,
             )
             .await;
         });
@@ -269,10 +284,13 @@ impl PengyCli {
                             content: Some(serde_json::Value::String(content)),
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id),
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
                         });
                     eprint!("{}Thinking...{}", DIM, RESET);
                 }
-                Some(LlmEvent::FinalResponse { content, usage }) => {
+                Some(LlmEvent::FinalResponse { content, message, usage }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
@@ -281,12 +299,15 @@ impl PengyCli {
                         .as_mut()
                         .unwrap()
                         .messages
-                        .push(ChatMessage {
+                        .push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
                             content: Some(serde_json::Value::String(content)),
                             tool_calls: vec![],
                             tool_call_id: None,
-                        });
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
+                        }));
                     if !self.no_save {
                         chat_manager::save_chat(self.current_chat.as_ref().unwrap()).ok();
                     }
@@ -304,76 +325,46 @@ impl PengyCli {
     // ── Rendering ────────────────────────────────────────────────
 
     fn render_tool_request(&self, name: &str, args: &serde_json::Value) {
-        let args_str = serde_json::to_string_pretty(args).unwrap_or_default();
-        let preview = args
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| {
-                        let vs = match v {
-                            serde_json::Value::String(s) => {
-                                if s.len() > 30 {
-                                    format!("{}...", &s[..27])
-                                } else {
-                                    s.clone()
-                                }
-                            }
-                            other => other.to_string(),
-                        };
-                        format!("{}={}", k, vs)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
+        let mut args_str = serde_json::to_string_pretty(args).unwrap_or_default();
+        if char_count(&args_str) > 4000 {
+            args_str = format!("{}\n\n[... truncated ...]", take_chars(&args_str, 4000));
+        }
 
         println!();
-        println!(
-            "{}--- Tool: {}{}{} [{}] ---{}",
-            YELLOW,
-            BOLD,
-            name,
-            RESET,
-            truncate(&preview, 60),
-            RESET
+        print_box(
+            &format!("🔧 Tool: {}", name),
+            &[name.to_string(), args_str],
+            None,
         );
-        if args_str.len() <= 2000 {
-            println!("{}{}{}", DIM, args_str, RESET);
-        } else {
-            println!("{}{}{}", DIM, &args_str[..2000], RESET);
-            println!("{}[... truncated]{}", DIM, RESET);
-        }
     }
 
     fn render_tool_result(&self, content: &str, declined: bool) {
         if declined {
-            println!("{}Declined{}", RED, RESET);
+            print_box("Tool output", &["Declined".to_string()], None);
             return;
         }
 
-        let display = if content.len() > 2000 {
-            format!("{}\n\n[... truncated ...]", &content[..2000])
+        let display = if char_count(content) > 4000 {
+            format!("{}\n\n[... truncated ...]", take_chars(content, 4000))
         } else {
             content.to_string()
         };
 
-        println!("{}--- Output ---{}", DIM, RESET);
-        println!("{}", display);
+        print_box("Tool output", &[display], None);
     }
 
     fn render_final(&self, content: &str, usage: &llm_client::Usage) {
         if content.trim().is_empty() {
-            println!("{}(empty response){}", DIM, RESET);
+            print_box("Assistant 🤖", &["(empty response)".to_string()], None);
         } else {
             println!();
-            println!("{}--- Assistant ---{}", GREEN, RESET);
-            println!("{}", content);
+            print_box("Assistant 🤖", &[content.to_string()], None);
         }
 
         if usage.total_tokens > 0 {
             println!(
-                "{}Tokens: {} in / {} out ({} total){}",
-                DIM, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, RESET
+                "Tokens: {} in / {} out ({} total)",
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             );
         }
     }
@@ -472,7 +463,7 @@ impl PengyCli {
 
     fn cmd_new(&mut self) {
         self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
-        println!("{}New chat created.{}", GREEN, RESET);
+        println!("✓ New chat created.");
     }
 
     fn cmd_config(&self) {
@@ -935,6 +926,122 @@ impl PengyCli {
 
 // ── Free functions ────────────────────────────────────────────────
 
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|w| *w >= MIN_PANEL_WIDTH)
+        .unwrap_or(120)
+}
+
+fn panel_width(requested: Option<usize>) -> usize {
+    requested.unwrap_or_else(|| terminal_width().saturating_sub(2))
+        .clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH)
+}
+
+fn visual_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '\u{1F300}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' => 2,
+            '\u{1100}'..='\u{115F}'
+            | '\u{2E80}'..='\u{A4CF}'
+            | '\u{AC00}'..='\u{D7A3}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE10}'..='\u{FE19}'
+            | '\u{FE30}'..='\u{FE6F}'
+            | '\u{FF00}'..='\u{FF60}'
+            | '\u{FFE0}'..='\u{FFE6}' => 2,
+            _ => 1,
+        })
+        .sum()
+}
+
+fn pad_to_width(s: &str, width: usize) -> String {
+    let used = visual_width(s);
+    if used >= width {
+        s.to_string()
+    } else {
+        format!("{}{}", s, " ".repeat(width - used))
+    }
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn take_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in line.split_inclusive(' ') {
+        let word_width = visual_width(word);
+        if current_width > 0 && current_width + word_width > width {
+            out.push(current.trim_end().to_string());
+            current.clear();
+            current_width = 0;
+        }
+
+        if word_width > width {
+            for ch in word.chars() {
+                let ch_width = visual_width(&ch.to_string());
+                if current_width > 0 && current_width + ch_width > width {
+                    out.push(current.trim_end().to_string());
+                    current.clear();
+                    current_width = 0;
+                }
+                current.push(ch);
+                current_width += ch_width;
+            }
+        } else {
+            current.push_str(word);
+            current_width += word_width;
+        }
+    }
+
+    if !current.is_empty() {
+        out.push(current.trim_end().to_string());
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn print_box(title: &str, blocks: &[String], requested_width: Option<usize>) {
+    let width = panel_width(requested_width);
+    let inner = width.saturating_sub(4);
+    let title_width = visual_width(title);
+
+    if title.is_empty() {
+        println!("╭{}╮", "─".repeat(width.saturating_sub(2)));
+    } else {
+        let dash_count = width.saturating_sub(title_width + 6);
+        println!("╭─ {}  {}╮", title, "─".repeat(dash_count));
+    }
+
+    for block in blocks {
+        for raw_line in block.lines() {
+            for line in wrap_line(raw_line, inner) {
+                println!("│ {} │", pad_to_width(&line, inner));
+            }
+        }
+        if block.ends_with('\n') {
+            println!("│ {} │", " ".repeat(inner));
+        }
+    }
+
+    println!("╰{}╯", "─".repeat(width.saturating_sub(2)));
+}
+
 fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if !config.system_message.is_empty() {
@@ -945,6 +1052,9 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
             ))),
             tool_calls: vec![],
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         });
     }
     let raw = chat_manager::clean_dangling_tool_calls(&chat.messages);

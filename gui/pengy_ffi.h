@@ -35,6 +35,8 @@ extern "C" {
         const char* model,
         const char* messages_json,
         const char* tool_confirmation,
+        const char* reasoning_effort,
+        bool preserve_reasoning,
         ConfirmState* confirm_state,
         SudoState* sudo_state,
         EventFn on_event,

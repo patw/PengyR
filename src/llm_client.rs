@@ -32,7 +32,12 @@ pub enum LlmEvent {
         declined: bool,
     },
     #[serde(rename = "final_response")]
-    FinalResponse { content: String, usage: Usage },
+    FinalResponse {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<ChatMessage>,
+        usage: Usage,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +91,8 @@ pub async fn chat(
     model: &str,
     messages: Vec<ChatMessage>,
     tool_confirmation: ToolConfirmation,
+    reasoning_effort: &str,
+    preserve_reasoning: bool,
     event_tx: mpsc::UnboundedSender<LlmEvent>,
     mut confirm_rx: mpsc::UnboundedReceiver<Confirmation>,
     cancel: Arc<AtomicBool>,
@@ -109,12 +116,15 @@ pub async fn chat(
         }
 
         // Build API request payload
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model": model,
             "messages": current_messages,
             "tools": tools::tool_definitions(),
             "tool_choice": "auto",
         });
+        if !reasoning_effort.is_empty() {
+            payload["reasoning_effort"] = serde_json::Value::String(reasoning_effort.to_string());
+        }
 
         let resp = match client
             .post(&url)
@@ -129,6 +139,7 @@ pub async fn chat(
             Err(e) => {
                 let _ = event_tx.send(LlmEvent::FinalResponse {
                     content: format!("API error: {e}"),
+                    message: None,
                     usage: accumulated_usage,
                 });
                 return;
@@ -141,6 +152,7 @@ pub async fn chat(
             Err(e) => {
                 let _ = event_tx.send(LlmEvent::FinalResponse {
                     content: format!("Error parsing API response (HTTP {status}): {e}"),
+                    message: None,
                     usage: accumulated_usage,
                 });
                 return;
@@ -155,6 +167,7 @@ pub async fn chat(
                 .unwrap_or("unknown error");
             let _ = event_tx.send(LlmEvent::FinalResponse {
                 content: format!("API error (HTTP {status}): {detail}"),
+                message: None,
                 usage: accumulated_usage,
             });
             return;
@@ -169,6 +182,7 @@ pub async fn chat(
                         "No choices in API response: {}",
                         serde_json::to_string_pretty(&body).unwrap_or_default()
                     ),
+                    message: None,
                     usage: accumulated_usage,
                 });
                 return;
@@ -216,6 +230,9 @@ pub async fn chat(
                         })
                         .collect(),
                     tool_call_id: None,
+                    reasoning_content: if preserve_reasoning { msg.get("reasoning_content").cloned() } else { None },
+                    reasoning: if preserve_reasoning { msg.get("reasoning").cloned() } else { None },
+                    reasoning_details: if preserve_reasoning { msg.get("reasoning_details").cloned() } else { None },
                 };
 
                 let _ = event_tx.send(LlmEvent::AssistantToolCalls {
@@ -259,6 +276,9 @@ pub async fn chat(
                             content: Some(serde_json::Value::String(result.clone())),
                             tool_calls: vec![],
                             tool_call_id: Some(tc_id.clone()),
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
                         });
 
                         let _ = event_tx.send(LlmEvent::ToolResult {
@@ -290,6 +310,9 @@ pub async fn chat(
                                     content: Some(serde_json::Value::String(result.clone())),
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
+                                    reasoning_content: None,
+                                    reasoning: None,
+                                    reasoning_details: None,
                                 });
 
                                 let _ = event_tx.send(LlmEvent::ToolResult {
@@ -309,6 +332,9 @@ pub async fn chat(
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
+                                    reasoning_content: None,
+                                    reasoning: None,
+                                    reasoning_details: None,
                                 });
 
                                 let _ = event_tx.send(LlmEvent::ToolResult {
@@ -328,8 +354,18 @@ pub async fn chat(
         }
 
         // No tool calls — this is the final response
+        let final_msg = ChatMessage {
+            role: "assistant".into(),
+            content: Some(serde_json::Value::String(content.clone())),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: if preserve_reasoning { msg.get("reasoning_content").cloned() } else { None },
+            reasoning: if preserve_reasoning { msg.get("reasoning").cloned() } else { None },
+            reasoning_details: if preserve_reasoning { msg.get("reasoning_details").cloned() } else { None },
+        };
         let _ = event_tx.send(LlmEvent::FinalResponse {
             content,
+            message: Some(final_msg),
             usage: accumulated_usage,
         });
         return;
@@ -389,6 +425,7 @@ mod tests {
     fn llm_event_final_response_serde() {
         let event = LlmEvent::FinalResponse {
             content: "Hello!".into(),
+            message: None,
             usage: Usage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
@@ -398,7 +435,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            LlmEvent::FinalResponse { content, usage } => {
+            LlmEvent::FinalResponse { content, usage, .. } => {
                 assert_eq!(content, "Hello!");
                 assert_eq!(usage.prompt_tokens, 100);
                 assert_eq!(usage.completion_tokens, 50);

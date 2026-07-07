@@ -28,6 +28,38 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<serde_json::Value>,
+}
+
+impl ChatMessage {
+    pub fn new(role: impl Into<String>, content: Option<serde_json::Value>) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: Some(serde_json::Value::String(content.into())),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +212,9 @@ pub fn clean_dangling_tool_calls(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     )),
                     tool_calls: vec![],
                     tool_call_id: Some(missing_id),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_details: None,
                 });
             }
         }
@@ -268,6 +303,9 @@ mod tests {
             content: Some(serde_json::Value::String(content.into())),
             tool_calls: vec![],
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -277,6 +315,9 @@ mod tests {
             content: Some(serde_json::Value::String(content.into())),
             tool_calls: vec![],
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -296,6 +337,9 @@ mod tests {
                 })
                 .collect(),
             tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -305,6 +349,9 @@ mod tests {
             content: Some(serde_json::Value::String(content.into())),
             tool_calls: vec![],
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
