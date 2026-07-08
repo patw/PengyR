@@ -14,6 +14,20 @@
 #include <QNetworkReply>
 #include <QEventLoop>
 #include <QPointer>
+#include <QAbstractItemView>
+
+/* ComboBox whose dropdown popup is ~50% wider than the combo itself,
+   so short-content combos (scale %, theme, accent) feel proportional
+   when the UI is scaled up. */
+class WidePopupComboBox : public QComboBox {
+public:
+    explicit WidePopupComboBox(QWidget* parent = nullptr) : QComboBox(parent) {}
+    void showPopup() override {
+        QComboBox::showPopup();
+        QWidget* popup = view()->parentWidget();
+        if (popup) popup->setFixedWidth(static_cast<int>(width() * 1.5));
+    }
+};
 
 SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     : QDialog(parent), m_config(config) {
@@ -102,7 +116,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_contextKeep->setValue(config["context_keep_turns"].toInt(0));
     form->addRow("Keep tool results:", m_contextKeep);
 
-    m_uiScale = new QComboBox;
+    m_uiScale = new WidePopupComboBox;
     int scales[] = {75, 100, 125, 150, 175, 200};
     int currentScale = config["ui_scale"].toInt(100);
     int idx = 1;
@@ -113,7 +127,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_uiScale->setCurrentIndex(idx);
     form->addRow("UI Scale (restart to apply):", m_uiScale);
 
-    m_themeMode = new QComboBox;
+    m_themeMode = new WidePopupComboBox;
     m_themeMode->addItem("System", "system");
     m_themeMode->addItem("Light", "light");
     m_themeMode->addItem("Dark", "dark");
@@ -121,7 +135,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     for (int i = 0; i < m_themeMode->count(); ++i) if (m_themeMode->itemData(i).toString() == tm) m_themeMode->setCurrentIndex(i);
     form->addRow("Theme mode:", m_themeMode);
 
-    m_themeAccent = new QComboBox;
+    m_themeAccent = new WidePopupComboBox;
     const QStringList accents = {"default", "blue", "teal", "green", "orange", "red", "pink", "purple"};
     for (const QString& a : accents) m_themeAccent->addItem(a.left(1).toUpper() + a.mid(1), a);
     QString ta = config["theme_accent"].toString("default");
