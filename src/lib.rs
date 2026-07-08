@@ -7,6 +7,7 @@
 pub mod chat_manager;
 pub mod config;
 pub mod llm_client;
+pub mod task_manager;
 pub mod tools;
 
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -103,6 +104,51 @@ pub extern "C" fn pengy_clean_messages(json: *const c_char) -> *mut c_char {
     to_c(
         &serde_json::to_string(&chat_manager::clean_dangling_tool_calls(&msgs)).unwrap_or_default(),
     )
+}
+
+// ── Tasks ─────────────────────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn pengy_tasks_load() -> *mut c_char {
+    to_c(&serde_json::to_string(&task_manager::load_tasks()).unwrap_or_default())
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_tasks_save(json: *const c_char) -> bool {
+    let tasks: Vec<task_manager::Task> = serde_json::from_str(&unsafe { cstr(json) }).unwrap_or_default();
+    task_manager::save_tasks(&tasks).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_task_create(title: *const c_char, template_str: *const c_char) -> *mut c_char {
+    match task_manager::create_task(&unsafe { cstr(title) }, &unsafe { cstr(template_str) }) {
+        Ok(t) => to_c(&serde_json::to_string(&t).unwrap_or_default()),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_task_update(id: *const c_char, title: *const c_char, template_str: *const c_char) -> *mut c_char {
+    match task_manager::update_task(&unsafe { cstr(id) }, &unsafe { cstr(title) }, &unsafe { cstr(template_str) }) {
+        Ok(Some(t)) => to_c(&serde_json::to_string(&t).unwrap_or_default()),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_task_delete(id: *const c_char) -> bool {
+    task_manager::delete_task(&unsafe { cstr(id) }).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_task_placeholders(template_str: *const c_char) -> *mut c_char {
+    to_c(&serde_json::to_string(&task_manager::extract_placeholders(&unsafe { cstr(template_str) })).unwrap_or_default())
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_task_render(template_str: *const c_char, values_json: *const c_char) -> *mut c_char {
+    let values: std::collections::HashMap<String, String> = serde_json::from_str(&unsafe { cstr(values_json) }).unwrap_or_default();
+    to_c(&task_manager::render_template(&unsafe { cstr(template_str) }, &values))
 }
 
 // ── Tools ─────────────────────────────────────────────────────────

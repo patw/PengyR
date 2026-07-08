@@ -4,6 +4,8 @@
 #include "chatinput.h"
 #include "chatworker.h"
 #include "settingsdialog.h"
+#include "tasksdialog.h"
+#include "themehelper.h"
 #include "pengy_ffi.h"
 
 #include <QSplitter>
@@ -28,6 +30,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     pengy_free(cfgJson);
 
     setupUi();
+    int themeScale = m_config["ui_scale"].toInt(100);
+    QString themeMode = m_config["theme_mode"].toString("system");
+    QString themeAccent = m_config["theme_accent"].toString("default");
+    qApp->setStyleSheet(appStyleSheet(makeTheme(themeMode, themeAccent), themeScale));
     updateLlmClient();
     loadChatList();
 
@@ -65,6 +71,7 @@ void MainWindow::setupUi() {
     connect(m_chatHistory, &ChatHistoryWidget::chatSelected, this, &MainWindow::loadChat);
     connect(m_chatHistory, &ChatHistoryWidget::newChatRequested, this, &MainWindow::createNewChat);
     connect(m_chatHistory, &ChatHistoryWidget::settingsRequested, this, &MainWindow::openSettings);
+    connect(m_chatHistory, &ChatHistoryWidget::tasksRequested, this, &MainWindow::openTasks);
     connect(m_chatHistory, &ChatHistoryWidget::deleteRequested, this, &MainWindow::deleteChat);
     leftSplitter->addWidget(m_chatHistory);
 
@@ -82,7 +89,7 @@ void MainWindow::setupUi() {
     inputLayout->addWidget(m_chatInput);
 
     m_stopBtn = new QPushButton("⏹ Stop");
-    m_stopBtn->setFixedHeight(32);
+    m_stopBtn->setFixedHeight(scaledSize(32, m_config["ui_scale"].toInt(100)));
     m_stopBtn->setStyleSheet(
         "QPushButton { background-color: #d20f39; color: white; border: none; "
         "border-radius: 8px; padding: 4px 14px; font-weight: bold; font-size: 11pt; }"
@@ -536,9 +543,24 @@ void MainWindow::openSettings() {
         m_config = dlg.config();
         QByteArray json = QJsonDocument(m_config).toJson(QJsonDocument::Compact);
         pengy_config_save(json.constData());
+        int themeScale = m_config["ui_scale"].toInt(100);
+        QString themeMode = m_config["theme_mode"].toString("system");
+        QString themeAccent = m_config["theme_accent"].toString("default");
+        qApp->setStyleSheet(appStyleSheet(makeTheme(themeMode, themeAccent), themeScale));
+        m_stopBtn->setFixedHeight(scaledSize(32, themeScale));
         updateLlmClient();
+        loadChatList();
+        if (!m_currentChatId.isEmpty()) m_chatHistory->selectChatById(m_currentChatId);
         m_chatHistory->updateQuickSettings(
             m_config["model"].toString(),
             m_config["tool_confirmation"].toString("none"));
     }
+}
+
+void MainWindow::openTasks() {
+    TasksDialog dlg(this);
+    connect(&dlg, &TasksDialog::taskPlayed, this, [this](const QString& prompt) {
+        sendMessage(prompt, QStringList());
+    });
+    dlg.exec();
 }

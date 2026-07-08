@@ -45,6 +45,14 @@ pub struct Config {
     #[serde(default = "default_ui_scale")]
     pub ui_scale: u32,
 
+    /// Theme mode: "system" | "light" | "dark".
+    #[serde(default = "default_theme_mode")]
+    pub theme_mode: String,
+
+    /// Accent colour: default | blue | teal | green | orange | red | pink | purple.
+    #[serde(default = "default_theme_accent")]
+    pub theme_accent: String,
+
     /// User-Agent header sent in HTTP requests.
     #[serde(default = "default_user_agent")]
     pub user_agent: String,
@@ -71,6 +79,12 @@ fn default_tool_confirmation() -> String {
 fn default_ui_scale() -> u32 {
     100
 }
+fn default_theme_mode() -> String {
+    "system".into()
+}
+fn default_theme_accent() -> String {
+    "default".into()
+}
 fn default_user_agent() -> String {
     "PengyAgent/1.0".into()
 }
@@ -90,6 +104,8 @@ impl Default for Config {
             preserve_reasoning: false,
             context_keep_turns: 0,
             ui_scale: default_ui_scale(),
+            theme_mode: default_theme_mode(),
+            theme_accent: default_theme_accent(),
             user_agent: default_user_agent(),
             tool_timeout: default_tool_timeout(),
         }
@@ -167,6 +183,16 @@ pub fn load_config() -> Config {
                     if let Some(v) = obj.get("ui_scale") {
                         if let Some(n) = v.as_u64() {
                             config.ui_scale = n as u32;
+                        }
+                    }
+                    if let Some(v) = obj.get("theme_mode") {
+                        if let Some(s) = v.as_str() {
+                            config.theme_mode = s.to_string();
+                        }
+                    }
+                    if let Some(v) = obj.get("theme_accent") {
+                        if let Some(s) = v.as_str() {
+                            config.theme_accent = s.to_string();
                         }
                     }
                     if let Some(v) = obj.get("user_agent") {
@@ -293,6 +319,8 @@ mod tests {
             preserve_reasoning: true,
             context_keep_turns: 5,
             ui_scale: 150,
+            theme_mode: "dark".into(),
+            theme_accent: "purple".into(),
             user_agent: "TestAgent/1.0".into(),
             tool_timeout: 120,
         };
@@ -306,6 +334,8 @@ mod tests {
         assert_eq!(c2.preserve_reasoning, c.preserve_reasoning);
         assert_eq!(c2.context_keep_turns, c.context_keep_turns);
         assert_eq!(c2.ui_scale, c.ui_scale);
+        assert_eq!(c2.theme_mode, c.theme_mode);
+        assert_eq!(c2.theme_accent, c.theme_accent);
         assert_eq!(c2.tool_timeout, c.tool_timeout);
     }
 

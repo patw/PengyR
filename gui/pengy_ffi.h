@@ -13,6 +13,14 @@ extern "C" {
     char* pengy_chat_get(const char* id);
     char* pengy_clean_messages(const char* json);
 
+    char* pengy_tasks_load();
+    bool  pengy_tasks_save(const char* json);
+    char* pengy_task_create(const char* title, const char* template_str);
+    char* pengy_task_update(const char* id, const char* title, const char* template_str);
+    bool  pengy_task_delete(const char* id);
+    char* pengy_task_placeholders(const char* template_str);
+    char* pengy_task_render(const char* template_str, const char* values_json);
+
     bool  pengy_tool_is_readonly(const char* name);
     void  pengy_tool_set_user_agent(const char* ua);
     void  pengy_tool_set_timeout(unsigned long long secs);
