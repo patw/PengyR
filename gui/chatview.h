@@ -1,4 +1,5 @@
 #pragma once
+#include "themehelper.h"
 #include <QTextBrowser>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -18,6 +19,7 @@ public:
         appendMessage(role, QJsonValue(text));
     }
     void clear();
+    void applyTheme(const Theme& theme, int scale = 100);
 
 #ifdef PENGY_UNIT_TEST
     QString testMarkdownToHtml(const QString& md) const { return markdownToHtml(md); }
@@ -33,6 +35,7 @@ private slots:
 private:
     void render();
     QString buildHtml();
+    QString buildCss() const;
     QString renderMessage(const QJsonObject& msg) const;
     QString renderToolBlock(const QJsonObject& msg) const;
     QString markdownToHtml(const QString& md) const;
@@ -41,6 +44,9 @@ private:
     QString paragraphize(const QString& html) const;
     QString escapeHtml(const QString& text) const;
     void fetchImage(const QString& url);
+
+    Theme m_theme;
+    int m_scale = 100;
 
     QJsonArray m_messages;
     QSet<QString> m_expandedTools;

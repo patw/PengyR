@@ -30,10 +30,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     pengy_free(cfgJson);
 
     setupUi();
-    int themeScale = m_config["ui_scale"].toInt(100);
-    QString themeMode = m_config["theme_mode"].toString("system");
-    QString themeAccent = m_config["theme_accent"].toString("default");
-    qApp->setStyleSheet(appStyleSheet(makeTheme(themeMode, themeAccent), themeScale));
+    applyTheme();
     updateLlmClient();
     loadChatList();
 
@@ -109,6 +106,23 @@ void MainWindow::setupUi() {
     mainSplitter->setStretchFactor(1, 1);
     mainSplitter->setSizes({300, 800});
     mainLayout->addWidget(mainSplitter);
+}
+
+void MainWindow::applyTheme() {
+    int themeScale = m_config["ui_scale"].toInt(100);
+    QString themeMode = m_config["theme_mode"].toString("system");
+    QString themeAccent = m_config["theme_accent"].toString("default");
+    Theme theme = makeTheme(themeMode, themeAccent);
+    qApp->setStyleSheet(appStyleSheet(theme, themeScale));
+    if (m_chatView) m_chatView->applyTheme(theme, themeScale);
+    if (m_chatInput) m_chatInput->applyTheme(theme, themeScale);
+    if (m_chatHistory) m_chatHistory->applyTheme(theme, themeScale);
+    if (m_stopBtn) {
+        m_stopBtn->setFixedHeight(scaledSize(32, themeScale));
+        m_stopBtn->setStyleSheet(QString(
+            "QPushButton { background-color:%1; color:white; border:none; border-radius:8px; padding:4px 14px; font-weight:bold; font-size:11pt; }"
+            "QPushButton:hover { background-color:%2; }").arg(theme["danger"], theme["danger_hover"]));
+    }
 }
 
 void MainWindow::updateLlmClient() {
@@ -428,10 +442,13 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
 void MainWindow::handleToolConfirm(const QJsonObject& req) {
     // The worker thread will block on the confirm_state.
     // We show a dialog and send the result back.
+    int themeScale = m_config["ui_scale"].toInt(100);
+    Theme theme = makeTheme(m_config["theme_mode"].toString("system"), m_config["theme_accent"].toString("default"));
     QDialog dlg(this);
     dlg.setWindowTitle("Confirm Tool: " + req["name"].toString());
     dlg.setModal(true);
     dlg.resize(480, 300);
+    dlg.setStyleSheet(appStyleSheet(theme, themeScale));
 
     auto* layout = new QVBoxLayout(&dlg);
     QString info = QString("Execute tool: <b>%1</b>\n\nArguments:\n%2")
@@ -439,25 +456,22 @@ void MainWindow::handleToolConfirm(const QJsonObject& req) {
              QJsonDocument(req["args"].toObject()).toJson(QJsonDocument::Indented));
     auto* label = new QLabel(info);
     label->setWordWrap(true);
-    label->setStyleSheet("color: #000; padding: 8px;");
+    label->setStyleSheet(QString("color:%1; padding:8px;").arg(theme["fg"]));
     layout->addWidget(label);
 
     auto* btnLayout = new QHBoxLayout;
     auto* execBtn = new QPushButton("Execute");
-    execBtn->setStyleSheet(
-        "QPushButton { background-color: #1e66f5; color: white; border: none; "
-        "border-radius: 6px; padding: 8px 18px; font-weight: bold; }"
-        "QPushButton:hover { background-color: #4478f7; }");
+    execBtn->setStyleSheet(QString(
+        "QPushButton { background-color:%1; color:%2; border:none; border-radius:6px; padding:8px 18px; font-weight:bold; }"
+        "QPushButton:hover { background-color:%3; }").arg(theme["primary"], theme["primary_fg"], theme["primary_hover"]));
     auto* yesAllBtn = new QPushButton("Yes to All\nThis Turn");
-    yesAllBtn->setStyleSheet(
-        "QPushButton { background-color: #df8e1d; color: white; border: none; "
-        "border-radius: 6px; padding: 8px 14px; font-weight: bold; }"
-        "QPushButton:hover { background-color: #fea82f; }");
+    yesAllBtn->setStyleSheet(QString(
+        "QPushButton { background-color:%1; color:white; border:none; border-radius:6px; padding:8px 14px; font-weight:bold; }"
+        "QPushButton:hover { background-color:%2; }").arg(theme["warning"], theme["warning_hover"]));
     auto* cancelBtn = new QPushButton("Decline");
-    cancelBtn->setStyleSheet(
-        "QPushButton { background-color: #d20f39; color: white; border: none; "
-        "border-radius: 6px; padding: 8px 18px; font-weight: bold; }"
-        "QPushButton:hover { background-color: #e64553; }");
+    cancelBtn->setStyleSheet(QString(
+        "QPushButton { background-color:%1; color:white; border:none; border-radius:6px; padding:8px 18px; font-weight:bold; }"
+        "QPushButton:hover { background-color:%2; }").arg(theme["danger"], theme["danger_hover"]));
 
     btnLayout->addWidget(execBtn);
     btnLayout->addWidget(yesAllBtn);
@@ -543,11 +557,7 @@ void MainWindow::openSettings() {
         m_config = dlg.config();
         QByteArray json = QJsonDocument(m_config).toJson(QJsonDocument::Compact);
         pengy_config_save(json.constData());
-        int themeScale = m_config["ui_scale"].toInt(100);
-        QString themeMode = m_config["theme_mode"].toString("system");
-        QString themeAccent = m_config["theme_accent"].toString("default");
-        qApp->setStyleSheet(appStyleSheet(makeTheme(themeMode, themeAccent), themeScale));
-        m_stopBtn->setFixedHeight(scaledSize(32, themeScale));
+        applyTheme();
         updateLlmClient();
         loadChatList();
         if (!m_currentChatId.isEmpty()) m_chatHistory->selectChatById(m_currentChatId);

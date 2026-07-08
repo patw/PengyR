@@ -1,4 +1,5 @@
 #pragma once
+#include "themehelper.h"
 #include <QWidget>
 #include <QListWidget>
 #include <QPushButton>
@@ -11,6 +12,7 @@ class ChatHistoryWidget : public QWidget {
     Q_OBJECT
 public:
     explicit ChatHistoryWidget(QWidget* parent = nullptr);
+    void applyTheme(const Theme& theme, int scale = 100);
 
     void loadChats(const QJsonArray& chats);
     void selectChatById(const QString& id);
@@ -34,10 +36,14 @@ private:
     void     onItemClicked(QListWidgetItem* item);
     void     blinkDot();
 
+    Theme m_theme;
+    int m_scale = 100;
+
     QPushButton* m_newChatBtn;
     QPushButton* m_settingsBtn;
     QPushButton* m_tasksBtn;
     QListWidget* m_chatList;
+    QLabel* m_statusLabel;
     QLabel* m_statusDot;
     QLabel* m_statusText;
     QLabel* m_modelLabel;

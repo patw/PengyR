@@ -36,6 +36,7 @@ private slots:
 
 private:
     void setupUi();
+    void applyTheme();
     void updateLlmClient();
     void loadChatList();
     void processResponse(const QJsonArray& messages);
