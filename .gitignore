@@ -6,18 +6,23 @@ gui/build/
 gui/build_macos/
 gui/build_windows/
 
-# AppImage output
-PengyR-x86_64.AppImage
+# Release/package artifacts
+*.deb
+*.dmg
+*.AppImage
+*.zip
+*.tar.gz
+*.dSYM
+
+# AppImage build directories
 appimage/PengyR.AppDir/
 appimage/tools/
 
 # macOS
 *.app
-*.dmg
 *.icns
 .dmg_staging/
 .pengy.iconset/
-*.dSYM
 
 # Windows
 *.exe
