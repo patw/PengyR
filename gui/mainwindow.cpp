@@ -388,23 +388,26 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
         QString content = event["content"].toString();
         QJsonObject usage = event["usage"].toObject();
 
-        QJsonObject asstMsg;
-        asstMsg["role"] = "assistant";
-        asstMsg["content"] = content;
-        QJsonArray messages = m_currentChat["messages"].toArray();
-        messages.append(asstMsg);
-        m_currentChat["messages"] = messages;
+        if (!content.isEmpty()) {
+            QJsonObject asstMsg;
+            asstMsg["role"] = "assistant";
+            asstMsg["content"] = content;
+            QJsonArray messages = m_currentChat["messages"].toArray();
+            messages.append(asstMsg);
+            m_currentChat["messages"] = messages;
 
-        m_chatView->appendMessageText("assistant", content);
+            m_chatView->appendMessageText("assistant", content);
+
+            QByteArray chatJson = QJsonDocument(m_currentChat).toJson(QJsonDocument::Compact);
+            pengy_chat_save(chatJson.constData());
+            loadChatList();
+        }
+
         m_chatHistory->setThinking(false);
         m_chatHistory->updateTokenUsage(
             usage["prompt_tokens"].toInt(),
             usage["completion_tokens"].toInt()
         );
-
-        QByteArray chatJson = QJsonDocument(m_currentChat).toJson(QJsonDocument::Compact);
-        pengy_chat_save(chatJson.constData());
-        loadChatList();
 
     } else if (type == "tool_request") {
         m_chatView->appendMessage("tool_request", event);
