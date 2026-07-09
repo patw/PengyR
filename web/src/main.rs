@@ -67,6 +67,7 @@ async fn main() {
         .route("/chat/:chat_id/stream", get(chat_stream))
         .route("/chat/:chat_id/confirm", post(chat_confirm))
         .route("/chat/:chat_id/sudo", post(chat_sudo))
+        .route("/chat/:chat_id/stop", post(chat_stop))
         .route("/chat/:chat_id/delete", post(chat_delete))
         .route("/settings", get(settings_get).post(settings_post))
         .with_state(state);
@@ -597,6 +598,19 @@ async fn chat_delete(
     Redirect::to("/")
 }
 
+async fn chat_stop(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+) -> impl IntoResponse {
+    {
+        let mut workers = state.workers.lock().unwrap();
+        if let Some(w) = workers.remove(&chat_id) {
+            w.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    Json(serde_json::json!({"status": "stopped"}))
+}
+
 async fn settings_get() -> impl IntoResponse {
     let config = config::load_config();
     let chats = chat_manager::load_chats();
@@ -790,11 +804,27 @@ fn render_markdown(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    // Simple markdown-to-HTML: fenced code blocks, inline code, bold, italic, headers, lists, links
+    // Simple markdown-to-HTML: fenced code blocks, inline code, bold, italic,
+    // headers, lists (ordered + unordered), blockquotes, tables, links
     let mut html = String::new();
     let mut in_code_block = false;
     let mut in_paragraph = false;
+    let mut in_ul = false;
+    let mut in_ol = false;
+    let mut in_blockquote = false;
     let mut table_lines: Vec<String> = Vec::new();
+
+    // Helper closures for closing open list/blockquote tags
+    let close_lists = |in_ul: &mut bool, in_ol: &mut bool, html: &mut String| {
+        if *in_ul {
+            html.push_str("</ul>\n");
+            *in_ul = false;
+        }
+        if *in_ol {
+            html.push_str("</ol>\n");
+            *in_ol = false;
+        }
+    };
 
     for line in text.lines() {
         if !table_lines.is_empty()
@@ -812,6 +842,11 @@ fn render_markdown(text: &str) -> String {
                 if in_paragraph {
                     html.push_str("</p>\n");
                     in_paragraph = false;
+                }
+                close_lists(&mut in_ul, &mut in_ol, &mut html);
+                if in_blockquote {
+                    html.push_str("</blockquote>\n");
+                    in_blockquote = false;
                 }
                 html.push_str("<pre><code>");
                 in_code_block = true;
@@ -832,41 +867,72 @@ fn render_markdown(text: &str) -> String {
                 html.push_str("</p>\n");
                 in_paragraph = false;
             }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             continue;
         }
 
         if trimmed.starts_with("### ") {
-            if in_paragraph {
-                html.push_str("</p>\n");
-                in_paragraph = false;
-            }
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
             html.push_str(&format!("<h3>{}</h3>\n", inline_markdown(&trimmed[4..])));
         } else if trimmed.starts_with("## ") {
-            if in_paragraph {
-                html.push_str("</p>\n");
-                in_paragraph = false;
-            }
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
             html.push_str(&format!("<h2>{}</h2>\n", inline_markdown(&trimmed[3..])));
         } else if trimmed.starts_with("# ") {
-            if in_paragraph {
-                html.push_str("</p>\n");
-                in_paragraph = false;
-            }
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
             html.push_str(&format!("<h1>{}</h1>\n", inline_markdown(&trimmed[2..])));
+        } else if trimmed.starts_with("> ") || trimmed == ">" {
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if !in_blockquote {
+                html.push_str("<blockquote>\n");
+                in_blockquote = true;
+            }
+            let content = trimmed.strip_prefix("> ").unwrap_or("");
+            if !content.is_empty() {
+                html.push_str(&format!("<p>{}</p>\n", inline_markdown(content)));
+            }
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            if in_paragraph {
-                html.push_str("</p>\n");
-                in_paragraph = false;
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_ol { html.push_str("</ol>\n"); in_ol = false; }
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if !in_ul {
+                html.push_str("<ul>\n");
+                in_ul = true;
             }
             html.push_str(&format!("<li>{}</li>\n", inline_markdown(&trimmed[2..])));
-        } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
-            if in_paragraph {
-                html.push_str("</p>\n");
-                in_paragraph = false;
+        } else if is_ordered_list_item(trimmed) {
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_ul { html.push_str("</ul>\n"); in_ul = false; }
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if !in_ol {
+                html.push_str("<ol>\n");
+                in_ol = true;
             }
+            let content = trimmed.splitn(2, ". ").nth(1).unwrap_or("");
+            html.push_str(&format!("<li>{}</li>\n", inline_markdown(content)));
+        } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
             table_lines.push(trimmed.to_string());
             continue;
         } else {
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
+            close_lists(&mut in_ul, &mut in_ol, &mut html);
+            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
             if !in_paragraph {
                 html.push_str("<p>");
                 in_paragraph = true;
@@ -884,11 +950,30 @@ fn render_markdown(text: &str) -> String {
     if in_code_block {
         html.push_str("</code></pre>\n");
     }
+    if in_ul {
+        html.push_str("</ul>\n");
+    }
+    if in_ol {
+        html.push_str("</ol>\n");
+    }
+    if in_blockquote {
+        html.push_str("</blockquote>\n");
+    }
     if in_paragraph {
         html.push_str("</p>\n");
     }
 
     html
+}
+
+/// Check if a line starts with a number followed by ". " (ordered list item).
+fn is_ordered_list_item(line: &str) -> bool {
+    let dot_pos = match line.find(". ") {
+        Some(p) => p,
+        None => return false,
+    };
+    let prefix = &line[..dot_pos];
+    !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
 }
 
 fn render_table(lines: &[String]) -> String {
@@ -1290,6 +1375,9 @@ mod templates {
     <button type="submit" id="sendBtn" class="btn btn-primary align-self-end">
       <i class="bi bi-send-fill"></i>
     </button>
+    <button type="button" id="stopBtn" class="btn btn-danger align-self-end d-none">
+      <i class="bi bi-stop-fill"></i>
+    </button>
   </form>
 </div>
 <div class="modal fade" id="confirmModal" tabindex="-1" data-bs-backdrop="static">
@@ -1355,6 +1443,7 @@ document.addEventListener('DOMContentLoaded', () => {{
   document.getElementById('sudoPasswordInput').addEventListener('keydown', e => {{
     if (e.key === 'Enter') submitSudo();
   }});
+  document.getElementById('stopBtn').addEventListener('click', stopGeneration);
 }});
 
 function scrollToBottom() {{
@@ -1376,7 +1465,16 @@ function setProcessing(val) {{
   isProcessing = val;
   document.getElementById('messageInput').disabled = val;
   document.getElementById('sendBtn').disabled = val;
+  document.getElementById('stopBtn').classList.toggle('d-none', !val);
   if (!val) document.getElementById('messageInput').focus();
+}}
+
+function stopGeneration() {{
+  fetch(`/chat/${{CHAT_ID}}/stop`, {{ method: 'POST' }})
+    .catch(err => console.error('Stop error:', err));
+  if (eventSource) {{ eventSource.close(); eventSource = null; }}
+  hideThinking();
+  setProcessing(false);
 }}
 
 function showThinking() {{

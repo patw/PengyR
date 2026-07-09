@@ -20,10 +20,27 @@ const MIN_PANEL_WIDTH: usize = 60;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Check for --help / -h before anything else
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Pengy CLI — chat with LLMs from the command line");
+        println!();
+        println!("Usage: pengy-cli [PROMPT...] [--no-save]");
+        println!();
+        println!("Arguments:");
+        println!("  PROMPT...  Optional prompt for single-shot mode.");
+        println!("             If omitted, starts interactive mode.");
+        println!();
+        println!("Options:");
+        println!("  --no-save  Don't persist single-shot chats to history.");
+        println!("  -h, --help Show this help message and exit.");
+        return;
+    }
+
     let no_save = args.iter().any(|a| a == "--no-save");
     let prompt_args: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| *a != "--no-save")
+        .filter(|a| *a != "--no-save" && *a != "--help" && *a != "-h")
         .map(|s| s.as_str())
         .collect();
 
@@ -358,7 +375,8 @@ impl PengyCli {
             print_box("Assistant 🤖", &["(empty response)".to_string()], None);
         } else {
             println!();
-            print_box("Assistant 🤖", &[content.to_string()], None);
+            let rendered = render_markdown_terminal(content);
+            print_box("Assistant 🤖", &[rendered], None);
         }
 
         if usage.total_tokens > 0 {
@@ -1107,4 +1125,214 @@ fn uuid_v4() -> String {
 
 fn chrono_now() -> String {
     chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+}
+
+// ── Markdown-to-terminal renderer ───────────────────────────────────
+
+/// Render markdown text with ANSI styling for the terminal.
+///
+/// Handles: fenced code blocks, inline code, bold, italic, headers,
+/// unordered/ordered lists, blockquotes, horizontal rules, and links.
+/// The output is plain text with ANSI escape codes — no HTML.
+fn render_markdown_terminal(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_code_block = false;
+    let mut in_list = false;
+    let mut list_num = 0u32;
+    let lines: Vec<&str> = text.lines().collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        // Code block fence
+        if line.starts_with("```") {
+            if in_code_block {
+                in_code_block = false;
+                out.push_str(&format!("{}{}\n", DIM, RESET));
+            } else {
+                if in_list {
+                    out.push_str(&format!("{}\n", RESET));
+                    in_list = false;
+                }
+                in_code_block = true;
+                out.push_str(&format!("{}", DIM));
+            }
+            continue;
+        }
+
+        if in_code_block {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        // Empty line
+        if trimmed.is_empty() {
+            if in_list {
+                out.push_str(&format!("{}\n", RESET));
+                in_list = false;
+            }
+            if i + 1 < lines.len() && !lines[i + 1].trim().is_empty() {
+                out.push('\n');
+            }
+            continue;
+        }
+
+        // Horizontal rule
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            if in_list {
+                out.push_str(&format!("{}\n", RESET));
+                in_list = false;
+            }
+            out.push_str(&format!("{}{}{}\n", DIM, "─".repeat(terminal_width().min(60)), RESET));
+            continue;
+        }
+
+        // Headers
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
+            out.push_str(&format!("{}{}{}\n\n", BOLD, render_inline(rest), RESET));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
+            out.push_str(&format!("{}{}{}\n\n", BOLD, render_inline(rest), RESET));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
+            out.push_str(&format!("{}{}{}\n\n", BOLD, render_inline(rest), RESET));
+            continue;
+        }
+
+        // Blockquote
+        if let Some(rest) = trimmed.strip_prefix("> ") {
+            if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
+            out.push_str(&format!("  {}│{} {}\n", DIM, RESET, render_inline(rest)));
+            continue;
+        }
+        if trimmed == ">" {
+            if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
+            out.push_str(&format!("  {}│{}\n", DIM, RESET));
+            continue;
+        }
+
+        // Unordered list
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            if !in_list {
+                in_list = true;
+            }
+            out.push_str(&format!("  {}•{} {}\n", CYAN, RESET, render_inline(rest)));
+            continue;
+        }
+
+        // Ordered list
+        if let Some(rest) = trimmed.strip_prefix("1. ") {
+            if !in_list { in_list = true; list_num = 0; }
+            list_num += 1;
+            out.push_str(&format!("  {}{}.{} {}\n", CYAN, list_num, RESET, render_inline(rest)));
+            continue;
+        }
+        // Generic ordered list (2., 3., etc.)
+        if let Some(dot_pos) = trimmed.find(". ") {
+            let prefix = &trimmed[..dot_pos];
+            if prefix.chars().all(|c| c.is_ascii_digit()) && !prefix.is_empty() {
+                if !in_list { in_list = true; list_num = 0; }
+                list_num += 1;
+                let rest = &trimmed[dot_pos + 2..];
+                out.push_str(&format!("  {}{}.{} {}\n", CYAN, list_num, RESET, render_inline(rest)));
+                continue;
+            }
+        }
+
+        // Regular paragraph line
+        if in_list {
+            out.push_str(&format!("{}\n", RESET));
+            in_list = false;
+        }
+        out.push_str(&render_inline(trimmed));
+        out.push('\n');
+    }
+
+    if in_code_block {
+        out.push_str(&format!("{}\n", RESET));
+    }
+    if in_list {
+        out.push_str(&format!("{}\n", RESET));
+    }
+
+    // Trim trailing newlines but keep at most one
+    out.trim_end_matches('\n').to_string() + "\n"
+}
+
+/// Render inline markdown: **bold**, *italic*, `code`, [links](url).
+fn render_inline(text: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Inline code: `...`
+        if chars[i] == '`' {
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`') {
+                let code: String = chars[i + 1..i + 1 + end].iter().collect();
+                result.push_str(&format!("{}{}{}{}{}", DIM, CYAN, code, RESET, RESET));
+                i += end + 2;
+                continue;
+            }
+        }
+
+        // Bold: **...**
+        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if let Some(end) = find_double(&chars, i + 2, '*') {
+                let inner: String = chars[i + 2..end].iter().collect();
+                result.push_str(&format!("{}{}{}", BOLD, render_inline(&inner), RESET));
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // Italic: *...*
+        if chars[i] == '*' {
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '*') {
+                let inner: String = chars[i + 1..i + 1 + end].iter().collect();
+                result.push_str(&format!("{}\x1b[3m{}{}", RESET, render_inline(&inner), RESET));
+                i += end + 2;
+                continue;
+            }
+        }
+
+        // Link: [text](url)
+        if chars[i] == '[' {
+            if let Some(bracket_end) = chars[i + 1..].iter().position(|&c| c == ']') {
+                let after = i + 1 + bracket_end + 1;
+                if after < chars.len() && chars[after] == '(' {
+                    if let Some(paren_end) = chars[after + 1..].iter().position(|&c| c == ')') {
+                        let link_text: String = chars[i + 1..i + 1 + bracket_end].iter().collect();
+                        let url: String = chars[after + 1..after + 1 + paren_end].iter().collect();
+                        result.push_str(&format!("{}{}{} ({})", CYAN, link_text, RESET, url));
+                        i = after + 1 + paren_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+/// Find the position of a double-character sequence (e.g. **) starting from `from`.
+fn find_double(chars: &[char], from: usize, ch: char) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < chars.len() {
+        if chars[i] == ch && chars[i + 1] == ch {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
