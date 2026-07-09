@@ -39,7 +39,18 @@ int main(int argc, char** argv) {
 
     QString code = view.testMarkdownToHtml("```rust\nfn main() {}\n```");
     requireContains(code, "class='code-lang'>rust</div>", "code language label");
-    requireContains(code, "<pre><code>fn main() {}", "code block content");
+    requireContains(code, "<pre><code>", "code block opens");
+    requireContains(code, "main() {}", "code block content");
+    requireContains(code, "<span style='color:", "code block keyword is highlighted");
+    requireContains(code, ">fn</span>", "rust keyword fn is highlighted");
+
+    QString pyCode = view.testMarkdownToHtml("```python\n# a comment\nx = 42\ns = \"hi\"\n```");
+    requireContains(pyCode, ">42</span>", "python number is highlighted");
+    requireContains(pyCode, "# a comment</span>", "python comment is highlighted");
+    requireContains(pyCode, "&quot;hi&quot;</span>", "python string is highlighted");
+
+    QString plainCode = view.testMarkdownToHtml("```\nplain text, no language\n```");
+    requireContains(plainCode, "<pre><code>plain text, no language", "unlabeled code block is left unhighlighted");
 
     QString table = view.testMarkdownToHtml("| A | B |\n|---|---|\n| 1 | 2 |");
     requireContains(table, "<table", "table renders");

@@ -68,7 +68,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     form->addRow("User Agent:", m_userAgent);
 
     m_systemMsg = new QTextEdit(config["system_message"].toString("You are a helpful assistant."));
-    m_systemMsg->setMaximumHeight(80);
+    m_systemMsg->setMaximumHeight(100);
     form->addRow("System Message:", m_systemMsg);
 
     m_toolConfirm = new QComboBox;
@@ -85,7 +85,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     form->addRow("Tool Confirmation:", m_toolConfirm);
 
     m_reasoningEffort = new QComboBox;
-    m_reasoningEffort->addItem("Provider default — do not send", "");
+    m_reasoningEffort->addItem("Provider default — do not send reasoning option", "");
     m_reasoningEffort->addItem("Off / none", "none");
     m_reasoningEffort->addItem("Minimal", "minimal");
     m_reasoningEffort->addItem("Low", "low");
@@ -125,7 +125,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         if (scales[i] == currentScale) idx = i;
     }
     m_uiScale->setCurrentIndex(idx);
-    form->addRow("UI Scale (restart to apply):", m_uiScale);
+    form->addRow("UI Scale (restart for full UI):", m_uiScale);
 
     m_themeMode = new WidePopupComboBox;
     m_themeMode->addItem("System", "system");

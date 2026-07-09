@@ -447,7 +447,7 @@ void MainWindow::handleToolConfirm(const QJsonObject& req) {
     QDialog dlg(this);
     dlg.setWindowTitle("Confirm Tool: " + req["name"].toString());
     dlg.setModal(true);
-    dlg.resize(480, 300);
+    dlg.resize(480, 320);
     dlg.setStyleSheet(appStyleSheet(theme, themeScale));
 
     auto* layout = new QVBoxLayout(&dlg);
