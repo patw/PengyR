@@ -15,19 +15,18 @@ const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const CYAN: &str = "\x1b[36m";
+const BLUE: &str = "\x1b[34m";
 const MAX_PANEL_WIDTH: usize = 140;
 const MIN_PANEL_WIDTH: usize = 60;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Check for --version / -v before anything else
     if args.iter().any(|a| a == "--version" || a == "-v") {
         println!("Pengy v{}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
-    // Check for --help / -h before anything else
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Pengy CLI — chat with LLMs from the command line");
         println!();
@@ -77,14 +76,12 @@ fn main() {
         .map(|(_, s)| s.as_str())
         .collect();
 
-    // Apply config directory override as early as possible
     if let Some(ref dir) = config_dir {
         pengy_core::config::set_config_dir(dir);
     }
 
     let mut cli = PengyCli::new(no_save);
 
-    // Apply model/system overrides — these persist for the session
     if let Some(ref model) = model_override {
         cli.config.model = model.clone();
     }
@@ -141,14 +138,22 @@ impl PengyCli {
         let chats = chat_manager::load_chats();
         if !chats.is_empty() {
             self.current_chat = Some(chats[0].clone());
+            let chat = self.current_chat.as_ref().unwrap();
+            let msg_count = chat.messages.len();
+            let last_user = chat.messages.iter().rev()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.as_ref())
+                .and_then(|v| v.as_str())
+                .map(|s| truncate(s, 80))
+                .unwrap_or_default();
+
             println!(
-                "{}Resumed chat:{} {}{}{}",
-                DIM,
-                RESET,
-                BOLD,
-                self.current_chat.as_ref().unwrap().title,
-                RESET
+                "{}Resumed:{} {}{}{} {}({} messages){}",
+                DIM, RESET, BOLD, chat.title, RESET, DIM, msg_count, RESET
             );
+            if !last_user.is_empty() {
+                println!("{}Last:{} {}", DIM, RESET, last_user);
+            }
         } else {
             self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
             println!("{}New chat created.{}", DIM, RESET);
@@ -165,7 +170,11 @@ impl PengyCli {
         self.set_sudo_provider();
 
         loop {
-            let line = match self.prompt("\nYou: ") {
+            let title = self.current_chat.as_ref()
+                .map(|c| truncate(&c.title, 30))
+                .unwrap_or_else(|| "?".to_string());
+            let prompt_label = format!("\n{} › You: ", title);
+            let line = match self.prompt(&prompt_label) {
                 Some(l) => l,
                 None => break,
             };
@@ -278,6 +287,7 @@ impl PengyCli {
         eprint!("{}Thinking...{}", DIM, RESET);
 
         let mut expecting_api = true;
+        let mut aborted = false;
 
         loop {
             match event_rx.blocking_recv() {
@@ -323,12 +333,24 @@ impl PengyCli {
                                     yolo_turn: true,
                                 });
                             }
-                            _ => {
+                            3 => {
                                 let _ = confirm_tx.send(Confirmation {
                                     tool_call_id,
                                     confirmed: false,
                                     yolo_turn: false,
                                 });
+                            }
+                            _ => {
+                                // Abort
+                                println!("{}Run aborted by user.{}", RED, RESET);
+                                let _ = confirm_tx.send(Confirmation {
+                                    tool_call_id,
+                                    confirmed: false,
+                                    yolo_turn: false,
+                                });
+                                aborted = true;
+                                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
                             }
                         }
                     }
@@ -381,7 +403,9 @@ impl PengyCli {
                 }
                 None => {
                     eprint!("\r{}\r", " ".repeat(40));
-                    println!("{}Chat ended unexpectedly.{}", RED, RESET);
+                    if !aborted {
+                        println!("{}Chat ended unexpectedly.{}", RED, RESET);
+                    }
                     break;
                 }
             }
@@ -446,8 +470,8 @@ impl PengyCli {
 
         if usage.total_tokens > 0 {
             println!(
-                "Tokens: {} in / {} out ({} total)",
-                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                "{}Tokens: {} in / {} out ({} total){}",
+                DIM, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, RESET
             );
         }
     }
@@ -457,14 +481,15 @@ impl PengyCli {
     fn prompt_tool_confirmation(&self) -> u8 {
         loop {
             let input = self.prompt(&format!(
-                "  [1] Execute  [2] Yes to all this turn  [3] Decline  {}[1/2/3]{} ",
+                "  [1] Execute  [2] Yes to all this turn  [3] Decline  [4] Abort run  {}[1/2/3/4]{} ",
                 BOLD, RESET
             ));
             match input.as_deref().unwrap_or("1").trim() {
                 "1" | "" => return 1,
                 "2" => return 2,
                 "3" => return 3,
-                _ => println!("{}Please enter 1, 2, or 3.{}", RED, RESET),
+                "4" => return 4,
+                _ => println!("{}Please enter 1, 2, 3, or 4.{}", RED, RESET),
             }
         }
     }
@@ -495,6 +520,11 @@ impl PengyCli {
             "/quit" | "/exit" | "/q" => return false,
             "/help" => self.cmd_help(),
             "/new" => self.cmd_new(),
+            "/show" => self.cmd_show(args),
+            "/tail" => self.cmd_tail(args),
+            "/rename" => self.cmd_rename(args),
+            "/clear" => self.cmd_clear(),
+            "/export" => self.cmd_export(args),
             "/config" => self.cmd_config(),
             "/model" => self.cmd_model(args),
             "/models" => self.cmd_models(),
@@ -522,6 +552,11 @@ impl PengyCli {
         let cmds = [
             ("/help", "Show this help"),
             ("/new", "Start a new chat"),
+            ("/show [N]", "Show full conversation (optional: last N messages)"),
+            ("/tail [N]", "Show the last N messages (default 5)"),
+            ("/rename <title>", "Rename the current chat"),
+            ("/clear", "Clear the terminal screen"),
+            ("/export [path]", "Export current chat as Markdown"),
             ("/config", "Show current configuration"),
             ("/model <name>", "Change the model"),
             ("/models", "Fetch available models from the endpoint"),
@@ -546,7 +581,188 @@ impl PengyCli {
 
     fn cmd_new(&mut self) {
         self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
-        println!("✓ New chat created.");
+        println!("{}✓ New chat created.{}", GREEN, RESET);
+    }
+
+    fn cmd_show(&self, args: &[&str]) {
+        let chat = match self.current_chat.as_ref() {
+            Some(c) => c,
+            None => { println!("{}No active chat.{}", DIM, RESET); return; }
+        };
+        let msgs = &chat.messages;
+        if msgs.is_empty() {
+            println!("{}No messages in this chat.{}", DIM, RESET);
+            return;
+        }
+
+        let limit: Option<usize> = if !args.is_empty() {
+            match args[0].parse::<usize>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => { println!("{}Usage: /show [N]  — show last N messages{}", RED, RESET); return; }
+            }
+        } else {
+            None
+        };
+
+        let start = limit.map(|n| msgs.len().saturating_sub(n)).unwrap_or(0);
+        let display = &msgs[start..];
+        let total = msgs.len();
+
+        println!();
+        println!("{}Conversation:{} {}{}{} {}({} messages total{}){}",
+            BOLD, RESET, BOLD, chat.title, RESET,
+            DIM, total,
+            if limit.is_some() { format!(", showing last {}", display.len()) } else { String::new() },
+            RESET);
+        println!("{}{}{}", DIM, "─".repeat(terminal_width().min(60)), RESET);
+
+        for (j, msg) in display.iter().enumerate() {
+            let i = start + j + 1;  // 1-based index
+            let role = &msg.role;
+            let content = msg.content.as_ref()
+                .and_then(|v| if v.is_string() { v.as_str().map(String::from) }
+                           else if v.is_array() {
+                               let parts: Vec<String> = v.as_array().unwrap().iter().map(|p| {
+                                   if let Some(t) = p.get("text").and_then(|t| t.as_str()) { t.to_string() }
+                                   else if p.get("image_url").is_some() { "[image]".to_string() }
+                                   else { String::new() }
+                               }).collect();
+                               Some(parts.join(" "))
+                           } else { Some(v.to_string()) })
+                .unwrap_or_default();
+
+            if role == "user" {
+                println!("{}{}#{} You:{}{} {}", BLUE, BOLD, i, RESET, RESET, content);
+            } else if role == "assistant" {
+                let tc_names: Vec<String> = msg.tool_calls.iter()
+                    .map(|tc| tc.function.name.clone())
+                    .collect();
+                if !tc_names.is_empty() {
+                    println!("{}{}#{} Assistant:{}{} {}(tool calls: {}){}",
+                        GREEN, BOLD, i, RESET, DIM, tc_names.join(", "), RESET);
+                }
+                if !content.is_empty() {
+                    println!("{}  {}{}", DIM, truncate(&content, 100), RESET);
+                }
+            } else if role == "tool" {
+                let tc_id = msg.tool_call_id.as_deref().unwrap_or("?");
+                let short_id = if tc_id.len() > 8 { &tc_id[..8] } else { tc_id };
+                println!("{}{}#{} Tool [{}]:{}{} {}", DIM, DIM, i, short_id, RESET, DIM, truncate(&content, 80), RESET);
+            } else if role == "system" {
+                println!("{}{}#{} System:{}{} {}", DIM, DIM, i, RESET, DIM, truncate(&content, 100), RESET);
+            }
+        }
+
+        println!("{}{}{}", DIM, "─".repeat(terminal_width().min(60)), RESET);
+    }
+
+    fn cmd_tail(&self, args: &[&str]) {
+        let n: usize = if !args.is_empty() {
+            args[0].parse().unwrap_or(5)
+        } else {
+            5
+        };
+        let n_str = n.to_string();
+        let fake_args: [&str; 1] = [&n_str];
+        self.cmd_show(&fake_args);
+    }
+
+    fn cmd_rename(&mut self, args: &[&str]) {
+        let chat = match self.current_chat.as_mut() {
+            Some(c) => c,
+            None => { println!("{}No active chat.{}", DIM, RESET); return; }
+        };
+        if args.is_empty() {
+            println!("{}Usage: /rename <new title>{}", DIM, RESET);
+            return;
+        }
+        let new_title = args.join(" ");
+        let old_title = chat.title.clone();
+        chat.title = new_title.clone();
+        chat_manager::save_chat(chat).ok();
+        println!("{}✓ Renamed:{} {}{}{} → {}{}{}",
+            GREEN, RESET, BOLD, old_title, RESET, BOLD, new_title, RESET);
+    }
+
+    fn cmd_clear(&self) {
+        print!("\x1b[2J\x1b[H");
+        println!("{}Screen cleared. Use /show to see conversation.{}", DIM, RESET);
+    }
+
+    fn cmd_export(&self, args: &[&str]) {
+        let chat = match self.current_chat.as_ref() {
+            Some(c) => c,
+            None => { println!("{}No active chat.{}", DIM, RESET); return; }
+        };
+
+        let out_path = if !args.is_empty() {
+            Path::new(args[0]).to_path_buf()
+        } else {
+            let safe_title: String = chat.title.chars()
+                .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+                .collect();
+            let safe_title = truncate(safe_title.trim(), 50);
+            let name = if safe_title.is_empty() { "chat".to_string() } else { safe_title };
+            dirs_next().unwrap_or_else(|| Path::new(".").to_path_buf()).join("Downloads").join(format!("{}.md", name))
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("# {}", chat.title));
+        lines.push(format!("*Exported {}*", chrono_now().replace('T', " ")));
+        lines.push(String::new());
+
+        for msg in &chat.messages {
+            let role = &msg.role;
+            let content = msg.content.as_ref()
+                .and_then(|v| if v.is_string() { v.as_str().map(String::from) }
+                           else if v.is_array() {
+                               let parts: Vec<String> = v.as_array().unwrap().iter().map(|p| {
+                                   if let Some(t) = p.get("text").and_then(|t| t.as_str()) { t.to_string() }
+                                   else if p.get("image_url").is_some() { "[image]".to_string() }
+                                   else { String::new() }
+                               }).collect();
+                               Some(parts.join(" "))
+                           } else { Some(v.to_string()) })
+                .unwrap_or_default();
+
+            if role == "user" {
+                lines.push("### 🧑 You".to_string());
+                lines.push(content);
+                lines.push(String::new());
+            } else if role == "assistant" {
+                if !msg.tool_calls.is_empty() {
+                    lines.push("### 🤖 Assistant (tool calls)".to_string());
+                    for tc in &msg.tool_calls {
+                        lines.push(format!("- **{}**", tc.function.name));
+                        lines.push(format!("  ```json\n  {}\n  ```", tc.function.arguments));
+                    }
+                    lines.push(String::new());
+                }
+                if !content.is_empty() {
+                    lines.push("### 🤖 Assistant".to_string());
+                    lines.push(content);
+                    lines.push(String::new());
+                }
+            } else if role == "tool" {
+                let tc_id = msg.tool_call_id.as_deref().unwrap_or("?");
+                lines.push(format!("#### 🔧 Tool result (`{}`)", tc_id));
+                lines.push("```".to_string());
+                lines.push(content);
+                lines.push("```".to_string());
+                lines.push(String::new());
+            } else if role == "system" {
+                lines.push(format!("*System: {}*", truncate(&content, 200)));
+                lines.push(String::new());
+            }
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        match std::fs::write(&out_path, lines.join("\n")) {
+            Ok(_) => println!("{}✓ Exported to:{} {}{}{}", GREEN, RESET, BOLD, out_path.display(), RESET),
+            Err(e) => println!("{}Error exporting:{} {}", RED, RESET, e),
+        }
     }
 
     fn cmd_config(&self) {
@@ -663,10 +879,10 @@ impl PengyCli {
 
         println!();
         println!("{}Chat History{}", BOLD, RESET);
-        println!("{}{}{}", DIM, "-".repeat(70), RESET);
+        println!("{}{}{}", DIM, "-".repeat(80), RESET);
         println!(
-            "  {}{:<4} {:<40} {:>6}  {}{}",
-            DIM, "#", "Title", "Msgs", "Created", RESET
+            "  {}{:<4} {:<30} {:>6}  {:<30}{}",
+            DIM, "#", "Title", "Msgs", "Preview", RESET
         );
 
         let current_id = self
@@ -677,18 +893,19 @@ impl PengyCli {
 
         for (i, chat) in chats.iter().enumerate() {
             let prefix = if chat.id == current_id { ">" } else { " " };
-            let created = if chat.created_at.len() >= 16 {
-                chat.created_at[..16].replace('T', " ")
-            } else {
-                chat.created_at.clone()
-            };
+            let preview = chat.messages.iter()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.as_ref())
+                .and_then(|v| v.as_str())
+                .map(|s| truncate(s, 28))
+                .unwrap_or_default();
             println!(
-                "  {}{:<4} {:<40} {:>6}  {}",
+                "  {}{:<4} {:<30} {:>6}  {}",
                 prefix,
                 i + 1,
-                truncate(&chat.title, 38),
+                truncate(&chat.title, 28),
                 chat.messages.len(),
-                created
+                preview,
             );
         }
     }
@@ -725,14 +942,11 @@ impl PengyCli {
         self.current_chat = Some(chats[idx].clone());
         let c = self.current_chat.as_ref().unwrap();
         println!(
-            "{}Loaded:{} {}{}{} ({} messages)",
-            GREEN,
-            RESET,
-            BOLD,
-            c.title,
-            RESET,
-            c.messages.len()
+            "{}Loaded:{} {}{}{} {}({} messages){}",
+            GREEN, RESET, BOLD, c.title, RESET, DIM, c.messages.len(), RESET
         );
+        // Show tail for context
+        self.cmd_tail(&["3"]);
     }
 
     fn cmd_delete(&mut self, args: &[&str]) {
@@ -983,7 +1197,7 @@ impl PengyCli {
         match self.config.tool_confirmation.as_str() {
             "all" => "YOLO",
             "safe" => "Safe",
-            _ => "Confirm",
+            _ => "None",
         }
     }
 
@@ -1008,6 +1222,10 @@ impl PengyCli {
 }
 
 // ── Free functions ────────────────────────────────────────────────
+
+fn dirs_next() -> Option<std::path::PathBuf> {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from)
+}
 
 fn terminal_width() -> usize {
     std::env::var("COLUMNS")
@@ -1194,11 +1412,6 @@ fn chrono_now() -> String {
 
 // ── Markdown-to-terminal renderer ───────────────────────────────────
 
-/// Render markdown text with ANSI styling for the terminal.
-///
-/// Handles: fenced code blocks, inline code, bold, italic, headers,
-/// unordered/ordered lists, blockquotes, horizontal rules, and links.
-/// The output is plain text with ANSI escape codes — no HTML.
 fn render_markdown_terminal(text: &str) -> String {
     let mut out = String::new();
     let mut in_code_block = false;
@@ -1207,7 +1420,6 @@ fn render_markdown_terminal(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
 
     for (i, line) in lines.iter().enumerate() {
-        // Code block fence
         if line.starts_with("```") {
             if in_code_block {
                 in_code_block = false;
@@ -1231,7 +1443,6 @@ fn render_markdown_terminal(text: &str) -> String {
 
         let trimmed = line.trim();
 
-        // Empty line
         if trimmed.is_empty() {
             if in_list {
                 out.push_str(&format!("{}\n", RESET));
@@ -1243,7 +1454,6 @@ fn render_markdown_terminal(text: &str) -> String {
             continue;
         }
 
-        // Horizontal rule
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             if in_list {
                 out.push_str(&format!("{}\n", RESET));
@@ -1253,7 +1463,6 @@ fn render_markdown_terminal(text: &str) -> String {
             continue;
         }
 
-        // Headers
         if let Some(rest) = trimmed.strip_prefix("### ") {
             if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
             out.push_str(&format!("{}{}{}\n\n", BOLD, render_inline(rest), RESET));
@@ -1270,7 +1479,6 @@ fn render_markdown_terminal(text: &str) -> String {
             continue;
         }
 
-        // Blockquote
         if let Some(rest) = trimmed.strip_prefix("> ") {
             if in_list { out.push_str(&format!("{}\n", RESET)); in_list = false; }
             out.push_str(&format!("  {}│{} {}\n", DIM, RESET, render_inline(rest)));
@@ -1282,7 +1490,6 @@ fn render_markdown_terminal(text: &str) -> String {
             continue;
         }
 
-        // Unordered list
         if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
             if !in_list {
                 in_list = true;
@@ -1291,14 +1498,12 @@ fn render_markdown_terminal(text: &str) -> String {
             continue;
         }
 
-        // Ordered list
         if let Some(rest) = trimmed.strip_prefix("1. ") {
             if !in_list { in_list = true; list_num = 0; }
             list_num += 1;
             out.push_str(&format!("  {}{}.{} {}\n", CYAN, list_num, RESET, render_inline(rest)));
             continue;
         }
-        // Generic ordered list (2., 3., etc.)
         if let Some(dot_pos) = trimmed.find(". ") {
             let prefix = &trimmed[..dot_pos];
             if prefix.chars().all(|c| c.is_ascii_digit()) && !prefix.is_empty() {
@@ -1310,7 +1515,6 @@ fn render_markdown_terminal(text: &str) -> String {
             }
         }
 
-        // Regular paragraph line
         if in_list {
             out.push_str(&format!("{}\n", RESET));
             in_list = false;
@@ -1326,18 +1530,15 @@ fn render_markdown_terminal(text: &str) -> String {
         out.push_str(&format!("{}\n", RESET));
     }
 
-    // Trim trailing newlines but keep at most one
     out.trim_end_matches('\n').to_string() + "\n"
 }
 
-/// Render inline markdown: **bold**, *italic*, `code`, [links](url).
 fn render_inline(text: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
-        // Inline code: `...`
         if chars[i] == '`' {
             if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`') {
                 let code: String = chars[i + 1..i + 1 + end].iter().collect();
@@ -1347,7 +1548,6 @@ fn render_inline(text: &str) -> String {
             }
         }
 
-        // Bold: **...**
         if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
             if let Some(end) = find_double(&chars, i + 2, '*') {
                 let inner: String = chars[i + 2..end].iter().collect();
@@ -1357,7 +1557,6 @@ fn render_inline(text: &str) -> String {
             }
         }
 
-        // Italic: *...*
         if chars[i] == '*' {
             if let Some(end) = chars[i + 1..].iter().position(|&c| c == '*') {
                 let inner: String = chars[i + 1..i + 1 + end].iter().collect();
@@ -1367,7 +1566,6 @@ fn render_inline(text: &str) -> String {
             }
         }
 
-        // Link: [text](url)
         if chars[i] == '[' {
             if let Some(bracket_end) = chars[i + 1..].iter().position(|&c| c == ']') {
                 let after = i + 1 + bracket_end + 1;
@@ -1390,7 +1588,6 @@ fn render_inline(text: &str) -> String {
     result
 }
 
-/// Find the position of a double-character sequence (e.g. **) starting from `from`.
 fn find_double(chars: &[char], from: usize, ch: char) -> Option<usize> {
     let mut i = from;
     while i + 1 < chars.len() {

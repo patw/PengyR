@@ -69,7 +69,11 @@ async fn main() {
         .route("/chat/:chat_id/sudo", post(chat_sudo))
         .route("/chat/:chat_id/stop", post(chat_stop))
         .route("/chat/:chat_id/delete", post(chat_delete))
+        .route("/chat/:chat_id/export", get(chat_export))
+        .route("/chat/:chat_id/rename", post(chat_rename))
+        .route("/chat/:chat_id/command", post(chat_command))
         .route("/settings", get(settings_get).post(settings_post))
+        .route("/models", get(models_api))
         .with_state(state);
 
     let addr = format!("{}:{}", host, port);
@@ -132,7 +136,6 @@ enum SseEvent {
 enum WorkerCommand {
     Confirm {
         confirmed: bool,
-        #[allow(dead_code)]
         tool_call_id: String,
         yolo_turn: bool,
     },
@@ -209,7 +212,7 @@ impl WebWorker {
             Arc::new((Mutex::new(None), Condvar::new()));
 
         let worker = Arc::new(Self {
-            sse_rx: Mutex::new(None), // set below
+            sse_rx: Mutex::new(None),
             cmd_tx,
             cancel: cancel.clone(),
             sudo_state: sudo_state.clone(),
@@ -407,6 +410,13 @@ async fn chat_view(Path(chat_id): Path<String>) -> impl IntoResponse {
 #[derive(Deserialize)]
 struct SendRequest {
     content: Option<String>,
+    files: Option<Vec<AttachedFile>>,
+}
+
+#[derive(Deserialize)]
+struct AttachedFile {
+    name: String,
+    data: String,
 }
 
 async fn chat_send(
@@ -414,7 +424,23 @@ async fn chat_send(
     Path(chat_id): Path<String>,
     Json(data): Json<SendRequest>,
 ) -> impl IntoResponse {
-    let content = data.content.unwrap_or_default().trim().to_string();
+    let mut content = data.content.unwrap_or_default().trim().to_string();
+
+    // Handle file attachments
+    if let Some(files) = &data.files {
+        let mut blocks = Vec::new();
+        for f in files {
+            if let Ok(decoded) = base64_decode(&f.data) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    blocks.push(format!("[File: {}]\n```\n{}\n```", f.name, text));
+                }
+            }
+        }
+        if !blocks.is_empty() {
+            content = format!("{}\n{}", blocks.join("\n\n"), content);
+        }
+    }
+
     if content.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -617,6 +643,309 @@ async fn chat_stop(
     Json(serde_json::json!({"status": "stopped"}))
 }
 
+// ── NEW: Export ──────────────────────────────────────────────────
+
+async fn chat_export(Path(chat_id): Path<String>) -> impl IntoResponse {
+    let chat = match chat_manager::get_chat(&chat_id) {
+        Some(c) => c,
+        None => return (StatusCode::NOT_FOUND, "Chat not found").into_response(),
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("# {}", chat.title));
+    lines.push(format!(
+        "*Exported {}*",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    ));
+    lines.push(String::new());
+
+    for msg in &chat.messages {
+        let role = &msg.role;
+        let content = msg
+            .content
+            .as_ref()
+            .and_then(|v| {
+                if v.is_string() {
+                    v.as_str().map(String::from)
+                } else if v.is_array() {
+                    let parts: Vec<String> = v
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|p| {
+                            if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                t.to_string()
+                            } else if p.get("image_url").is_some() {
+                                "[image]".to_string()
+                            } else {
+                                String::new()
+                            }
+                        })
+                        .collect();
+                    Some(parts.join(" "))
+                } else {
+                    Some(v.to_string())
+                }
+            })
+            .unwrap_or_default();
+
+        if role == "user" {
+            lines.push("### 🧑 You".to_string());
+            lines.push(content);
+            lines.push(String::new());
+        } else if role == "assistant" {
+            if !msg.tool_calls.is_empty() {
+                lines.push("### 🤖 Assistant (tool calls)".to_string());
+                for tc in &msg.tool_calls {
+                    lines.push(format!("- **{}**", tc.function.name));
+                    lines.push(format!(
+                        "  ```json\n  {}\n  ```",
+                        tc.function.arguments
+                    ));
+                }
+                lines.push(String::new());
+            }
+            if !content.is_empty() {
+                lines.push("### 🤖 Assistant".to_string());
+                lines.push(content);
+                lines.push(String::new());
+            }
+        } else if role == "tool" {
+            let tc_id = msg.tool_call_id.as_deref().unwrap_or("?");
+            lines.push(format!("#### 🔧 Tool result (`{}`)", tc_id));
+            lines.push("```".to_string());
+            lines.push(content);
+            lines.push("```".to_string());
+            lines.push(String::new());
+        } else if role == "system" {
+            let truncated = if content.len() > 200 {
+                format!("{}...", &content[..200])
+            } else {
+                content
+            };
+            lines.push(format!("*System: {}*", truncated));
+            lines.push(String::new());
+        }
+    }
+
+    let safe_title: String = chat
+        .title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_title = safe_title.trim().chars().take(50).collect::<String>();
+    let filename = if safe_title.is_empty() {
+        "chat.md".to_string()
+    } else {
+        format!("{}.md", safe_title)
+    };
+
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "text/markdown; charset=utf-8"),
+            (
+                "Content-Disposition",
+                &format!("attachment; filename=\"{}\"", filename),
+            ),
+        ],
+        lines.join("\n"),
+    )
+        .into_response()
+}
+
+// ── NEW: Rename ──────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    title: Option<String>,
+}
+
+async fn chat_rename(
+    Path(chat_id): Path<String>,
+    Json(data): Json<RenameRequest>,
+) -> impl IntoResponse {
+    let new_title = data.title.unwrap_or_default().trim().to_string();
+    if new_title.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Empty title"})),
+        )
+            .into_response();
+    }
+
+    let mut chat = match chat_manager::get_chat(&chat_id) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Chat not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    chat.title = new_title.clone();
+    chat_manager::save_chat(&chat).ok();
+    Json(serde_json::json!({"status": "ok", "title": new_title})).into_response()
+}
+
+// ── NEW: Slash Commands ──────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CommandRequest {
+    command: Option<String>,
+}
+
+async fn chat_command(
+    Path(chat_id): Path<String>,
+    Json(data): Json<CommandRequest>,
+) -> impl IntoResponse {
+    let cmd_text = data.command.unwrap_or_default().trim().to_string();
+    if !cmd_text.starts_with('/') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Not a command"})),
+        )
+            .into_response();
+    }
+
+    let parts: Vec<&str> = cmd_text.split_whitespace().collect();
+    let cmd = parts[0].to_lowercase();
+    let args: Vec<&str> = parts[1..].to_vec();
+
+    let mut config = config::load_config();
+
+    if cmd == "/yolo" {
+        let modes = ["none", "safe", "all"];
+        let current = &config.tool_confirmation;
+        let new_mode = if !args.is_empty() && modes.contains(&args[0]) {
+            args[0].to_string()
+        } else {
+            let idx = modes.iter().position(|m| m == current).unwrap_or(2);
+            modes[(idx + 1) % 3].to_string()
+        };
+        config.tool_confirmation = new_mode.clone();
+        config::save_config(&config).ok();
+
+        let label = match new_mode.as_str() {
+            "all" => "YOLO",
+            "safe" => "Safe",
+            _ => "None",
+        };
+        return Json(serde_json::json!({
+            "type": "config",
+            "message": format!("Tool Confirmation: {}", label),
+            "config": {
+                "tool_confirmation": new_mode,
+            }
+        }))
+        .into_response();
+    }
+
+    if cmd == "/model" && !args.is_empty() {
+        config.model = args[0].to_string();
+        config::save_config(&config).ok();
+        return Json(serde_json::json!({
+            "type": "config",
+            "message": format!("Model: {}", args[0]),
+            "config": {
+                "model": args[0],
+                "tool_confirmation": config.tool_confirmation,
+            }
+        }))
+        .into_response();
+    }
+
+    if cmd == "/new" {
+        let chat = chat_manager::create_chat("New Chat").unwrap();
+        return Json(serde_json::json!({
+            "type": "redirect",
+            "url": format!("/chat/{}", chat.id),
+        }))
+        .into_response();
+    }
+
+    if cmd == "/export" {
+        return Json(serde_json::json!({
+            "type": "redirect",
+            "url": format!("/chat/{}/export", chat_id),
+        }))
+        .into_response();
+    }
+
+    if cmd == "/rename" && !args.is_empty() {
+        let new_title = args.join(" ");
+        if let Some(mut chat) = chat_manager::get_chat(&chat_id) {
+            chat.title = new_title.clone();
+            chat_manager::save_chat(&chat).ok();
+            return Json(serde_json::json!({
+                "type": "rename",
+                "title": new_title,
+            }))
+            .into_response();
+        }
+    }
+
+    if cmd == "/help" {
+        return Json(serde_json::json!({
+            "type": "message",
+            "message": "Slash commands: /new /yolo [none|safe|all] /model <name> /rename <title> /export /help",
+        }))
+        .into_response();
+    }
+
+    Json(serde_json::json!({
+        "type": "message",
+        "message": format!("Unknown command: {}. Try /help.", cmd),
+    }))
+    .into_response()
+}
+
+// ── NEW: Fetch Models API ────────────────────────────────────────
+
+async fn models_api() -> impl IntoResponse {
+    let config = config::load_config();
+    let base_url = config.base_url.trim_end_matches('/');
+    let url = format!("{}/models", base_url);
+
+    let client = reqwest::Client::new();
+    match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("api-key", &config.api_key)
+        .header("User-Agent", &config.user_agent)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(data) => {
+                let mut model_ids: Vec<String> = data["data"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                model_ids.sort();
+                Json(serde_json::json!({"models": model_ids}))
+            }
+            Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        },
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+// ── Settings ─────────────────────────────────────────────────────
+
 async fn settings_get() -> impl IntoResponse {
     let config = config::load_config();
     let chats = chat_manager::load_chats();
@@ -664,7 +993,8 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
         }
     }
     if let Some(v) = &form.reasoning_effort {
-        if ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&v.as_str()) {
+        if ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&v.as_str())
+        {
             config.reasoning_effort = v.clone();
         }
     }
@@ -684,6 +1014,15 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
 
     let chats = chat_manager::load_chats();
     Html(templates::settings_page(&config, &chats, true))
+}
+
+// ── Base64 decode helper ─────────────────────────────────────────
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .map_err(|e| e.to_string())
 }
 
 // ── Message grouping ─────────────────────────────────────────────
@@ -810,8 +1149,7 @@ fn render_markdown(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    // Simple markdown-to-HTML: fenced code blocks, inline code, bold, italic,
-    // headers, lists (ordered + unordered), blockquotes, tables, links
+
     let mut html = String::new();
     let mut in_code_block = false;
     let mut in_paragraph = false;
@@ -820,7 +1158,6 @@ fn render_markdown(text: &str) -> String {
     let mut in_blockquote = false;
     let mut table_lines: Vec<String> = Vec::new();
 
-    // Helper closures for closing open list/blockquote tags
     let close_lists = |in_ul: &mut bool, in_ol: &mut bool, html: &mut String| {
         if *in_ul {
             html.push_str("</ul>\n");
@@ -882,22 +1219,43 @@ fn render_markdown(text: &str) -> String {
         }
 
         if trimmed.starts_with("### ") {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             html.push_str(&format!("<h3>{}</h3>\n", inline_markdown(&trimmed[4..])));
         } else if trimmed.starts_with("## ") {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             html.push_str(&format!("<h2>{}</h2>\n", inline_markdown(&trimmed[3..])));
         } else if trimmed.starts_with("# ") {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             html.push_str(&format!("<h1>{}</h1>\n", inline_markdown(&trimmed[2..])));
         } else if trimmed.starts_with("> ") || trimmed == ">" {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
             if !in_blockquote {
                 html.push_str("<blockquote>\n");
@@ -908,18 +1266,36 @@ fn render_markdown(text: &str) -> String {
                 html.push_str(&format!("<p>{}</p>\n", inline_markdown(content)));
             }
         } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
-            if in_ol { html.push_str("</ol>\n"); in_ol = false; }
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
+            if in_ol {
+                html.push_str("</ol>\n");
+                in_ol = false;
+            }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             if !in_ul {
                 html.push_str("<ul>\n");
                 in_ul = true;
             }
             html.push_str(&format!("<li>{}</li>\n", inline_markdown(&trimmed[2..])));
         } else if is_ordered_list_item(trimmed) {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
-            if in_ul { html.push_str("</ul>\n"); in_ul = false; }
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
+            if in_ul {
+                html.push_str("</ul>\n");
+                in_ul = false;
+            }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             if !in_ol {
                 html.push_str("<ol>\n");
                 in_ol = true;
@@ -927,9 +1303,15 @@ fn render_markdown(text: &str) -> String {
             let content = trimmed.splitn(2, ". ").nth(1).unwrap_or("");
             html.push_str(&format!("<li>{}</li>\n", inline_markdown(content)));
         } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
-            if in_paragraph { html.push_str("</p>\n"); in_paragraph = false; }
+            if in_paragraph {
+                html.push_str("</p>\n");
+                in_paragraph = false;
+            }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             table_lines.push(trimmed.to_string());
             continue;
         } else {
@@ -938,7 +1320,10 @@ fn render_markdown(text: &str) -> String {
                 in_paragraph = false;
             }
             close_lists(&mut in_ul, &mut in_ol, &mut html);
-            if in_blockquote { html.push_str("</blockquote>\n"); in_blockquote = false; }
+            if in_blockquote {
+                html.push_str("</blockquote>\n");
+                in_blockquote = false;
+            }
             if !in_paragraph {
                 html.push_str("<p>");
                 in_paragraph = true;
@@ -972,7 +1357,6 @@ fn render_markdown(text: &str) -> String {
     html
 }
 
-/// Check if a line starts with a number followed by ". " (ordered list item).
 fn is_ordered_list_item(line: &str) -> bool {
     let dot_pos = match line.find(". ") {
         Some(p) => p,
@@ -1037,21 +1421,17 @@ fn inline_markdown(text: &str) -> String {
     let escaped = escape_html(text);
     let mut result = escaped;
 
-    // Inline code
     let code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
     result = code_re.replace_all(&result, "<code>$1</code>").to_string();
 
-    // Bold
     let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
     result = bold_re
         .replace_all(&result, "<strong>$1</strong>")
         .to_string();
 
-    // Italic
     let italic_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
     result = italic_re.replace_all(&result, "<em>$1</em>").to_string();
 
-    // Links
     let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
     result = link_re
         .replace_all(&result, r#"<a href="$2">$1</a>"#)
@@ -1214,7 +1594,7 @@ mod templates {
         <button class="btn btn-outline-secondary d-md-none" type="button" data-bs-toggle="offcanvas" data-bs-target="#sidebarOffcanvas" aria-label="Open sidebar">
           <i class="bi bi-list"></i>
         </button>
-        <span class="fw-bold text-nowrap">Pengy</span>
+        <span class="fw-bold text-nowrap" style="cursor:pointer" title="Double-click to rename" id="navTitle">Pengy</span>
         <form action="/chat/new" method="post" class="d-md-none ms-1">
           <button type="submit" class="btn btn-outline-primary" title="New Chat" aria-label="New Chat">
             <i class="bi bi-plus-lg"></i>
@@ -1276,12 +1656,15 @@ mod templates {
         let sidebar = render_sidebar_chats(chats, &chat.id);
 
         let tc_badge = match config.tool_confirmation.as_str() {
-            "all" => r#"<span class="badge bg-warning text-dark small">YOLO</span>"#,
-            "safe" => r#"<span class="badge bg-info text-dark small">Safe</span>"#,
-            _ => r#"<span class="badge bg-secondary small">Confirm</span>"#,
+            "all" => r#"<span class="badge bg-warning text-dark small" id="navConfirmBadge">YOLO</span>"#,
+            "safe" => r#"<span class="badge bg-info text-dark small" id="navConfirmBadge">Safe</span>"#,
+            _ => r#"<span class="badge bg-secondary small" id="navConfirmBadge">None</span>"#,
         };
         let navbar_center = format!(
-            r#"<span class="text-muted small d-none d-sm-inline">{}</span> {}"#,
+            r#"<span class="text-muted small d-none d-sm-inline" id="navModel">{}</span> {}
+<button class="btn btn-outline-secondary btn-sm ms-1" onclick="exportChat()" title="Export chat as Markdown">
+  <i class="bi bi-download"></i>
+</button>"#,
             escape_html(&config.model),
             tc_badge
         );
@@ -1329,7 +1712,8 @@ mod templates {
                             r#"<span class="badge bg-secondary ms-1">?</span>"#
                         };
 
-                        let args_str = serde_json::to_string_pretty(&ev.args).unwrap_or_default();
+                        let args_str =
+                            serde_json::to_string_pretty(&ev.args).unwrap_or_default();
 
                         let result_html = match &ev.result {
                             Some(r) if ev.declined => {
@@ -1373,11 +1757,19 @@ mod templates {
             }
         }
 
+        let chat_id_json = serde_json::to_string(&chat.id).unwrap_or_default();
+        let chat_title_json = serde_json::to_string(&chat.title).unwrap_or_default();
+
         let main_content = format!(
             r##"<div class="messages-area" id="messagesArea">{messages_html}</div>
 <div class="input-area">
   <form id="messageForm" class="d-flex gap-2" novalidate>
-    <textarea id="messageInput" class="form-control" rows="1" placeholder="Message... (Enter to send, Shift+Enter for newline)" autocomplete="off" autofocus></textarea>
+    <input type="file" id="fileInput" style="display:none" multiple onchange="handleFiles(this.files)">
+    <button type="button" id="attachBtn" class="btn btn-outline-secondary align-self-end"
+            title="Attach files" onclick="document.getElementById('fileInput').click()">
+      <i class="bi bi-paperclip"></i>
+    </button>
+    <textarea id="messageInput" class="form-control" rows="1" placeholder="Message... (Enter to send, Shift+Enter for newline, / for commands)" autocomplete="off" autofocus></textarea>
     <button type="submit" id="sendBtn" class="btn btn-primary align-self-end">
       <i class="bi bi-send-fill"></i>
     </button>
@@ -1385,6 +1777,10 @@ mod templates {
       <i class="bi bi-stop-fill"></i>
     </button>
   </form>
+  <div id="filePreview" class="mt-1 d-none">
+    <small class="text-muted">Attached: <span id="fileNames"></span>
+      <a href="#" onclick="clearFiles()" class="text-danger ms-1">clear</a></small>
+  </div>
 </div>
 <div class="modal fade" id="confirmModal" tabindex="-1" data-bs-backdrop="static">
   <div class="modal-dialog modal-lg">
@@ -1394,6 +1790,7 @@ mod templates {
           <i class="bi bi-gear-fill text-warning me-2"></i>
           Tool Request: <code id="confirmToolName"></code>
         </h6>
+        <button type="button" class="btn-close" onclick="confirmTool(false)" aria-label="Decline and close"></button>
       </div>
       <div class="modal-body">
         <pre id="confirmToolArgs" class="tool-args" style="max-height:300px"></pre>
@@ -1429,27 +1826,51 @@ mod templates {
       </div>
     </div>
   </div>
+</div>
+<div class="modal fade" id="renameModal" tabindex="-1">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title">Rename Chat</h6>
+      </div>
+      <div class="modal-body">
+        <input type="text" id="renameInput" class="form-control" value="" placeholder="Chat title...">
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button class="btn btn-sm btn-primary" onclick="doRename()">Rename</button>
+      </div>
+    </div>
+  </div>
 </div>"##
         );
 
-        let chat_id_json = serde_json::to_string(&chat.id).unwrap_or_default();
         let scripts = format!(
             r##"<script>
 const CHAT_ID = {chat_id_json};
+const CHAT_TITLE = {chat_title_json};
 let isProcessing = false;
 let eventSource = null;
 let pendingToolCallId = null;
 let thinkingEl = null;
-let confirmModal, sudoModal;
+let confirmModal, sudoModal, renameModal;
+let pendingFiles = [];
 
 document.addEventListener('DOMContentLoaded', () => {{
   scrollToBottom();
   confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
   sudoModal    = new bootstrap.Modal(document.getElementById('sudoModal'));
+  renameModal  = new bootstrap.Modal(document.getElementById('renameModal'));
+  document.title = CHAT_TITLE + ' — Pengy';
+  document.getElementById('navTitle').textContent = 'Pengy';
   document.getElementById('sudoPasswordInput').addEventListener('keydown', e => {{
     if (e.key === 'Enter') submitSudo();
   }});
+  document.getElementById('renameInput').addEventListener('keydown', e => {{
+    if (e.key === 'Enter') doRename();
+  }});
   document.getElementById('stopBtn').addEventListener('click', stopGeneration);
+  document.getElementById('navTitle').addEventListener('dblclick', showRename);
 }});
 
 function scrollToBottom() {{
@@ -1475,7 +1896,52 @@ function setProcessing(val) {{
   if (!val) document.getElementById('messageInput').focus();
 }}
 
+function handleFiles(files) {{
+  for (const f of files) {{
+    const reader = new FileReader();
+    reader.onload = (e) => {{
+      const base64 = e.target.result.split(',')[1];
+      pendingFiles.push({{name: f.name, data: base64}});
+      showFilePreview();
+    }};
+    reader.readAsDataURL(f);
+  }}
+  document.getElementById('fileInput').value = '';
+}}
+
+function showFilePreview() {{
+  const names = pendingFiles.map(f => f.name).join(', ');
+  document.getElementById('fileNames').textContent = names;
+  document.getElementById('filePreview').classList.remove('d-none');
+  document.getElementById('attachBtn').classList.add('active');
+}}
+
+function clearFiles() {{
+  pendingFiles = [];
+  document.getElementById('filePreview').classList.add('d-none');
+  document.getElementById('attachBtn').classList.remove('active');
+}}
+
 function stopGeneration() {{
+  if (confirmModal._isShown) {{
+    confirmModal.hide();
+    if (pendingToolCallId) {{
+      fetch(`/chat/${{CHAT_ID}}/confirm`, {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{confirmed: false, tool_call_id: pendingToolCallId, yolo_turn: false}}),
+      }});
+      pendingToolCallId = null;
+    }}
+  }}
+  if (sudoModal._isShown) {{
+    sudoModal.hide();
+    fetch(`/chat/${{CHAT_ID}}/sudo`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{password: null}}),
+    }});
+  }}
   fetch(`/chat/${{CHAT_ID}}/stop`, {{ method: 'POST' }})
     .catch(err => console.error('Stop error:', err));
   if (eventSource) {{ eventSource.close(); eventSource = null; }}
@@ -1496,22 +1962,70 @@ function hideThinking() {{
   if (thinkingEl) {{ thinkingEl.remove(); thinkingEl = null; }}
 }}
 
+function exportChat() {{
+  window.open(`/chat/${{CHAT_ID}}/export`, '_blank');
+}}
+
+function showRename() {{
+  document.getElementById('renameInput').value = document.title.replace(' — Pengy', '');
+  renameModal.show();
+  setTimeout(() => document.getElementById('renameInput').focus(), 300);
+}}
+
+function doRename() {{
+  const newTitle = document.getElementById('renameInput').value.trim();
+  if (!newTitle) return;
+  renameModal.hide();
+  fetch(`/chat/${{CHAT_ID}}/rename`, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{title: newTitle}}),
+  }})
+  .then(r => r.json())
+  .then(data => {{
+    if (data.title) {{
+      const el = document.querySelector(`[data-chat-id="${{CHAT_ID}}"] .chat-title`);
+      if (el) el.textContent = data.title;
+      document.title = data.title + ' — Pengy';
+    }}
+  }});
+}}
+
 function doSend() {{
   if (isProcessing) return;
   const input = document.getElementById('messageInput');
   const content = input.value.trim();
-  if (!content) return;
+  if (!content && pendingFiles.length === 0) return;
+
+  if (content.startsWith('/') && pendingFiles.length === 0) {{
+    handleSlashCommand(content);
+    input.value = '';
+    input.style.height = 'auto';
+    return;
+  }}
+
   input.value = '';
   input.style.height = 'auto';
+
   const placeholder = document.querySelector('#messagesArea .text-center.text-muted');
   if (placeholder) placeholder.remove();
-  appendUserMessage(content);
+
+  const displayContent = content + (pendingFiles.length > 0 ? ' [attached: ' + pendingFiles.map(f => f.name).join(', ') + ']' : '');
+  appendUserMessage(displayContent);
   setProcessing(true);
   showThinking();
+
+  const body = {{content}};
+  if (pendingFiles.length > 0) {{
+    body.files = pendingFiles;
+    pendingFiles = [];
+    clearFiles();
+  }}
+
   fetch(`/chat/${{CHAT_ID}}/send`, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{content}}),
+    body: JSON.stringify(body),
   }})
   .then(r => r.json())
   .then(data => {{
@@ -1528,6 +2042,54 @@ function doSend() {{
     appendError('Failed to send: ' + err);
     setProcessing(false);
   }});
+}}
+
+function handleSlashCommand(text) {{
+  fetch(`/chat/${{CHAT_ID}}/command`, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{command: text}}),
+  }})
+  .then(r => r.json())
+  .then(data => {{
+    switch (data.type) {{
+      case 'config':
+        appendSystemMessage(data.message);
+        if (data.config) {{
+          if (data.config.model) {{
+            document.getElementById('navModel').textContent = data.config.model;
+          }}
+          const badge = document.getElementById('navConfirmBadge');
+          const tc = data.config.tool_confirmation;
+          if (tc === 'all') {{ badge.className = 'badge bg-warning text-dark small'; badge.textContent = 'YOLO'; }}
+          else if (tc === 'safe') {{ badge.className = 'badge bg-info text-dark small'; badge.textContent = 'Safe'; }}
+          else {{ badge.className = 'badge bg-secondary small'; badge.textContent = 'None'; }}
+        }}
+        break;
+      case 'redirect':
+        window.location.href = data.url;
+        break;
+      case 'rename':
+        if (data.title) {{
+          const el = document.querySelector(`[data-chat-id="${{CHAT_ID}}"] .chat-title`);
+          if (el) el.textContent = data.title;
+          document.title = data.title + ' — Pengy';
+        }}
+        appendSystemMessage('Chat renamed to: ' + data.title);
+        break;
+      case 'message':
+        appendSystemMessage(data.message);
+        break;
+    }}
+  }});
+}}
+
+function appendSystemMessage(msg) {{
+  const el = document.createElement('div');
+  el.className = 'mb-2';
+  el.innerHTML = `<div class="alert alert-info py-1 px-2 mb-0 small"><i class="bi bi-info-circle me-1"></i>${{escHtml(msg)}}</div>`;
+  document.getElementById('messagesArea').appendChild(el);
+  scrollToBottom();
 }}
 
 document.getElementById('messageForm').addEventListener('submit', e => {{
@@ -1805,7 +2367,13 @@ function submitSudo(override) {{
       </div>
       <div class="mb-3">
         <label class="form-label fw-semibold">Model</label>
-        <input type="text" name="model" class="form-control" value="{model}" placeholder="gpt-4o">
+        <div class="input-group">
+          <input type="text" name="model" id="modelInput" class="form-control" value="{model}" placeholder="gpt-4o">
+          <button type="button" id="fetchModelsBtn" class="btn btn-outline-secondary" onclick="fetchModels()">
+            <i class="bi bi-cloud-download me-1"></i>Fetch
+          </button>
+        </div>
+        <div id="modelsList" class="mt-2 d-none"></div>
       </div>
       <div class="mb-3">
         <label class="form-label fw-semibold">Tool Confirmation</label>
@@ -1858,7 +2426,45 @@ function submitSudo(override) {{
       <a href="/" class="btn btn-outline-secondary ms-2">Cancel</a>
     </form>
   </div>
-</div>"##,
+</div>
+<script>
+async function fetchModels() {{
+  const btn = document.getElementById('fetchModelsBtn');
+  const list = document.getElementById('modelsList');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Fetching...';
+  list.classList.add('d-none');
+
+  try {{
+    const resp = await fetch('/models');
+    const data = await resp.json();
+    if (data.error) {{
+      list.innerHTML = `<div class="text-danger small">Error: ${{data.error}}</div>`;
+    }} else if (data.models && data.models.length > 0) {{
+      let html = '<div class="small fw-semibold mb-1">Available models (click to select):</div>';
+      const current = document.getElementById('modelInput').value;
+      for (const m of data.models) {{
+        const active = m === current ? ' active fw-bold' : '';
+        const escaped = m.replace(/'/g, "&#39;");
+        html += `<span class="badge bg-light text-dark me-1 mb-1${{active}}" style="cursor:pointer;font-size:0.8rem"
+                 onclick="document.getElementById('modelInput').value='${{escaped}}';
+                         document.querySelectorAll('#modelsList .badge').forEach(b=>b.classList.remove('active','fw-bold'));
+                         this.classList.add('active','fw-bold')">${{m}}</span>`;
+      }}
+      list.innerHTML = html;
+    }} else {{
+      list.innerHTML = '<div class="text-muted small">No models returned.</div>';
+    }}
+    list.classList.remove('d-none');
+  }} catch (e) {{
+    list.innerHTML = `<div class="text-danger small">Failed: ${{e}}</div>`;
+    list.classList.remove('d-none');
+  }} finally {{
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-cloud-download me-1"></i>Fetch';
+  }}
+}}
+</script>"##,
             base_url = escape_html(&config.base_url),
             model = escape_html(&config.model),
             tool_timeout = config.tool_timeout,
@@ -1937,7 +2543,6 @@ mod tests {
 
     #[test]
     fn truncate_on_char_boundary_multibyte_backs_up() {
-        // 🐧 is 4 bytes; starts at byte 2999 → straddles 3000
         let base = "a".repeat(2999);
         let s = format!("{base}🐧tail");
         let result = truncate_on_char_boundary(&s, 3000);
@@ -1947,7 +2552,6 @@ mod tests {
 
     #[test]
     fn chat_title_truncation_emoji_start_does_not_panic() {
-        // Simulates the &content[..47] site: emoji at position 0
         let content = "🐧".repeat(20);
         let result = truncate_on_char_boundary(&content, 47);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
