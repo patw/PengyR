@@ -5,6 +5,7 @@ extern "C" {
     char* pengy_config_load();
     bool  pengy_config_save(const char* json);
     char* pengy_config_render(const char* template_str);
+    void  pengy_config_set_dir(const char* path);
 
     char* pengy_chats_load();
     char* pengy_chat_create(const char* title);

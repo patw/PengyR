@@ -1191,9 +1191,12 @@ name = "pengy-web"
 version = "1.3.3"
 dependencies = [
  "axum",
+ "base64",
+ "chrono",
  "futures-util",
  "pengy_core",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

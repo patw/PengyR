@@ -287,7 +287,7 @@ impl PengyCli {
         eprint!("{}Thinking...{}", DIM, RESET);
 
         let mut expecting_api = true;
-        let mut aborted = false;
+        let aborted = false;
 
         loop {
             match event_rx.blocking_recv() {
@@ -348,7 +348,6 @@ impl PengyCli {
                                     confirmed: false,
                                     yolo_turn: false,
                                 });
-                                aborted = true;
                                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
@@ -638,7 +637,7 @@ impl PengyCli {
                     .map(|tc| tc.function.name.clone())
                     .collect();
                 if !tc_names.is_empty() {
-                    println!("{}{}#{} Assistant:{}{} {}(tool calls: {}){}",
+                    println!("{}{}#{} Assistant:{}{} (tool calls: {}){}",
                         GREEN, BOLD, i, RESET, DIM, tc_names.join(", "), RESET);
                 }
                 if !content.is_empty() {
@@ -647,9 +646,9 @@ impl PengyCli {
             } else if role == "tool" {
                 let tc_id = msg.tool_call_id.as_deref().unwrap_or("?");
                 let short_id = if tc_id.len() > 8 { &tc_id[..8] } else { tc_id };
-                println!("{}{}#{} Tool [{}]:{}{} {}", DIM, DIM, i, short_id, RESET, DIM, truncate(&content, 80), RESET);
+                println!("{}{}#{} Tool [{}]:{}{} {}{}", DIM, DIM, i, short_id, RESET, DIM, truncate(&content, 80), RESET);
             } else if role == "system" {
-                println!("{}{}#{} System:{}{} {}", DIM, DIM, i, RESET, DIM, truncate(&content, 100), RESET);
+                println!("{}{}#{} System:{}{} {}{}", DIM, DIM, i, RESET, DIM, truncate(&content, 100), RESET);
             }
         }
 
