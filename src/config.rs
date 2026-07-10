@@ -5,10 +5,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::{fs, io};
 
 const CONFIG_DIR: &str = "pengy";
 const CONFIG_FILE: &str = "settings.json";
+
+/// Global override for config directory (set via --config-dir or
+/// pengy_config_set_dir FFI).
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Override the config directory path.
+pub fn set_config_dir(path: &str) {
+    let _ = CONFIG_DIR_OVERRIDE.set(PathBuf::from(path));
+}
 
 /// The application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +126,9 @@ impl Default for Config {
 /// Uses `$HOME/.config/pengy` on all platforms so settings are shared with the
 /// Python edition and consistent across macOS / Linux / Windows.
 pub fn pengy_config_dir() -> PathBuf {
+    if let Some(override_dir) = CONFIG_DIR_OVERRIDE.get() {
+        return override_dir.clone();
+    }
     let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     p.push(".config");
     p.push(CONFIG_DIR);

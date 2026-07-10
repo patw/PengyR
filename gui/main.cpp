@@ -15,14 +15,17 @@ static void showHelp(const char* argv0) {
     out << "Pengy v" << PENGY_VERSION << " — Local-first AI agent with tools (GUI, Rust core)\n\n";
     out << "Usage: " << (argv0 ? argv0 : "pengy") << " [OPTIONS]\n\n";
     out << "Options:\n";
-    out << "  -h, --help     Show this help message and exit.\n";
-    out << "  -v, --version  Show version information and exit.\n\n";
-    out << "The desktop GUI launches a Qt6 window. No additional\n";
-    out << "command-line options are supported.\n";
+    out << "  -h, --help         Show this help message and exit.\n";
+    out << "  -v, --version      Show version information and exit.\n";
+    out << "  --config-dir PATH  Use a custom config directory.\n";
+    out << "\n"
+           "The desktop GUI launches a Qt6 window. No additional\n"
+           "command-line options are supported.\n";
+    out.flush();
 }
 
 int main(int argc, char* argv[]) {
-    // Handle -v/--version and -h/--help before creating QApplication
+    // Handle flags before creating QApplication
     for (int i = 1; i < argc; ++i) {
         const QString arg = QString::fromUtf8(argv[i]);
         if (arg == "-v" || arg == "--version") {
@@ -32,6 +35,10 @@ int main(int argc, char* argv[]) {
         if (arg == "-h" || arg == "--help") {
             showHelp(argv[0]);
             return 0;
+        }
+        if (arg == "--config-dir" && i + 1 < argc) {
+            QByteArray path = QString::fromUtf8(argv[++i]).toUtf8();
+            pengy_config_set_dir(path.constData());
         }
     }
 

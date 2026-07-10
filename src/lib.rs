@@ -372,6 +372,17 @@ pub extern "C" fn pengy_llm_cancel(cancel_flag: *mut bool) {
     tools::kill_active_process();
 }
 
+// ── Config dir override ──────────────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn pengy_config_set_dir(path: *const c_char) {
+    let p = unsafe { cstr(path) };
+    if !p.is_empty() {
+        config::set_config_dir(&p);
+    }
+}
+
+
 // ── Memory ────────────────────────────────────────────────────────
 
 #[no_mangle]

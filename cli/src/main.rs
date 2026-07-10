@@ -31,27 +31,67 @@ fn main() {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Pengy CLI — chat with LLMs from the command line");
         println!();
-        println!("Usage: pengy-cli [PROMPT...] [--no-save]");
+        println!("Usage: pengy-cli [PROMPT...] [OPTIONS]");
         println!();
         println!("Arguments:");
         println!("  PROMPT...  Optional prompt for single-shot mode.");
         println!("             If omitted, starts interactive mode.");
         println!();
         println!("Options:");
-        println!("  --no-save  Don't persist single-shot chats to history.");
-        println!("  -v, --version  Show version information and exit.");
-        println!("  -h, --help     Show this help message and exit.");
+        println!("  --no-save       Don't persist single-shot chats to history.");
+        println!("  --model NAME    Set the model to use (overrides config).");
+        println!("  --system MSG    Set the system message (overrides config).");
+        println!("  --output FORMAT Output format: pretty, raw, json, silent (default: pretty).");
+        println!("  --config-dir PATH  Use a custom config directory.");
+        println!("  -v, --version   Show version information and exit.");
+        println!("  -h, --help      Show this help message and exit.");
         return;
     }
 
     let no_save = args.iter().any(|a| a == "--no-save");
+    let mut model_override: Option<String> = None;
+    let mut system_override: Option<String> = None;
+    let mut output_mode: String = "pretty".to_string();
+    let mut config_dir: Option<String> = None;
+
+    let mut skip_next = false;
     let prompt_args: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| *a != "--no-save" && *a != "--help" && *a != "-h" && *a != "--version" && *a != "-v")
-        .map(|s| s.as_str())
+        .enumerate()
+        .filter(|(i, a)| {
+            if skip_next { skip_next = false; return false; }
+            let a_str: &str = *a;
+            if a_str == "--no-save" || a_str == "--help" || a_str == "-h" || a_str == "--version" || a_str == "-v" {
+                return false;
+            }
+            if a_str == "--model" || a_str == "--system" || a_str == "--output" || a_str == "--config-dir" {
+                skip_next = true;
+                if a_str == "--model" { model_override = args.get(*i + 2).map(|s| s.clone()); }
+                else if a_str == "--system" { system_override = args.get(*i + 2).map(|s| s.clone()); }
+                else if a_str == "--output" { if let Some(v) = args.get(*i + 2) { output_mode = v.clone(); } }
+                else if a_str == "--config-dir" { config_dir = args.get(*i + 2).map(|s| s.clone()); }
+                return false;
+            }
+            true
+        })
+        .map(|(_, s)| s.as_str())
         .collect();
 
+    // Apply config directory override as early as possible
+    if let Some(ref dir) = config_dir {
+        pengy_core::config::set_config_dir(dir);
+    }
+
     let mut cli = PengyCli::new(no_save);
+
+    // Apply model/system overrides — these persist for the session
+    if let Some(ref model) = model_override {
+        cli.config.model = model.clone();
+    }
+    if let Some(ref sys) = system_override {
+        cli.config.system_message = sys.clone();
+    }
+    cli.output_mode = output_mode;
 
     if prompt_args.is_empty() {
         cli.run_interactive();
@@ -65,6 +105,7 @@ struct PengyCli {
     current_chat: Option<Chat>,
     no_save: bool,
     yolo_this_turn: bool,
+    output_mode: String,
     rt: tokio::runtime::Runtime,
 }
 
@@ -81,6 +122,7 @@ impl PengyCli {
             current_chat: None,
             no_save,
             yolo_this_turn: false,
+            output_mode: "pretty".to_string(),
             rt,
         }
     }
@@ -378,6 +420,22 @@ impl PengyCli {
     }
 
     fn render_final(&self, content: &str, usage: &llm_client::Usage) {
+        match self.output_mode.as_str() {
+            "silent" => return,
+            "json" => {
+                let result = serde_json::json!({"content": content, "usage": usage});
+                println!("{}", serde_json::to_string_pretty(&result).unwrap_or_default());
+                return;
+            }
+            "raw" => {
+                if !content.trim().is_empty() {
+                    println!("{}", content);
+                }
+                return;
+            }
+            _ => {} // pretty — fall through
+        }
+
         if content.trim().is_empty() {
             print_box("Assistant 🤖", &["(empty response)".to_string()], None);
         } else {
