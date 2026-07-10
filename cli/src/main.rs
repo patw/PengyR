@@ -21,6 +21,12 @@ const MIN_PANEL_WIDTH: usize = 60;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Check for --version / -v before anything else
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("Pengy v{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Check for --help / -h before anything else
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Pengy CLI — chat with LLMs from the command line");
@@ -33,14 +39,15 @@ fn main() {
         println!();
         println!("Options:");
         println!("  --no-save  Don't persist single-shot chats to history.");
-        println!("  -h, --help Show this help message and exit.");
+        println!("  -v, --version  Show version information and exit.");
+        println!("  -h, --help     Show this help message and exit.");
         return;
     }
 
     let no_save = args.iter().any(|a| a == "--no-save");
     let prompt_args: Vec<&str> = args[1..]
         .iter()
-        .filter(|a| *a != "--no-save" && *a != "--help" && *a != "-h")
+        .filter(|a| *a != "--no-save" && *a != "--help" && *a != "-h" && *a != "--version" && *a != "-v")
         .map(|s| s.as_str())
         .collect();
 

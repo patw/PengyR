@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
+# Generate version.h from template
+configure_file(
+    ${CMAKE_SOURCE_DIR}/version.h.in
+    ${CMAKE_BINARY_DIR}/version.h
+    @ONLY
+)
+
 # Platform detection
 if(APPLE)
   set(PENGY_PLATFORM "macOS")
@@ -106,6 +113,8 @@ else()
     ${PENGY_CORE_LIB}
   )
 endif()
+
+target_include_directories(pengy PRIVATE ${CMAKE_BINARY_DIR})
 
 target_include_directories(pengy PRIVATE ${CMAKE_SOURCE_DIR})
 
