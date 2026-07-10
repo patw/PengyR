@@ -140,6 +140,17 @@ void MainWindow::loadChatList() {
 }
 
 void MainWindow::createNewChat() {
+    loadChatList();
+    if (!m_chats.isEmpty()) {
+        QJsonObject first = m_chats[0].toObject();
+        if (first["title"].toString() == "New Chat" && first["messages"].toArray().isEmpty()) {
+            m_currentChat = first;
+            m_currentChatId = first["id"].toString();
+            m_chatHistory->selectChatById(m_currentChatId);
+            m_chatView->clear();
+            return;
+        }
+    }
     char* json = pengy_chat_create("New Chat");
     if (json) {
         QJsonObject chat = QJsonDocument::fromJson(QByteArray(json)).object();

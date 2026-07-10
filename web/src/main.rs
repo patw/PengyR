@@ -382,6 +382,12 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn new_chat() -> impl IntoResponse {
+    let chats = chat_manager::load_chats();
+    if let Some(first) = chats.first() {
+        if first.title == "New Chat" && first.messages.is_empty() {
+            return Redirect::to(&format!("/chat/{}", first.id));
+        }
+    }
     let chat = chat_manager::create_chat("New Chat").unwrap();
     Redirect::to(&format!("/chat/{}", chat.id))
 }
