@@ -38,6 +38,7 @@ private:
     QString buildCss() const;
     QString renderMessage(const QJsonObject& msg) const;
     QString renderToolBlock(const QJsonObject& msg) const;
+    QString renderReasoningBlock(const QString& reasoning, int idx) const;
     QString markdownToHtml(const QString& md) const;
     QString convertMarkdownTables(const QString& md) const;
     QString convertMarkdownBlocks(const QString& html) const;
@@ -51,6 +52,7 @@ private:
 
     QJsonArray m_messages;
     QSet<QString> m_expandedTools;
+    QSet<int> m_expandedReasoning;
 
     // Image caching for external HTTP images
     QMap<QString, QByteArray> m_imageCache;  // url -> raw bytes (empty = failed)
