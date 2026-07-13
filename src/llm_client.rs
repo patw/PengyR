@@ -147,24 +147,16 @@ pub async fn chat(
         };
 
         let status = resp.status();
-        let body: serde_json::Value = match resp.json().await {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: format!("Error parsing API response (HTTP {status}): {e}"),
-                    message: None,
-                    usage: accumulated_usage,
-                });
-                return;
-            }
-        };
+        let body_text = resp.text().await.unwrap_or_default();
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
 
         if !status.is_success() {
             let detail = body["error"]["message"]
                 .as_str()
                 .or_else(|| body["error"].as_str())
                 .or_else(|| body["message"].as_str())
-                .unwrap_or("unknown error");
+                .unwrap_or(body_text.as_str());
             let _ = event_tx.send(LlmEvent::FinalResponse {
                 content: format!("API error (HTTP {status}): {detail}"),
                 message: None,

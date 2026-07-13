@@ -631,12 +631,14 @@ impl PengyCli {
                 .unwrap_or_default();
 
             if role == "user" {
-                println!("{}{}#{} You:{}{} {}", BLUE, BOLD, i, RESET, RESET, content);
+                println!("{}{}#{} You:{}{} {}", BLUE, BOLD, i, RESET, RESET, truncate(&content, 200));
             } else if role == "assistant" {
                 let tc_names: Vec<String> = msg.tool_calls.iter()
                     .map(|tc| tc.function.name.clone())
                     .collect();
-                if !tc_names.is_empty() {
+                if tc_names.is_empty() {
+                    println!("{}{}#{} Assistant:{}{}", GREEN, BOLD, i, RESET, RESET);
+                } else {
                     println!("{}{}#{} Assistant:{}{} (tool calls: {}){}",
                         GREEN, BOLD, i, RESET, DIM, tc_names.join(", "), RESET);
                 }
@@ -645,7 +647,7 @@ impl PengyCli {
                 }
             } else if role == "tool" {
                 let tc_id = msg.tool_call_id.as_deref().unwrap_or("?");
-                let short_id = if tc_id.len() > 8 { &tc_id[..8] } else { tc_id };
+                let short_id = tc_id.chars().take(8).collect::<String>();
                 println!("{}{}#{} Tool [{}]:{}{} {}{}", DIM, DIM, i, short_id, RESET, DIM, truncate(&content, 80), RESET);
             } else if role == "system" {
                 println!("{}{}#{} System:{}{} {}{}", DIM, DIM, i, RESET, DIM, truncate(&content, 100), RESET);
@@ -1364,11 +1366,13 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
 }
 
 fn truncate(text: &str, max_len: usize) -> String {
-    let first_line = text.lines().next().unwrap_or(text);
-    if first_line.len() <= max_len {
-        first_line.to_string()
+    let preview = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = preview.chars().count();
+    if count <= max_len {
+        preview
     } else {
-        format!("{}...", &first_line[..max_len.saturating_sub(3)])
+        let keep = max_len.saturating_sub(3);
+        format!("{}...", preview.chars().take(keep).collect::<String>())
     }
 }
 
