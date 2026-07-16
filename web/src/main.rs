@@ -20,26 +20,36 @@ use std::sync::{Arc, Condvar, Mutex};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Handle --version / -v before anything else
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("Pengy v{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let mut host = String::from("127.0.0.1");
     let mut port: u16 = 5000;
+    let mut config_dir: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!("Pengy Web — chat with LLMs from your browser");
                 println!();
-                println!("Usage: pengy-web [PORT] [--host HOST]");
+                println!("Usage: pengy-web [PORT] [OPTIONS]");
                 println!();
                 println!("Arguments:");
-                println!("  PORT          Bind port (default: 5000)");
+                println!("  PORT               Bind port (default: 5000)");
                 println!();
                 println!("Options:");
-                println!("  --host HOST   Bind host (default: 127.0.0.1). Pass");
-                println!("                --host 0.0.0.0 to expose beyond localhost —");
-                println!("                this app has no authentication and exposes");
-                println!("                run_bash/run_python tools, so only do this");
-                println!("                on a trusted network.");
-                println!("  -h, --help    Show this help message and exit");
+                println!("  --host HOST        Bind host (default: 127.0.0.1). Pass");
+                println!("                     --host 0.0.0.0 to expose beyond localhost —");
+                println!("                     this app has no authentication and exposes");
+                println!("                     run_bash/run_python tools, so only do this");
+                println!("                     on a trusted network.");
+                println!("  --config-dir PATH  Use a custom config directory.");
+                println!("  --no-browser       Don't auto-open a browser on startup.");
+                println!("  -v, --version      Show version information and exit.");
+                println!("  -h, --help         Show this help message and exit.");
                 return;
             }
             "--host" => {
@@ -48,6 +58,16 @@ async fn main() {
                     host = h.clone();
                 }
             }
+            "--config-dir" => {
+                i += 1;
+                if let Some(d) = args.get(i) {
+                    config_dir = Some(d.clone());
+                }
+            }
+            "--no-browser" => {
+                // Accepted for CLI compatibility; pengy-web does not
+                // auto-open a browser.
+            }
             other => {
                 if let Ok(p) = other.parse() {
                     port = p;
@@ -55,6 +75,10 @@ async fn main() {
             }
         }
         i += 1;
+    }
+
+    if let Some(ref dir) = config_dir {
+        config::set_config_dir(dir);
     }
 
     let state = AppState::new();

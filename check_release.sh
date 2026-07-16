@@ -136,13 +136,24 @@ else
     cd "$ROOT"
 fi
 
-# ── 9. Verify binaries ──────────────────────────────────────────────
+# ── 9. Verify binaries (existence + --version/--help smoke test) ───
 echo "--- Verify binaries ---"
 for bin in gui/build/pengy target/release/pengy-cli target/release/pengy-web; do
-    if [ -f "$bin" ]; then
-        ok "$bin exists ($(ls -lh "$bin" | awk '{print $5}'))"
-    else
+    if [ ! -f "$bin" ]; then
         warn "$bin not found"
+        continue
+    fi
+    name=$(basename "$bin")
+    ok "$name exists ($(ls -lh "$bin" | awk '{print $5}'))"
+    if "$bin" --version 2>/dev/null | grep -q "^Pengy v"; then
+        ok "$name --version works"
+    else
+        warn "$name --version failed (stale binary?)"
+    fi
+    if "$bin" --help 2>/dev/null | grep -qiE "usage|options"; then
+        ok "$name --help works"
+    else
+        warn "$name --help failed (stale binary?)"
     fi
 done
 

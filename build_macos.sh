@@ -33,6 +33,33 @@ make -j$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 echo ""
 echo "==> Done! Binary: gui/build_macos/pengy"
 
+# ── Smoke test: verify --version and --help on every binary ─────────
+echo "==> Smoke testing binaries..."
+PASS=0; FAIL=0
+smoke() {
+    local bin="$1" name; name=$(basename "$bin")
+    if [ ! -f "$bin" ]; then
+        echo -e "  \033[31m✗\033[0m $name not found"
+        FAIL=$((FAIL+1)); return
+    fi
+    if "$bin" --version 2>/dev/null | grep -q "^Pengy v" && \
+       "$bin" --help    2>/dev/null | grep -qiE "usage|options"; then
+        echo -e "  \033[32m✓\033[0m $name --version + --help"
+        PASS=$((PASS+1))
+    else
+        echo -e "  \033[31m✗\033[0m $name --version/--help failed (stale or broken?)"
+        FAIL=$((FAIL+1))
+    fi
+}
+smoke "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-cli"
+smoke "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-web"
+smoke "$ROOT/gui/build_macos/pengy"
+if [ "$FAIL" -gt 0 ]; then
+    echo -e "\033[31m==> $FAIL binary(s) failed smoke test!\033[0m"
+    exit 1
+fi
+echo "==> All $PASS binary(s) passed smoke test."
+
 # Generate .icns from pengy.png
 echo "==> Generating app icon..."
 ICONSET="$ROOT/.pengy.iconset"
