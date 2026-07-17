@@ -3,6 +3,8 @@ use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::tools;
 
+use rustyline::{Editor, history::FileHistory};
+
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -104,6 +106,8 @@ struct PengyCli {
     yolo_this_turn: bool,
     output_mode: String,
     rt: tokio::runtime::Runtime,
+    rl: Editor<(), FileHistory>,
+    hist_path: std::path::PathBuf,
 }
 
 impl PengyCli {
@@ -114,6 +118,21 @@ impl PengyCli {
 
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+        // ── readline history ────────────────────────────────
+        let hist_path = dirs_next()
+            .unwrap_or_else(|| Path::new(".").to_path_buf())
+            .join(".local")
+            .join("state")
+            .join("pengy")
+            .join("cli_history");
+        let hist_dir = hist_path.parent().map(|p| p.to_path_buf());
+        if let Some(dir) = &hist_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let mut rl: Editor<(), FileHistory> = Editor::new().expect("rustyline editor");
+        let _ = rl.load_history(&hist_path);
+
         Self {
             config,
             current_chat: None,
@@ -121,6 +140,8 @@ impl PengyCli {
             yolo_this_turn: false,
             output_mode: "pretty".to_string(),
             rt,
+            rl,
+            hist_path,
         }
     }
 
@@ -217,6 +238,7 @@ impl PengyCli {
         }
 
         self.clear_sudo_provider();
+        let _ = self.rl.save_history(&self.hist_path);
         println!("\nGoodbye!");
     }
 
@@ -477,7 +499,7 @@ impl PengyCli {
 
     // ── Tool confirmation ────────────────────────────────────────
 
-    fn prompt_tool_confirmation(&self) -> u8 {
+    fn prompt_tool_confirmation(&mut self) -> u8 {
         loop {
             let input = self.prompt(&format!(
                 "  [1] Execute  [2] Yes to all this turn  [3] Decline  [4] Abort run  {}[1/2/3/4]{} ",
@@ -1206,17 +1228,16 @@ impl PengyCli {
         config::save_config(&self.config).ok();
     }
 
-    fn prompt(&self, prompt: &str) -> Option<String> {
-        print!("{}", prompt);
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => Some(
-                line.trim_end_matches('\n')
-                    .trim_end_matches('\r')
-                    .to_string(),
-            ),
+    fn prompt(&mut self, prompt_str: &str) -> Option<String> {
+        match self.rl.readline(prompt_str) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = self.rl.add_history_entry(trimmed);
+                }
+                Some(line)
+            }
+            Err(rustyline::error::ReadlineError::Eof | rustyline::error::ReadlineError::Interrupted) => None,
             Err(_) => None,
         }
     }
