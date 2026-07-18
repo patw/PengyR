@@ -93,6 +93,7 @@ async fn main() {
         .route("/chat/:chat_id/command", post(chat_command))
         .route("/settings", get(settings_get).post(settings_post))
         .route("/models", get(models_api))
+        .route("/files", get(serve_file))
         .with_state(state);
 
     let addr = format!("{}:{}", host, port);
@@ -989,6 +990,69 @@ async fn models_api() -> impl IntoResponse {
     }
 }
 
+// ── File serving for local images ───────────────────────────────────
+
+async fn serve_file(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let raw_path = params.get("path").map(String::as_str).unwrap_or("");
+    if raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing path parameter").into_response();
+    }
+
+    // Expand ~ and resolve symlinks
+    let path = match std::path::Path::new(raw_path).canonicalize() {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+
+    if !path.is_file() {
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+
+    // Security: only serve files under allowed directories
+    let home = match std::env::var_os("HOME") {
+        Some(h) => std::path::PathBuf::from(h),
+        None => return (StatusCode::FORBIDDEN, "Access denied").into_response(),
+    };
+
+    let allowed = [
+        home.join("Pictures"),
+        home.join("Downloads"),
+        home.join("Desktop"),
+        std::path::PathBuf::from("/tmp"),
+    ];
+
+    let is_allowed = allowed.iter().any(|root| {
+        path == *root || path.starts_with(root)
+    });
+
+    if !is_allowed {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+
+    // Guess MIME type from extension
+    let mime = match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        _ => "image/png", // default for unknown (most plots are PNG)
+    };
+
+    match tokio::fs::read(&path).await {
+        Ok(data) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, mime)],
+            data,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Cannot read file").into_response(),
+    }
+}
+
 // ── Settings ─────────────────────────────────────────────────────
 
 async fn settings_get() -> impl IntoResponse {
@@ -1399,7 +1463,7 @@ fn render_markdown(text: &str) -> String {
         html.push_str("</p>\n");
     }
 
-    html
+    fix_file_urls(&html)
 }
 
 fn is_ordered_list_item(line: &str) -> bool {
@@ -1466,6 +1530,12 @@ fn inline_markdown(text: &str) -> String {
     let escaped = escape_html(text);
     let mut result = escaped;
 
+    // Images — must come before link regex so ![alt](url) isn't partially matched
+    let img_re = regex::Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap();
+    result = img_re
+        .replace_all(&result, r#"<img src="$2" alt="$1">"#)
+        .to_string();
+
     let code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
     result = code_re.replace_all(&result, "<code>$1</code>").to_string();
 
@@ -1483,6 +1553,40 @@ fn inline_markdown(text: &str) -> String {
         .to_string();
 
     result
+}
+
+/// Percent-encode a file path for use in a query string.
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'/' | b'.' | b'-' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Replace ``file://`` image URLs with ``/files?path=`` URLs that browsers
+/// can load.  Browsers block ``file://`` from HTTP pages as a security
+/// restriction.
+fn fix_file_urls(html: &str) -> String {
+    let re = regex::Regex::new(r#"src="file://([^"]+)""#).unwrap();
+    re.replace_all(html, |caps: &regex::Captures| {
+        let path = &caps[1];
+        // Expand ~ to the user's home directory
+        let expanded = if let (Some(home), Some(suffix)) =
+            (std::env::var_os("HOME"), path.strip_prefix('~'))
+        {
+            format!("{}{}", home.to_string_lossy(), suffix)
+        } else {
+            path.to_string()
+        };
+        let encoded = percent_encode_path(&expanded);
+        format!(r#"src="/files?path={}""#, encoded)
+    })
+    .to_string()
 }
 
 fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
