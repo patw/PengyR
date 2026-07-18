@@ -31,9 +31,9 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 │  ┌─ Qt6 GUI (C++17) ─────────────┐  ┌─ CLI (Rust) ──────────────┐ │
 │  │ ChatHistory / ChatView /       │  │ Interactive REPL           │ │
 │  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
-│  │ ChatWorker (QThread → FFI)     │  │ 18 slash commands          │ │
+│  │ ChatWorker (QThread → FFI)     │  │ 25 slash commands          │ │
 │  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
-│               │ C FFI (20 extern "C")             │ direct Rust    │
+│               │ C FFI (23 extern "C")             │ direct Rust    │
 │               │                                    │                │
 │  ┌─ Web UI (Rust/Axum) ──────────┐                │                │
 │  │ Bootstrap 5 + SSE streaming    │                │                │
@@ -60,6 +60,7 @@ PengyR/
 │   ├── lib.rs                  # Public modules + C FFI exports + global tokio runtime
 │   ├── config.rs               # Settings load/save + system message rendering
 │   ├── chat_manager.rs         # Chat session CRUD + message cleaning
+│   ├── task_manager.rs         # Prompt-template Tasks CRUD (~/.config/pengy/tasks.json)
 │   ├── tools.rs                # 11 OpenAI function-calling tools
 │   └── llm_client.rs           # Async LLM chat generator (tokio channels)
 ├── cli/                        # CLI binary (pengy-cli)
@@ -77,7 +78,9 @@ PengyR/
 │   ├── chatview.cpp/h          # Right-top — QTextBrowser markdown, tables, tool blocks
 │   ├── chatinput.cpp/h         # Right-bottom — message input
 │   ├── chatworker.cpp/h        # QThread worker — calls pengy_llm_chat_run()
-│   └── settingsdialog.cpp/h    # Settings modal + Fetch Models button
+│   ├── settingsdialog.cpp/h    # Settings modal + Fetch Models button
+│   ├── tasksdialog.cpp/h       # Prompt-template Tasks manager/player
+│   └── themehelper.h           # Light/dark/accent theme + UI scale helpers
 ├── appimage/
 │   ├── build.sh                # Bundles PengyR-x86_64.AppImage
 │   ├── pengy.desktop           # Linux desktop entry
@@ -89,7 +92,7 @@ PengyR/
 
 ## FFI Design
 
-The Rust core exposes 20 C functions via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library.
+The Rust core exposes 23 C functions via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library.
 
 ### Config Functions
 
@@ -235,6 +238,8 @@ pengy-cli "What is the capital of France?"
 pengy-cli --no-save "quick question"
 ```
 
+Flags (shared with the Python and C++ CLIs): `--no-save`, `--model NAME`, `--system MSG`, `--output pretty|raw|json|silent`, `--config-dir PATH`, `-v/--version`. `--model` and `--system` are in-memory overrides — they never modify `settings.json`.
+
 ### Interactive Mode
 
 On startup:
@@ -256,6 +261,11 @@ The main thread drives the tokio channel receiver. Tool confirmation blocks on u
 |---------|-------------|
 | `/help` | Show the command reference table |
 | `/new` | Start a new chat session |
+| `/show [n]` | Show the full conversation (optional: last n messages) |
+| `/tail [n]` | Show the last n messages (default 5) |
+| `/rename <title>` | Rename the current chat |
+| `/clear` | Clear the terminal screen |
+| `/export [path]` | Export the current chat as Markdown |
 | `/yolo [all\|safe\|none]` | Set tool confirmation: all (YOLO), safe (read-only), none — cycles if no arg |
 | `/config` | Show current configuration (base URL, model, timeout, etc.) |
 | `/model <name>` | Switch models (e.g. `/model gpt-4o`) |
@@ -288,7 +298,11 @@ The Web binary (`pengy-web [port]`) runs an Axum HTTP server (default port 5000)
 ```bash
 pengy-web                            # localhost:5000
 pengy-web 8080                       # custom port
+pengy-web 8080 --host 0.0.0.0        # expose beyond localhost (no auth — trusted networks only)
+pengy-web --config-dir PATH          # custom config directory
 ```
+
+The server prints its URL on startup; it does not auto-open a browser.
 
 ### Layout
 
@@ -321,6 +335,10 @@ pengy-web 8080                       # custom port
 | POST | `/chat/:id/sudo` | Provide sudo password to blocked worker |
 | POST | `/chat/:id/stop` | Cancel running generation for a chat |
 | POST | `/chat/:id/delete` | Delete chat and redirect to index |
+| GET | `/chat/:id/export` | Download the chat as a Markdown file |
+| POST | `/chat/:id/rename` | Rename a chat |
+| POST | `/chat/:id/command` | Web slash commands typed in the chat input |
+| GET | `/models` | Fetch available models from the endpoint (settings page Fetch button) |
 | GET/POST | `/settings` | View/update all config fields |
 
 ### SSE Event Types
@@ -432,12 +450,16 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
   "base_url": "https://api.openai.com/v1",
   "api_key": "",
   "model": "gpt-4o",
-  "system_message": "You are a helpful assistant. The current date is {date} and the user is {username} on host {hostname} which is {osinfo}.",
+  "system_message": "You are a helpful assistant named Pengy. The current date is {date} and the user is {username} on host {hostname} which is {osinfo}.",
   "tool_confirmation": "none",
+  "reasoning_effort": "",
+  "preserve_reasoning": false,
+  "context_keep_turns": 0,
   "ui_scale": 100,
+  "theme_mode": "system",
+  "theme_accent": "default",
   "user_agent": "PengyAgent/1.0",
-  "tool_timeout": 60,
-  "context_keep_turns": 0
+  "tool_timeout": 60
 }
 ```
 
@@ -448,10 +470,14 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `model` | string | `gpt-4o` | Model name |
 | `system_message` | string | (see above) | Template; `{date}`, `{username}`, `{hostname}`, `{osinfo}` filled at send time |
 | `tool_confirmation` | string | `"none"` | `"all"` (YOLO), `"safe"` (read-only auto), `"none"` (prompt all) |
+| `reasoning_effort` | string | `""` | Passed as `reasoning_effort` on API calls when set (`none`…`max`; `""` = provider default) |
+| `preserve_reasoning` | bool | `false` | Keep reasoning fields on assistant messages sent back to the API |
+| `context_keep_turns` | int | `0` | Recent turns whose tool results are kept; older ones elided. 0 = keep all |
 | `ui_scale` | int | `100` | Sets `QT_SCALE_FACTOR` on next launch (75/100/125/200); CLI ignores |
+| `theme_mode` | string | `"system"` | Desktop theme: `"system"`, `"light"`, or `"dark"` |
+| `theme_accent` | string | `"default"` | Desktop accent color (`default`/`blue`/`teal`/`green`/`orange`/`red`/`pink`/`purple`) |
 | `user_agent` | string | `PengyAgent/1.0` | User-Agent header for HTTP requests |
 | `tool_timeout` | int | `60` | Timeout in seconds for tool execution (-1 = no timeout) |
-| `context_keep_turns` | int | `0` | Recent turns whose tool results are kept; older ones elided. 0 = keep all |
 
 ### System Message Templating
 
@@ -488,7 +514,7 @@ All 11 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | `directory_tree` | ✅ | Visual directory tree (Unicode box-drawing, 500 entry cap). |
 | `search_content` | ✅ | Regex search in files with context lines and region grouping. |
 
-Tool execution runs on the tokio runtime via `tokio::task::spawn_blocking` for CPU/IO-heavy operations. Sudo password is cached in memory for the session.
+Tool execution runs on the tokio runtime via `tokio::task::spawn_blocking` for CPU/IO-heavy operations. Sudo password is cached in memory for the duration of the LLM run and cleared when the run completes.
 
 ---
 
@@ -559,7 +585,7 @@ build_windows.bat
 
 ## Design Decisions
 
-**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — 20 functions with simple types.
+**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — 23 functions with simple types.
 
 **Static linking of Rust core:** The Rust library is compiled as a static archive (`.a` / `.lib`) and linked into the Qt6 binary. This eliminates runtime Rust dependencies in the final binary. The trade-off is a larger binary (~13 MB) but simpler deployment.
 
@@ -571,7 +597,7 @@ build_windows.bat
 
 **Non-streaming API calls:** The LLM client uses non-streaming completions (no `stream: true`). Full responses render at once. This simplifies the architecture and is acceptable because tool call round-trips dominate latency for agentic workflows.
 
-**Sudo via `-S`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, pass it to `sudo -S`. Password cached in memory for the session. No PTY complexity.
+**Sudo via `-S`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, pass it to `sudo -S`. Password cached in memory for the duration of the LLM run. No PTY complexity.
 
 **System message templating at send time:** Templates are resolved fresh on every send so `{date}` is always accurate regardless of when the config was saved.
 
@@ -590,7 +616,7 @@ build_windows.bat
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
 | 11 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
-| CLI (interactive REPL + single-shot) | ✅ | 18 slash commands, @path attachments |
+| CLI (interactive REPL + single-shot) | ✅ | 25 slash commands, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |
 | File attachments (GUI) | ✅ | Image + text file support |
 | Image paste from clipboard | ✅ | |
@@ -600,7 +626,10 @@ build_windows.bat
 | Context elision | ✅ | `elide_old_tool_results` wired to config |
 | Chat export to Markdown | ✅ | GUI sidebar export button |
 | Settings dialog + Fetch Models | ✅ | GUI dialog + Web settings page + CLI `/config` |
-| Skills system | ✅ | Skills are markdown docs loaded via system message |
+| Tasks (prompt templates) | ✅ | GUI Tasks dialog; stored in shared `tasks.json` (GUI-only in all editions) |
+| Theme system (mode + accent) | ✅ | Desktop GUI; `theme_mode`/`theme_accent` in settings.json |
+| Reasoning effort / preservation | ✅ | `reasoning_effort`/`preserve_reasoning` settings |
+| Skills system | ✅ | Skills are markdown docs loaded via system message (skill files ship in the Python repo) |
 
 ---
 

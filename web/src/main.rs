@@ -47,7 +47,6 @@ async fn main() {
                 println!("                     run_bash/run_python tools, so only do this");
                 println!("                     on a trusted network.");
                 println!("  --config-dir PATH  Use a custom config directory.");
-                println!("  --no-browser       Don't auto-open a browser on startup.");
                 println!("  -v, --version      Show version information and exit.");
                 println!("  -h, --help         Show this help message and exit.");
                 return;
@@ -63,10 +62,6 @@ async fn main() {
                 if let Some(d) = args.get(i) {
                     config_dir = Some(d.clone());
                 }
-            }
-            "--no-browser" => {
-                // Accepted for CLI compatibility; pengy-web does not
-                // auto-open a browser.
             }
             other => {
                 if let Ok(p) = other.parse() {
