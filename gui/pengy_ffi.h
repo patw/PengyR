@@ -26,6 +26,11 @@ extern "C" {
     void  pengy_tool_set_user_agent(const char* ua);
     void  pengy_tool_set_timeout(unsigned long long secs);
 
+    char* pengy_image_preprocess(const char* path,
+                                 unsigned int max_dimension,
+                                 double max_mb,
+                                 unsigned char quality);
+
     struct ConfirmState {
         int status;    // 0=idle, 1=pending, 2=confirmed, 3=declined
         bool yolo_turn;
