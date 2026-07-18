@@ -11,6 +11,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+// ── 429 / 529 backoff ────────────────────────────────────────────
+const MAX_RETRIES: u32 = 5;
+const BASE_DELAY_SECS: f64 = 1.0;
+const MAX_DELAY_SECS: f64 = 60.0;
+const JITTER: f64 = 0.25;
+const RETRYABLE_STATUSES: &[u16] = &[429, 529];
+
+fn backoff_delay(attempt: u32, retry_after: Option<f64>) -> f64 {
+    let base = match retry_after {
+        Some(ra) => ra.min(MAX_DELAY_SECS),
+        None => (BASE_DELAY_SECS * (2u32.pow(attempt) as f64)).min(MAX_DELAY_SECS),
+    };
+    let jitter = base * JITTER * (rand::random::<f64>() * 2.0 - 1.0);
+    base + jitter.max(-base * JITTER)
+}
+
+fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
+    // OpenAI-specific: retry-after-ms (integer milliseconds)
+    if let Some(ms) = headers.get("retry-after-ms") {
+        if let Ok(ms_str) = ms.to_str() {
+            if let Ok(ms_val) = ms_str.parse::<f64>() {
+                return Some(ms_val / 1000.0);
+            }
+        }
+    }
+    // Standard Retry-After (seconds)
+    if let Some(ra) = headers.get("retry-after") {
+        if let Ok(ra_str) = ra.to_str() {
+            if let Ok(secs) = ra_str.parse::<f64>() {
+                return Some(secs);
+            }
+        }
+    }
+    None
+}
+
 /// Events emitted by the LLM chat loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -37,6 +73,14 @@ pub enum LlmEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<ChatMessage>,
         usage: Usage,
+    },
+    #[serde(rename = "retrying")]
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: f64,
+        status_code: u16,
+        message: String,
     },
 }
 
@@ -126,19 +170,96 @@ pub async fn chat(
             payload["reasoning_effort"] = serde_json::Value::String(reasoning_effort.to_string());
         }
 
-        let resp = match client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("api-key", api_key)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        // ── API call with 429 / 529 exponential backoff ──────────
+        let resp = {
+            let mut last_status: Option<reqwest::StatusCode> = None;
+            let mut last_body: Option<serde_json::Value> = None;
+            let mut success = None;
+            for attempt in 0..=MAX_RETRIES {
+                if cancel.load(Ordering::Relaxed) {
+                    // Cancelled during backoff — emit nothing, just return
+                    return;
+                }
+                match client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .header("api-key", api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(r) => {
+                        let status = r.status();
+                        if status.is_success() {
+                            success = Some(r);
+                            break;
+                        }
+                        let code = status.as_u16();
+                        let headers = r.headers().clone();
+                        let body_text = r.text().await.unwrap_or_default();
+                        let body: serde_json::Value =
+                            serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
+                        last_status = Some(status);
+                        last_body = Some(body.clone());
+                        if RETRYABLE_STATUSES.contains(&code) && attempt < MAX_RETRIES {
+                            let ra = extract_retry_after(&headers);
+                            let delay = backoff_delay(attempt, ra);
+                            let detail = body["error"]["message"]
+                                .as_str()
+                                .or_else(|| body["error"].as_str())
+                                .or_else(|| body["message"].as_str())
+                                .unwrap_or(body_text.as_str())
+                                .to_string();
+                            let _ = event_tx.send(LlmEvent::Retrying {
+                                attempt: attempt + 1,
+                                max_attempts: MAX_RETRIES,
+                                delay_secs: (delay * 10.0).round() / 10.0,
+                                status_code: code,
+                                message: detail,
+                            });
+                            // Sleep in 500ms slices so cancel is responsive
+                            let deadline = tokio::time::Instant::now()
+                                + tokio::time::Duration::from_secs_f64(delay);
+                            loop {
+                                if cancel.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let now = tokio::time::Instant::now();
+                                if now >= deadline {
+                                    break;
+                                }
+                                let remaining = deadline - now;
+                                let slice = remaining.min(tokio::time::Duration::from_millis(500));
+                                tokio::time::sleep(slice).await;
+                            }
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(LlmEvent::FinalResponse {
+                            content: format!("API error: {e}"),
+                            message: None,
+                            usage: accumulated_usage,
+                        });
+                        return;
+                    }
+                }
+                break; // non-retryable status or final attempt — handled below
+            }
+            if let Some(r) = success {
+                r
+            } else {
+                let status = last_status.unwrap();
+                let body = last_body.unwrap();
+                let body_text = serde_json::to_string(&body).unwrap_or_default();
+                let detail = body["error"]["message"]
+                    .as_str()
+                    .or_else(|| body["error"].as_str())
+                    .or_else(|| body["message"].as_str())
+                    .unwrap_or(body_text.as_str());
                 let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: format!("API error: {e}"),
+                    content: format!("API error (HTTP {status}): {detail}"),
                     message: None,
                     usage: accumulated_usage,
                 });
@@ -146,24 +267,9 @@ pub async fn chat(
             }
         };
 
-        let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
         let body: serde_json::Value =
             serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
-
-        if !status.is_success() {
-            let detail = body["error"]["message"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .or_else(|| body["message"].as_str())
-                .unwrap_or(body_text.as_str());
-            let _ = event_tx.send(LlmEvent::FinalResponse {
-                content: format!("API error (HTTP {status}): {detail}"),
-                message: None,
-                usage: accumulated_usage,
-            });
-            return;
-        }
 
         // Parse the response
         let choice = match body["choices"].as_array().and_then(|a| a.first()) {

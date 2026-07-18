@@ -321,6 +321,16 @@ impl PengyCli {
                     self.yolo_this_turn = false;
                     self.current_chat.as_mut().unwrap().messages.push(message);
                 }
+                Some(LlmEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message }) => {
+                    if expecting_api {
+                        eprint!("\r{}\r", " ".repeat(40));
+                    }
+                    expecting_api = true;  // will show "Thinking..." again after sleep
+                    eprintln!(
+                        "{}Overloaded (HTTP {}) — retrying in {:.1}s ({}/{}){}  {}",
+                        YELLOW, status_code, delay_secs, attempt, max_attempts, RESET, message
+                    );
+                }
                 Some(LlmEvent::ToolRequest {
                     name,
                     args,

@@ -147,6 +147,13 @@ enum SseEvent {
         usage: llm_client::Usage,
     },
     SudoRequest,
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: f64,
+        status_code: u16,
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -213,6 +220,16 @@ fn sse_event_to_json(event: &SseEvent) -> String {
         })
         .to_string(),
         SseEvent::SudoRequest => r#"{"type":"sudo_request"}"#.to_string(),
+        SseEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message } => {
+            serde_json::json!({
+                "type": "retrying",
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "delay_secs": delay_secs,
+                "status_code": status_code,
+                "message": message,
+            }).to_string()
+        }
         SseEvent::Error { message } => {
             serde_json::json!({"type": "error", "message": message}).to_string()
         }
@@ -284,6 +301,15 @@ impl WebWorker {
                     Some(LlmEvent::AssistantToolCalls { message }) => {
                         yolo_this_turn = false;
                         chat.messages.push(message);
+                    }
+                    Some(LlmEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message }) => {
+                        let _ = sse_tx2.send(SseEvent::Retrying {
+                            attempt,
+                            max_attempts,
+                            delay_secs,
+                            status_code,
+                            message,
+                        });
                     }
                     Some(LlmEvent::ToolRequest {
                         name,
