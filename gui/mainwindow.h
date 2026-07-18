@@ -6,6 +6,8 @@
 #include <QPushButton>
 #include <QDialog>
 #include <QLabel>
+#include <QPlainTextEdit>
+#include <QTextOption>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QThread>
