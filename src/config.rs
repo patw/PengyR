@@ -70,6 +70,18 @@ pub struct Config {
     /// Tool execution timeout in seconds. 0 means no timeout.
     #[serde(default = "default_tool_timeout")]
     pub tool_timeout: u64,
+
+    /// Max image dimension in pixels. Images larger than this are downscaled.
+    #[serde(default = "default_image_max_dimension")]
+    pub image_max_dimension: u32,
+
+    /// Max image file size in MB. Images larger are compressed further.
+    #[serde(default = "default_image_max_mb")]
+    pub image_max_mb: f64,
+
+    /// JPEG quality for image compression (0-100).
+    #[serde(default = "default_image_quality")]
+    pub image_quality: u8,
 }
 
 fn default_base_url() -> String {
@@ -101,6 +113,15 @@ fn default_user_agent() -> String {
 fn default_tool_timeout() -> u64 {
     60
 }
+fn default_image_max_dimension() -> u32 {
+    4096
+}
+fn default_image_max_mb() -> f64 {
+    4.5
+}
+fn default_image_quality() -> u8 {
+    85
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -118,6 +139,9 @@ impl Default for Config {
             theme_accent: default_theme_accent(),
             user_agent: default_user_agent(),
             tool_timeout: default_tool_timeout(),
+            image_max_dimension: default_image_max_dimension(),
+            image_max_mb: default_image_max_mb(),
+            image_quality: default_image_quality(),
         }
     }
 }
@@ -314,6 +338,9 @@ mod tests {
         assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 60);
+        assert_eq!(c.image_max_dimension, 4096);
+        assert!((c.image_max_mb - 4.5).abs() < 0.001);
+        assert_eq!(c.image_quality, 85);
         assert_eq!(c.reasoning_effort, "");
         assert!(!c.preserve_reasoning);
         assert_eq!(c.context_keep_turns, 0);
@@ -336,6 +363,9 @@ mod tests {
             theme_accent: "purple".into(),
             user_agent: "TestAgent/1.0".into(),
             tool_timeout: 120,
+            image_max_dimension: 2048,
+            image_max_mb: 3.0,
+            image_quality: 70,
         };
         let json = serde_json::to_string(&c).unwrap();
         let c2: Config = serde_json::from_str(&json).unwrap();
@@ -350,6 +380,9 @@ mod tests {
         assert_eq!(c2.theme_mode, c.theme_mode);
         assert_eq!(c2.theme_accent, c.theme_accent);
         assert_eq!(c2.tool_timeout, c.tool_timeout);
+        assert_eq!(c2.image_max_dimension, c.image_max_dimension);
+        assert!((c2.image_max_mb - c.image_max_mb).abs() < 0.001);
+        assert_eq!(c2.image_quality, c.image_quality);
     }
 
     #[test]
@@ -364,6 +397,7 @@ mod tests {
         assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 60);
+        assert_eq!(c.image_max_dimension, 4096);
     }
 
     #[test]
@@ -376,6 +410,7 @@ mod tests {
         assert_eq!(c.reasoning_effort, d.reasoning_effort);
         assert_eq!(c.preserve_reasoning, d.preserve_reasoning);
         assert_eq!(c.ui_scale, d.ui_scale);
+        assert_eq!(c.image_max_dimension, d.image_max_dimension);
     }
 
     #[test]

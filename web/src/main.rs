@@ -243,6 +243,16 @@ impl WebWorker {
         config: Config,
         sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>,
     ) -> Arc<Self> {
+        let messages = build_messages(&chat, &config);
+        Self::start_with_messages(chat, config, messages, sse_tx)
+    }
+
+    fn start_with_messages(
+        chat: Chat,
+        config: Config,
+        messages: Vec<ChatMessage>,
+        sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>,
+    ) -> Arc<Self> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
@@ -277,7 +287,7 @@ impl WebWorker {
         let mut chat = chat;
 
         tokio::spawn(async move {
-            let messages = build_messages(&chat, &config);
+            let messages = messages;
             let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
             let (confirm_tx, confirm_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -470,24 +480,79 @@ async fn chat_send(
     Path(chat_id): Path<String>,
     Json(data): Json<SendRequest>,
 ) -> impl IntoResponse {
-    let mut content = data.content.unwrap_or_default().trim().to_string();
+    let content = data.content.unwrap_or_default().trim().to_string();
+    let config = config::load_config();
 
-    // Handle file attachments
+    // Handle file attachments — detect images vs text
+    let mut text_blocks = Vec::new();
+    let mut image_parts: Vec<serde_json::Value> = Vec::new();
+    let mut display_parts = Vec::new();
+
     if let Some(files) = &data.files {
-        let mut blocks = Vec::new();
         for f in files {
-            if let Ok(decoded) = base64_decode(&f.data) {
+            let is_image = is_image_filename(&f.name);
+            if is_image {
+                if let Ok(decoded) = base64_decode(&f.data) {
+                    // Write to temp file for preprocessing
+                    let ext = std::path::Path::new(&f.name)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("png");
+                    let tmp = std::env::temp_dir()
+                        .join(format!("pengy_web_{}.{}", uuid::Uuid::new_v4(), ext));
+                    if std::fs::write(&tmp, &decoded).is_ok() {
+                        if let Ok(result) = pengy_core::image_utils::preprocess(
+                            &tmp,
+                            config.image_max_dimension,
+                            config.image_max_mb,
+                            config.image_quality,
+                        ) {
+                            use base64::Engine;
+                            let b64 = base64::engine::general_purpose::STANDARD
+                                .encode(&result.bytes);
+                            image_parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {"url": format!("data:{};base64,{}", result.mime, b64)}
+                            }));
+                            display_parts.push(format!("[Image: {}]", f.name));
+                        }
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                }
+            } else if let Ok(decoded) = base64_decode(&f.data) {
                 if let Ok(text) = String::from_utf8(decoded) {
-                    blocks.push(format!("[File: {}]\n```\n{}\n```", f.name, text));
+                    text_blocks.push(format!("[File: {}]\n```\n{}\n```", f.name, text));
                 }
             }
         }
-        if !blocks.is_empty() {
-            content = format!("{}\n{}", blocks.join("\n\n"), content);
-        }
     }
 
-    if content.is_empty() {
+    // Build display content and API message content
+    let (display_content, api_user_content) = if !image_parts.is_empty() {
+        if !text_blocks.is_empty() {
+            display_parts.push(text_blocks.join("\n\n"));
+        }
+        if !content.is_empty() {
+            display_parts.push(content.clone());
+        }
+        let mut parts = image_parts.clone();
+        if !text_blocks.is_empty() || !content.is_empty() {
+            let combined = if !text_blocks.is_empty() {
+                format!("{}\n{}", text_blocks.join("\n\n"), content)
+            } else {
+                content.clone()
+            };
+            parts.push(serde_json::json!({"type": "text", "text": combined}));
+        }
+        (display_parts.join("\n"), serde_json::Value::Array(parts))
+    } else if !text_blocks.is_empty() {
+        let combined = format!("{}\n{}", text_blocks.join("\n\n"), content);
+        (combined.clone(), serde_json::Value::String(combined))
+    } else {
+        (content.clone(), serde_json::Value::String(content.clone()))
+    };
+
+    if content.is_empty() && text_blocks.is_empty() && image_parts.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Empty message"})),
@@ -515,7 +580,7 @@ async fn chat_send(
 
     chat.messages.push(ChatMessage {
         role: "user".into(),
-        content: Some(serde_json::Value::String(content.clone())),
+        content: Some(serde_json::Value::String(display_content.clone())),
         tool_calls: vec![],
         tool_call_id: None,
         reasoning_content: None,
@@ -524,18 +589,28 @@ async fn chat_send(
     });
 
     if chat.title == "New Chat" {
-        chat.title = if content.len() > 50 {
-            format!("{}...", truncate_on_char_boundary(&content, 47))
+        chat.title = if display_content.len() > 50 {
+            format!("{}...", truncate_on_char_boundary(&display_content, 47))
         } else {
-            content.clone()
+            display_content.clone()
         };
     }
     chat_manager::save_chat(&chat).ok();
 
+    // Build API messages — the last user message gets the real multimodal content
+    let mut api_messages = build_messages(&chat, &config);
+    // Replace the last user message's content with the real API payload
+    for msg in api_messages.iter_mut().rev() {
+        if msg.role == "user" {
+            msg.content = Some(api_user_content.clone());
+            break;
+        }
+    }
+
     let config = config::load_config();
     let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let worker = WebWorker::start(chat.clone(), config, sse_tx);
+    let worker = WebWorker::start_with_messages(chat.clone(), config, api_messages, sse_tx);
     *worker.sse_rx.lock().unwrap() = Some(sse_rx);
 
     state
@@ -1132,6 +1207,16 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|e| e.to_string())
+}
+
+fn is_image_filename(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
 }
 
 // ── Message grouping ─────────────────────────────────────────────
@@ -2050,7 +2135,9 @@ function handleFiles(files) {{
     const reader = new FileReader();
     reader.onload = (e) => {{
       const base64 = e.target.result.split(',')[1];
-      pendingFiles.push({{name: f.name, data: base64}});
+      const mimeMatch = e.target.result.match(/^data:([^;]+);/);
+      const mime = mimeMatch ? mimeMatch[1] : f.type || '';
+      pendingFiles.push({{name: f.name, data: base64, mime: mime}});
       showFilePreview();
     }};
     reader.readAsDataURL(f);

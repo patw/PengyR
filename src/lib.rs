@@ -6,6 +6,7 @@
 
 pub mod chat_manager;
 pub mod config;
+pub mod image_utils;
 pub mod llm_client;
 pub mod task_manager;
 pub mod tools;
@@ -379,6 +380,49 @@ pub extern "C" fn pengy_config_set_dir(path: *const c_char) {
     let p = unsafe { cstr(path) };
     if !p.is_empty() {
         config::set_config_dir(&p);
+    }
+}
+
+// ── Image preprocessing ──────────────────────────────────────────
+
+/// Preprocess an image file for LLM vision API use.
+/// Returns a JSON string: `{"bytes_base64":"...", "mime":"image/jpeg"}` or null on error.
+/// Caller must free with `pengy_free()`.
+#[no_mangle]
+pub extern "C" fn pengy_image_preprocess(
+    path: *const c_char,
+    max_dimension: u32,
+    max_mb: f64,
+    quality: u8,
+) -> *mut c_char {
+    let p = unsafe { cstr(path) };
+    let dim = if max_dimension == 0 {
+        image_utils::DEFAULT_MAX_DIMENSION
+    } else {
+        max_dimension
+    };
+    let mb = if max_mb <= 0.0 {
+        image_utils::DEFAULT_MAX_MB
+    } else {
+        max_mb
+    };
+    let q = if quality == 0 {
+        image_utils::DEFAULT_QUALITY
+    } else {
+        quality
+    };
+
+    match image_utils::preprocess(std::path::Path::new(&p), dim, mb, q) {
+        Ok(result) => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&result.bytes);
+            let json = serde_json::json!({
+                "bytes_base64": b64,
+                "mime": result.mime,
+            });
+            to_c(&json.to_string())
+        }
+        Err(_) => std::ptr::null_mut(),
     }
 }
 

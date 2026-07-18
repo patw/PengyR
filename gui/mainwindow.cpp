@@ -306,32 +306,27 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
 
     // Build the current user message — with image data if present
     if (!images.isEmpty()) {
+        int maxDim = m_config.value("image_max_dimension").toInt(4096);
+        double maxMb = m_config.value("image_max_mb").toDouble(4.5);
+        int quality = m_config.value("image_quality").toInt(85);
+
         QJsonArray contentParts;
         for (const QString& imgPath : images) {
-            QFile imgFile(imgPath);
-            if (imgFile.open(QIODevice::ReadOnly)) {
-                QByteArray imgData = imgFile.readAll();
-                imgFile.close();
-                QString b64 = QString::fromUtf8(imgData.toBase64());
-
-                // Detect MIME type
-                QMimeDatabase mimeDb;
-                QMimeType mime = mimeDb.mimeTypeForFile(imgPath);
-                QString mimeStr = mime.name();
-                if (mimeStr.isEmpty() || !mimeStr.startsWith("image/")) {
-                    // Fall back to extension-based detection
-                    QString ext = imgPath.section('.', -1).toLower();
-                    if (ext == "jpg" || ext == "jpeg") mimeStr = "image/jpeg";
-                    else if (ext == "png") mimeStr = "image/png";
-                    else if (ext == "gif") mimeStr = "image/gif";
-                    else if (ext == "webp") mimeStr = "image/webp";
-                    else mimeStr = "image/jpeg"; // fallback
-                }
+            char* result = pengy_image_preprocess(
+                imgPath.toUtf8().constData(),
+                static_cast<unsigned int>(maxDim),
+                maxMb,
+                static_cast<unsigned char>(quality));
+            if (result) {
+                QJsonObject preprocessed = QJsonDocument::fromJson(QByteArray(result)).object();
+                pengy_free(result);
+                QString b64 = preprocessed["bytes_base64"].toString();
+                QString mime = preprocessed["mime"].toString("image/jpeg");
 
                 QJsonObject imgPart;
                 imgPart["type"] = "image_url";
                 QJsonObject imgUrlObj;
-                imgUrlObj["url"] = QString("data:%1;base64,%2").arg(mimeStr, b64);
+                imgUrlObj["url"] = QString("data:%1;base64,%2").arg(mime, b64);
                 imgPart["image_url"] = imgUrlObj;
                 contentParts.append(imgPart);
             }
