@@ -499,7 +499,7 @@ async fn chat_send(
                         .and_then(|e| e.to_str())
                         .unwrap_or("png");
                     let tmp = std::env::temp_dir()
-                        .join(format!("pengy_web_{}.{}", uuid::Uuid::new_v4(), ext));
+                        .join(format!("pengy_web_{}.{}", std::process::id(), ext));
                     if std::fs::write(&tmp, &decoded).is_ok() {
                         if let Ok(result) = pengy_core::image_utils::preprocess(
                             &tmp,
