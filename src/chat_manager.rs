@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 use std::{fs, io};
 
 const CHATS_FILE: &str = "chats.json";
@@ -93,10 +95,62 @@ fn chats_path() -> PathBuf {
     p
 }
 
-/// Load all chat sessions from disk.
-pub fn load_chats() -> Vec<Chat> {
+// ---------------------------------------------------------------------------
+// in-memory cache
+// ---------------------------------------------------------------------------
+// chats.json is a single (potentially large) file that was fully re-parsed on
+// every read: the GUI loads the list, then `get_chat` re-loads it; `save_chat`
+// loads it again before writing. We cache the parsed Vec keyed by the file's
+// (mtime, size). Any external writer (the CLI, or the Python/C++ editions
+// sharing ~/.config/pengy/) bumps mtime and transparently invalidates us.
+struct ChatCache {
+    key: Option<(u128, u64)>, // (mtime nanos since epoch, size)
+    chats: Vec<Chat>,
+}
+
+static CHAT_CACHE: LazyLock<Mutex<ChatCache>> = LazyLock::new(|| {
+    Mutex::new(ChatCache {
+        key: None,
+        chats: Vec::new(),
+    })
+});
+
+fn stat_key(path: &std::path::Path) -> Option<(u128, u64)> {
+    let md = fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((mtime, md.len()))
+}
+
+/// Drop the in-memory chats cache (forces a re-read on the next load).
+pub fn invalidate_cache() {
+    if let Ok(mut c) = CHAT_CACHE.lock() {
+        c.key = None;
+        c.chats = Vec::new();
+    }
+}
+
+/// Run `f` against the cached chat list without cloning the whole Vec.
+///
+/// This is the cheap path for lookups like [`get_chat`], which previously
+/// parsed the entire file just to return one chat.
+fn with_chats<R>(f: impl FnOnce(&[Chat]) -> R) -> R {
     let path = chats_path();
-    match fs::read_to_string(&path) {
+    let mut cache = match CHAT_CACHE.lock() {
+        Ok(c) => c,
+        Err(p) => p.into_inner(), // a poisoned lock still holds usable data
+    };
+
+    let key = stat_key(&path);
+    if key.is_some() && key == cache.key {
+        return f(&cache.chats);
+    }
+
+    let chats = match fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<Vec<Chat>>(&text) {
             Ok(chats) => chats,
             Err(_) => {
@@ -105,7 +159,16 @@ pub fn load_chats() -> Vec<Chat> {
             }
         },
         Err(_) => Vec::new(),
-    }
+    };
+    cache.chats = chats;
+    // Re-stat: backup_corrupt_file may have moved the file aside.
+    cache.key = stat_key(&path);
+    f(&cache.chats)
+}
+
+/// Load all chat sessions from disk.
+pub fn load_chats() -> Vec<Chat> {
+    with_chats(|chats| chats.to_vec())
 }
 
 /// Save all chat sessions to disk atomically.
@@ -119,6 +182,13 @@ pub fn save_chats(chats: &[Chat]) -> io::Result<()> {
     tmp.set_extension("tmp");
     fs::write(&tmp, &json)?;
     fs::rename(&tmp, &path)?;
+
+    // Prime the cache with what we just wrote so the next load (e.g. the
+    // load->mutate->save cycle in `save_chat`) skips a re-parse.
+    if let Ok(mut cache) = CHAT_CACHE.lock() {
+        cache.chats = chats.to_vec();
+        cache.key = stat_key(&path);
+    }
     Ok(())
 }
 
@@ -151,7 +221,8 @@ pub fn save_chat(chat: &Chat) -> io::Result<()> {
 
 /// Get a chat by ID.
 pub fn get_chat(chat_id: &str) -> Option<Chat> {
-    load_chats().into_iter().find(|c| c.id == chat_id)
+    // Clone just the one chat, not the whole list.
+    with_chats(|chats| chats.iter().find(|c| c.id == chat_id).cloned())
 }
 
 /// Clean dangling tool calls so the message list is valid for the API.

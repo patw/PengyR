@@ -1625,29 +1625,38 @@ fn render_table(lines: &[String]) -> String {
     html
 }
 
+// Compiled once. `inline_markdown` runs for every heading, paragraph, list item
+// and table cell, so building these per call recompiled five regexes thousands
+// of times when rendering a long chat.
+static IMG_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+static CODE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"`([^`]+)`").unwrap());
+static BOLD_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap());
+static ITALIC_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\*([^*]+)\*").unwrap());
+static LINK_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+
 fn inline_markdown(text: &str) -> String {
     let escaped = escape_html(text);
     let mut result = escaped;
 
     // Images — must come before link regex so ![alt](url) isn't partially matched
-    let img_re = regex::Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap();
-    result = img_re
+    result = IMG_RE
         .replace_all(&result, r#"<img src="$2" alt="$1">"#)
         .to_string();
 
-    let code_re = regex::Regex::new(r"`([^`]+)`").unwrap();
-    result = code_re.replace_all(&result, "<code>$1</code>").to_string();
+    result = CODE_RE.replace_all(&result, "<code>$1</code>").to_string();
 
-    let bold_re = regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap();
-    result = bold_re
+    result = BOLD_RE
         .replace_all(&result, "<strong>$1</strong>")
         .to_string();
 
-    let italic_re = regex::Regex::new(r"\*([^*]+)\*").unwrap();
-    result = italic_re.replace_all(&result, "<em>$1</em>").to_string();
+    result = ITALIC_RE.replace_all(&result, "<em>$1</em>").to_string();
 
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap();
-    result = link_re
+    result = LINK_RE
         .replace_all(&result, r#"<a href="$2">$1</a>"#)
         .to_string();
 
@@ -1670,8 +1679,11 @@ fn percent_encode_path(path: &str) -> String {
 /// Replace ``file://`` image URLs with ``/files?path=`` URLs that browsers
 /// can load.  Browsers block ``file://`` from HTTP pages as a security
 /// restriction.
+static FILE_URL_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"src="file://([^"]+)""#).unwrap());
+
 fn fix_file_urls(html: &str) -> String {
-    let re = regex::Regex::new(r#"src="file://([^"]+)""#).unwrap();
+    let re: &regex::Regex = &FILE_URL_RE;
     re.replace_all(html, |caps: &regex::Captures| {
         let path = &caps[1];
         // Expand ~ to the user's home directory

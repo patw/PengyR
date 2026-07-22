@@ -192,7 +192,7 @@ void MainWindow::loadChat(const QString& chatId) {
         QJsonObject msg = v.toObject();
         QString role = msg["role"].toString();
         if (role == "user") {
-            m_chatView->appendMessageText("user", msg["content"].toString());
+            m_chatView->appendMessageText("user", msg["content"].toString(), false);
         } else if (role == "assistant") {
             QJsonArray toolCalls = msg["tool_calls"].toArray();
             if (!toolCalls.isEmpty()) {
@@ -205,7 +205,7 @@ void MainWindow::loadChat(const QString& chatId) {
                     req["tool_call_id"] = tcObj["id"];
                     req["name"] = fn["name"];
                     req["args"] = args;
-                    m_chatView->appendMessage("tool_request", req);
+                    m_chatView->appendMessage("tool_request", req, false);
                 }
                 if (!msg["content"].toString().isEmpty()) {
                     QJsonObject display;
@@ -215,7 +215,7 @@ void MainWindow::loadChat(const QString& chatId) {
                         display["reasoning_content"] = msg["reasoning_content"];
                     else if (msg.contains("reasoning"))
                         display["reasoning_content"] = msg["reasoning"];
-                    m_chatView->appendMessage("assistant", display);
+                    m_chatView->appendMessage("assistant", display, false);
                 }
             } else if (!msg["content"].toString().isEmpty()) {
                 QJsonObject display;
@@ -225,16 +225,19 @@ void MainWindow::loadChat(const QString& chatId) {
                     display["reasoning_content"] = msg["reasoning_content"];
                 else if (msg.contains("reasoning"))
                     display["reasoning_content"] = msg["reasoning"];
-                m_chatView->appendMessage("assistant", display);
+                m_chatView->appendMessage("assistant", display, false);
             }
         } else if (role == "tool") {
             QJsonObject result;
             result["tool_call_id"] = msg["tool_call_id"];
             result["content"] = msg["content"];
             result["declined"] = false;
-            m_chatView->appendMessage("tool_result", result);
+            m_chatView->appendMessage("tool_result", result, false);
         }
     }
+
+    // Render once after the batch: appending with render=true is O(n^2).
+    m_chatView->renderNow();
 }
 
 void MainWindow::sendMessage(const QString& text, const QStringList& images) {
