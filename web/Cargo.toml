@@ -1,6 +1,6 @@
 [package]
 name = "pengy-web"
-version = "1.3.14"
+version = "1.4.1"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
 description = "Pengy Web UI — browser-based interface"
