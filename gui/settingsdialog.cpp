@@ -142,11 +142,18 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     for (int i = 0; i < m_themeAccent->count(); ++i) if (m_themeAccent->itemData(i).toString() == ta) m_themeAccent->setCurrentIndex(i);
     form->addRow("Accent color:", m_themeAccent);
 
+    m_llmTimeout = new QSpinBox;
+    m_llmTimeout->setRange(1, 3600);
+    m_llmTimeout->setSuffix(" sec");
+    m_llmTimeout->setToolTip("HTTP timeout for each LLM API request");
+    m_llmTimeout->setValue(config["llm_timeout"].toInt(300));
+    form->addRow("LLM timeout:", m_llmTimeout);
+
     m_toolTimeout = new QSpinBox;
     m_toolTimeout->setRange(-1, 3600);
     m_toolTimeout->setSpecialValueText("No timeout");
     m_toolTimeout->setSuffix(" sec");
-    m_toolTimeout->setValue(config["tool_timeout"].toInt(60));
+    m_toolTimeout->setValue(config["tool_timeout"].toInt(300));
     form->addRow("Tool timeout:", m_toolTimeout);
 
     layout->addLayout(form);
@@ -166,6 +173,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["ui_scale"] = m_uiScale->currentData().toInt();
         m_config["theme_mode"] = m_themeMode->currentData().toString();
         m_config["theme_accent"] = m_themeAccent->currentData().toString();
+        m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();
         accept();
     });

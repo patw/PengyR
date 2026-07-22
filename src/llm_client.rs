@@ -137,11 +137,15 @@ pub async fn chat(
     tool_confirmation: ToolConfirmation,
     reasoning_effort: &str,
     preserve_reasoning: bool,
+    llm_timeout: u64,
     event_tx: mpsc::UnboundedSender<LlmEvent>,
     mut confirm_rx: mpsc::UnboundedReceiver<Confirmation>,
     cancel: Arc<AtomicBool>,
 ) {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(llm_timeout))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/chat/completions");
 
@@ -713,6 +717,7 @@ mod loop_tests {
                 mode,
                 &effort,
                 preserve_reasoning,
+                300,
                 event_tx,
                 confirm_rx,
                 cancel,

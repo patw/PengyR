@@ -296,11 +296,12 @@ impl PengyCli {
         let md = self.config.model.clone();
         let re = self.config.reasoning_effort.clone();
         let pr = self.config.preserve_reasoning;
+        let lt = self.config.llm_timeout;
         let cancel2 = cancel.clone();
 
         self.rt.spawn(async move {
             llm_client::chat(
-                &bu, &ak, &md, messages, tc_mode, &re, pr, event_tx, confirm_rx, cancel2,
+                &bu, &ak, &md, messages, tc_mode, &re, pr, lt, event_tx, confirm_rx, cancel2,
             )
             .await;
         });
@@ -565,6 +566,7 @@ impl PengyCli {
             "/yolo" => self.cmd_yolo(args),
             "/baseurl" => self.cmd_baseurl(args),
             "/apikey" => self.cmd_apikey(args),
+            "/llm-timeout" => self.cmd_llm_timeout(args),
             "/timeout" => self.cmd_timeout(args),
             "/agent" => self.cmd_agent(args),
             "/context-keep" => self.cmd_context_keep(args),
@@ -593,6 +595,7 @@ impl PengyCli {
             ("/models", "Fetch available models from the endpoint"),
             ("/baseurl <url>", "Set the API base URL"),
             ("/apikey <key>", "Set the API key"),
+            ("/llm-timeout <sec>", "Set LLM API request timeout in seconds"),
             ("/timeout <sec>", "Set tool execution timeout in seconds"),
             ("/agent <string>", "Set the user agent string"),
             ("/context-keep <n>", "Set how many recent turns to keep"),
@@ -825,6 +828,10 @@ impl PengyCli {
         println!(
             "  {}Context Keep Turns:{} {}",
             CYAN, RESET, self.config.context_keep_turns
+        );
+        println!(
+            "  {}LLM Timeout:{} {}s",
+            CYAN, RESET, self.config.llm_timeout
         );
         println!(
             "  {}Tool Timeout:{} {}s",
@@ -1093,10 +1100,33 @@ impl PengyCli {
         println!("{}API key updated.{}", GREEN, RESET);
     }
 
+    fn cmd_llm_timeout(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            println!(
+                "{}Current LLM timeout:{} {}s",
+                DIM, RESET, self.config.llm_timeout
+            );
+            println!("{}Usage: /llm-timeout <seconds>{}", DIM, RESET);
+            return;
+        }
+        match args[0].parse::<u64>() {
+            Ok(secs) if secs >= 1 => {
+                let old = self.config.llm_timeout;
+                self.config.llm_timeout = secs;
+                self.save_config();
+                println!(
+                    "{}LLM timeout changed:{} {}s -> {}{}s{}",
+                    GREEN, RESET, old, BOLD, secs, RESET
+                );
+            }
+            _ => println!("{}Invalid number. Usage: /llm-timeout <seconds>{}", RED, RESET),
+        }
+    }
+
     fn cmd_timeout(&mut self, args: &[&str]) {
         if args.is_empty() {
             println!(
-                "{}Current timeout:{} {}s",
+                "{}Current tool timeout:{} {}s",
                 DIM, RESET, self.config.tool_timeout
             );
             println!("{}Usage: /timeout <seconds>{}", DIM, RESET);
@@ -1109,7 +1139,7 @@ impl PengyCli {
                 self.save_config();
                 *tools::TOOL_TIMEOUT.lock().unwrap() = secs;
                 println!(
-                    "{}Timeout changed:{} {}s -> {}{}s{}",
+                    "{}Tool timeout changed:{} {}s -> {}{}s{}",
                     GREEN, RESET, old, BOLD, secs, RESET
                 );
             }

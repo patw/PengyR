@@ -259,7 +259,7 @@ pub extern "C" fn pengy_llm_chat_run(
     let cancel2 = cancel.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
-            &bu, &ak, &md, messages, tc_mode, &re_str, preserve_reasoning, event_tx, confirm_rx, cancel2,
+            &bu, &ak, &md, messages, tc_mode, &re_str, preserve_reasoning, 300, event_tx, confirm_rx, cancel2,
         )
         .await;
     }));

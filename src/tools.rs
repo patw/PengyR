@@ -18,7 +18,7 @@ pub static SUDO_PASSWORD_PROVIDER: Mutex<Option<Box<dyn Fn() -> Option<String> +
     Mutex::new(None);
 
 pub static CACHED_SUDO_PASSWORD: Mutex<Option<String>> = Mutex::new(None);
-pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(60);
+pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
 
 static ACTIVE_PROCESS_GROUPS: once_cell::sync::Lazy<Mutex<HashSet<u32>>> =

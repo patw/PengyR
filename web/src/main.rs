@@ -10,6 +10,7 @@ use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
 use futures_util::stream::Stream;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -296,11 +297,12 @@ impl WebWorker {
             let md = config.model.clone();
             let re = config.reasoning_effort.clone();
             let pr = config.preserve_reasoning;
+            let lt = config.llm_timeout;
             let cancel2 = cancel.clone();
 
             tokio::spawn(async move {
                 llm_client::chat(
-                    &bu, &ak, &md, messages, tc_mode, &re, pr, event_tx, confirm_rx, cancel2,
+                    &bu, &ak, &md, messages, tc_mode, &re, pr, lt, event_tx, confirm_rx, cancel2,
                 )
                 .await;
             });
@@ -451,7 +453,7 @@ async fn new_chat() -> impl IntoResponse {
     Redirect::to(&format!("/chat/{}", chat.id))
 }
 
-async fn chat_view(Path(chat_id): Path<String>) -> impl IntoResponse {
+async fn chat_view(Path(chat_id): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
     let chat = match chat_manager::get_chat(&chat_id) {
         Some(c) => c,
         None => return Redirect::to("/").into_response(),
@@ -459,8 +461,9 @@ async fn chat_view(Path(chat_id): Path<String>) -> impl IntoResponse {
     let chats = chat_manager::load_chats();
     let config = config::load_config();
     let turns = group_messages(&chat.messages);
+    let has_active_worker = state.workers.lock().unwrap().contains_key(&chat_id);
 
-    Html(templates::chat_page(&chat, &chats, &config, &turns)).into_response()
+    Html(templates::chat_page(&chat, &chats, &config, &turns, has_active_worker)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -646,7 +649,10 @@ fn async_stream(
     workers: Arc<Mutex<HashMap<String, Arc<WebWorker>>>>,
     chat_id: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    futures_util::stream::unfold((sse_rx, false), move |(mut rx, done)| {
+    // Send retry:1000 first so browsers reconnect in 1s instead of default 3s
+    let retry_event = Ok(Event::default().retry(std::time::Duration::from_millis(1000)));
+    let retry_stream = futures_util::stream::once(async move { retry_event });
+    let main_stream = futures_util::stream::unfold((sse_rx, false), move |(mut rx, done)| {
         let workers = workers.clone();
         let chat_id = chat_id.clone();
         async move {
@@ -678,7 +684,9 @@ fn async_stream(
                 }
             }
         }
-    })
+    });
+
+    retry_stream.chain(main_stream)
 }
 
 #[derive(Deserialize)]
@@ -1146,6 +1154,7 @@ struct SettingsForm {
     tool_confirmation: Option<String>,
     reasoning_effort: Option<String>,
     preserve_reasoning: Option<String>,
+    llm_timeout: Option<String>,
     tool_timeout: Option<String>,
     context_keep_turns: Option<String>,
 }
@@ -1183,6 +1192,11 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
         }
     }
     config.preserve_reasoning = form.preserve_reasoning.is_some();
+    if let Some(v) = &form.llm_timeout {
+        if let Ok(n) = v.parse::<u64>() {
+            config.llm_timeout = n.max(1);
+        }
+    }
     if let Some(v) = &form.tool_timeout {
         if let Ok(n) = v.parse::<u64>() {
             config.tool_timeout = n.max(1);
@@ -1886,7 +1900,7 @@ mod templates {
         html
     }
 
-    pub fn chat_page(chat: &Chat, chats: &[Chat], config: &Config, turns: &[Turn]) -> String {
+    pub fn chat_page(chat: &Chat, chats: &[Chat], config: &Config, turns: &[Turn], has_active_worker: bool) -> String {
         let sidebar = render_sidebar_chats(chats, &chat.id);
 
         let tc_badge = match config.tool_confirmation.as_str() {
@@ -2083,12 +2097,14 @@ mod templates {
             r##"<script>
 const CHAT_ID = {chat_id_json};
 const CHAT_TITLE = {chat_title_json};
+const HAS_ACTIVE_WORKER = {has_active_worker};
 let isProcessing = false;
 let eventSource = null;
 let pendingToolCallId = null;
 let thinkingEl = null;
 let confirmModal, sudoModal, renameModal;
 let pendingFiles = [];
+let wakeLock = null;
 
 document.addEventListener('DOMContentLoaded', () => {{
   scrollToBottom();
@@ -2105,6 +2121,36 @@ document.addEventListener('DOMContentLoaded', () => {{
   }});
   document.getElementById('stopBtn').addEventListener('click', stopGeneration);
   document.getElementById('navTitle').addEventListener('dblclick', showRename);
+
+  // ── Mobile resilience: visibility & bfcache ───────────────────
+  document.addEventListener('visibilitychange', () => {{
+    if (document.visibilityState === 'visible' && isProcessing) {{
+      acquireWakeLock();
+      if (!eventSource || eventSource.readyState !== EventSource.OPEN) {{
+        openSSE();
+      }}
+    }}
+  }});
+  window.addEventListener('pageshow', (event) => {{
+    if (event.persisted && isProcessing) {{
+      acquireWakeLock();
+      if (!eventSource || eventSource.readyState !== EventSource.OPEN) {{
+        openSSE();
+      }}
+    }}
+  }});
+  const draft = sessionStorage.getItem('pengy_draft_' + CHAT_ID);
+  if (draft) {{
+    document.getElementById('messageInput').value = draft;
+    sessionStorage.removeItem('pengy_draft_' + CHAT_ID);
+  }}
+
+  // Auto-resume SSE if page loaded with active worker
+  if (HAS_ACTIVE_WORKER) {{
+    setProcessing(true);
+    showThinking();
+    openSSE();
+  }}
 }});
 
 function scrollToBottom() {{
@@ -2127,6 +2173,11 @@ function setProcessing(val) {{
   document.getElementById('messageInput').disabled = val;
   document.getElementById('sendBtn').disabled = val;
   document.getElementById('stopBtn').classList.toggle('d-none', !val);
+  if (val) {{
+    acquireWakeLock();
+  }} else {{
+    releaseWakeLock();
+  }}
   if (!val) document.getElementById('messageInput').focus();
 }}
 
@@ -2350,9 +2401,19 @@ function openSSE() {{
   eventSource = new EventSource(`/chat/${{CHAT_ID}}/stream`);
   eventSource.onmessage = e => handleEvent(JSON.parse(e.data));
   eventSource.onerror = () => {{
-    eventSource.close(); eventSource = null;
-    hideThinking();
-    setProcessing(false);
+    // Don't close immediately — EventSource auto-reconnects. Only act
+    // if CLOSED (non-retryable HTTP status), then reload to sync.
+    if (eventSource && eventSource.readyState === EventSource.CLOSED) {{
+      eventSource.close();
+      eventSource = null;
+      if (isProcessing) {{
+        reloadToSync();
+      }} else {{
+        hideThinking();
+        setProcessing(false);
+      }}
+    }}
+    // If CONNECTING, let the browser auto-reconnect.
   }};
 }}
 
@@ -2389,6 +2450,15 @@ function handleEvent(data) {{
       break;
     case 'error':
       hideThinking();
+      if (data.message === 'No active task') {{
+        if (eventSource) {{ eventSource.close(); eventSource = null; }}
+        if (isProcessing) {{
+          reloadToSync();
+        }} else {{
+          setProcessing(false);
+        }}
+        return;
+      }}
       appendError(data.message || 'Unknown error');
       if (eventSource) {{ eventSource.close(); eventSource = null; }}
       setProcessing(false);
@@ -2639,6 +2709,11 @@ function submitSudo(override) {{
         <div class="form-text">Keeps reasoning_content/reasoning/reasoning_details when providers return them.</div>
       </div>
       <div class="mb-3">
+        <label class="form-label fw-semibold">LLM Timeout (seconds)</label>
+        <input type="number" name="llm_timeout" class="form-control" value="{llm_timeout}" min="1" max="3600">
+        <div class="form-text">HTTP timeout for each LLM API request</div>
+      </div>
+      <div class="mb-3">
         <label class="form-label fw-semibold">Tool Timeout (seconds)</label>
         <input type="number" name="tool_timeout" class="form-control" value="{tool_timeout}" min="1" max="3600">
       </div>
@@ -2703,6 +2778,7 @@ async function fetchModels() {{
 </script>"##,
             base_url = escape_html(&config.base_url),
             model = escape_html(&config.model),
+            llm_timeout = config.llm_timeout,
             tool_timeout = config.tool_timeout,
             context_keep_turns = config.context_keep_turns,
             user_agent = escape_html(&config.user_agent),
