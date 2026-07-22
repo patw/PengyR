@@ -26,14 +26,8 @@ jobs:
       - name: Check Rust workspace (fast, no codegen)
         run: cargo check --workspace
 
-      - name: Build Rust workspace (debug, for tests)
-        run: cargo build --workspace
-
-      - name: Run Rust tests
-        run: cargo test
-
-      - name: Build Rust workspace (release, no LTO)
-        run: cargo build --release --workspace
+      - name: Build & test Rust workspace (ci profile — release without LTO)
+        run: cargo test --profile ci --workspace
 
       - name: Build GUI
         run: |
@@ -44,4 +38,4 @@ jobs:
 
       - name: Verify
         run: |
-          ls -lh gui/build/pengy target/release/pengy-cli target/release/pengy-web
+          ls -lh gui/build/pengy target/ci/pengy-cli target/ci/pengy-web
