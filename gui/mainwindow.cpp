@@ -279,7 +279,6 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     // Save
     QByteArray chatJson = QJsonDocument(m_currentChat).toJson(QJsonDocument::Compact);
     pengy_chat_save(chatJson.constData());
-    loadChatList();
 
     m_stopBtn->show();
 
@@ -434,7 +433,6 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
 
             QByteArray chatJson = QJsonDocument(m_currentChat).toJson(QJsonDocument::Compact);
             pengy_chat_save(chatJson.constData());
-            loadChatList();
         }
 
         m_chatHistory->setThinking(false);

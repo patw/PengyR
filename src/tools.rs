@@ -48,6 +48,22 @@ pub struct ParametersDef {
     pub required: Vec<String>,
 }
 
+use std::sync::LazyLock;
+
+// Cached serde_json::Value of the tool definitions — built once, reused on
+// every API call. Avoids constructing 11 ToolDef structs + serializing them
+// to JSON on every request. Cloning a Value::Array is much cheaper than the
+// struct construction + serialization it replaces.
+static TOOLS_JSON: LazyLock<serde_json::Value> =
+    LazyLock::new(|| serde_json::to_value(tool_definitions()).unwrap());
+
+/// Pre-serialized tool definitions as a JSON value (cached).
+/// Use this in the LLM loop instead of `tool_definitions()` to avoid
+/// per-request allocation.
+pub fn tool_definitions_json() -> serde_json::Value {
+    TOOLS_JSON.clone()
+}
+
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         td("read_file", "Read the contents of a file",
@@ -390,11 +406,14 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
 /// Rewrite the first word-boundary `sudo` that isn't already followed by
 /// `-S` into `sudo -S`. Mirrors the reference's
 /// `re.sub(r'\bsudo\b(?!\s+-S)', 'sudo -S', command, count=1)`.
+static SUDO_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bsudo\b").unwrap());
+static SUDO_DASH_S_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-S").unwrap());
+static SUDO_PROMPT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\[sudo[^]]*\].*\n?").unwrap());
+
 fn rewrite_first_sudo(command: &str) -> String {
-    let sudo_word = Regex::new(r"\bsudo\b").unwrap();
-    let followed_by_s = Regex::new(r"^\s+-S").unwrap();
-    for m in sudo_word.find_iter(command) {
-        if !followed_by_s.is_match(&command[m.end()..]) {
+    for m in SUDO_WORD_RE.find_iter(command) {
+        if !SUDO_DASH_S_RE.is_match(&command[m.end()..]) {
             return format!("{}sudo -S{}", &command[..m.start()], &command[m.end()..]);
         }
     }
@@ -404,7 +423,7 @@ fn rewrite_first_sudo(command: &str) -> String {
 async fn run_bash(command: String) -> String {
     let timeout = timeout_secs();
 
-    let password_needed = Regex::new(r"\bsudo\b").unwrap().is_match(&command);
+    let password_needed = SUDO_WORD_RE.is_match(&command);
     if password_needed {
         let need_pw = { CACHED_SUDO_PASSWORD.lock().unwrap().is_none() };
         if need_pw {
@@ -499,8 +518,7 @@ async fn run_bash(command: String) -> String {
         let mut out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
-            let err = Regex::new(r"^\[sudo[^]]*\].*\n?")
-                .unwrap()
+            let err = SUDO_PROMPT_RE
                 .replace_all(&err, "")
                 .to_string();
             if !err.is_empty() {
@@ -1365,9 +1383,11 @@ async fn fetch_url(url_str: String) -> String {
     };
 
     let text = String::from_utf8_lossy(&raw).to_string();
+    // Single lowercase allocation instead of two (saves up to 4MB for a 2MB page)
+    let text_lower = text.to_ascii_lowercase();
     let is_html = content_type.contains("html")
-        || text.to_lowercase().contains("<html")
-        || text.to_lowercase().contains("<!doctype");
+        || text_lower.contains("<html")
+        || text_lower.contains("<!doctype");
 
     let text = if is_html {
         let document = scraper::Html::parse_document(&text);
@@ -1380,8 +1400,8 @@ async fn fetch_url(url_str: String) -> String {
         } else {
             document.root_element().text().collect::<String>()
         };
-        Regex::new(r"\n{3,}")
-            .unwrap()
+        static NEWLINE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
+        NEWLINE_RE
             .replace_all(&body_text, "\n\n")
             .trim()
             .to_string()
@@ -2023,9 +2043,17 @@ fn is_likely_text(path: &Path) -> bool {
     false
 }
 
+static GLOB_BRACE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(.*)\{([^}]+)\}(.*)$").unwrap());
+
+// Cache compiled glob regexes — the glob is constant for an entire
+// search_content call, so this avoids recompiling per file.
+static GLOB_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 fn matches_glob(name: &str, glob: &str) -> bool {
     // Handle brace expansion like *.{js,ts}
-    if let Some(caps) = Regex::new(r"^(.*)\{([^}]+)\}(.*)$").unwrap().captures(glob) {
+    if let Some(caps) = GLOB_BRACE_RE.captures(glob) {
         let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let choices = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
@@ -2041,13 +2069,25 @@ fn matches_glob(name: &str, glob: &str) -> bool {
 }
 
 fn simple_glob_match(name: &str, pattern: &str) -> bool {
-    let pattern = pattern
+    // Check the cache first — avoids recompiling the same glob pattern
+    // for every file in a search_content directory walk.
+    {
+        let cache = GLOB_CACHE.lock().unwrap();
+        if let Some(re) = cache.get(pattern) {
+            return re.is_match(name);
+        }
+    }
+    let escaped = pattern
         .replace('.', "\\.")
         .replace('*', ".*")
         .replace('?', ".");
-    Regex::new(&format!("^{pattern}$"))
-        .map(|re| re.is_match(name))
-        .unwrap_or(false)
+    let re = match Regex::new(&format!("^{escaped}$")) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let result = re.is_match(name);
+    GLOB_CACHE.lock().unwrap().insert(pattern.to_string(), re);
+    result
 }
 
 #[cfg(test)]
@@ -2133,6 +2173,21 @@ mod tests {
     #[test]
     fn tool_definitions_has_eleven_tools() {
         assert_eq!(tool_definitions().len(), 11);
+    }
+
+    #[test]
+    fn tool_definitions_json_has_eleven_tools() {
+        let json = tool_definitions_json();
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn tool_definitions_json_matches_struct() {
+        let from_struct: serde_json::Value =
+            serde_json::to_value(tool_definitions()).unwrap();
+        let from_cache = tool_definitions_json();
+        assert_eq!(from_struct, from_cache);
     }
 
     #[test]

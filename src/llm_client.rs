@@ -167,7 +167,7 @@ pub async fn chat(
         let mut payload = serde_json::json!({
             "model": model,
             "messages": current_messages,
-            "tools": tools::tool_definitions(),
+            "tools": tools::tool_definitions_json(),
             "tool_choice": "auto",
         });
         if !reasoning_effort.is_empty() {
