@@ -4,6 +4,11 @@ use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::tools;
 
 use rustyline::{Editor, history::FileHistory};
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{Context, Helper};
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -20,6 +25,106 @@ const CYAN: &str = "\x1b[36m";
 const BLUE: &str = "\x1b[34m";
 const MAX_PANEL_WIDTH: usize = 140;
 const MIN_PANEL_WIDTH: usize = 60;
+
+// ── Slash command completion ──────────────────────────────────
+
+/// Every slash command the REPL dispatches, for tab completion.
+const SLASH_COMMANDS: &[&str] = &[
+    "/help", "/new", "/show", "/tail", "/rename", "/clear", "/export",
+    "/yolo", "/config", "/model", "/models", "/list", "/load", "/baseurl",
+    "/apikey", "/llm-timeout", "/timeout", "/agent", "/context-keep",
+    "/system", "/delete", "/attach", "/compact", "/quit", "/exit", "/q",
+];
+
+/// Sub-arguments worth completing once the command is fully typed.
+const SLASH_ARGS: &[(&str, &[&str])] = &[
+    ("/yolo", &["all", "safe", "none"]),
+];
+
+#[derive(Clone)]
+struct PengyHelper;
+
+impl Helper for PengyHelper {}
+
+impl Completer for PengyHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let line_up_to_cursor = &line[..pos];
+        let stripped = line_up_to_cursor.trim_start();
+
+        // Only engage on lines starting with "/"
+        if !stripped.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+
+        let parts: Vec<&str> = stripped.split_whitespace().collect();
+        let completing_arg = parts.len() > 1
+            || (parts.len() == 1 && line_up_to_cursor.ends_with(' ') && !stripped.ends_with(' '));
+
+        let cursor_word = if line_up_to_cursor.ends_with(' ') {
+            ""
+        } else {
+            parts.last().copied().unwrap_or("")
+        };
+
+        if completing_arg {
+            // Complete arguments for known commands
+            for (cmd, args) in SLASH_ARGS {
+                if parts[0].eq_ignore_ascii_case(cmd) {
+                    let matches: Vec<Pair> = args
+                        .iter()
+                        .filter(|a| a.starts_with(cursor_word))
+                        .map(|a| Pair { display: a.to_string(), replacement: a.to_string() })
+                        .collect();
+                    let start = pos.saturating_sub(cursor_word.len());
+                    return Ok((start, matches));
+                }
+            }
+            return Ok((0, vec![]));
+        }
+
+        // Complete command names
+        let matches: Vec<Pair> = SLASH_COMMANDS
+            .iter()
+            .filter(|c| c.starts_with(cursor_word))
+            .map(|c| Pair { display: c.to_string(), replacement: c.to_string() })
+            .collect();
+        let start = pos.saturating_sub(cursor_word.len());
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for PengyHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for PengyHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        std::borrow::Cow::Borrowed(prompt)
+    }
+}
+
+impl Validator for PengyHelper {
+    fn validate(
+        &self,
+        _ctx: &mut rustyline::validate::ValidationContext,
+    ) -> rustyline::Result<rustyline::validate::ValidationResult> {
+        Ok(rustyline::validate::ValidationResult::Valid(None))
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -106,7 +211,7 @@ struct PengyCli {
     yolo_this_turn: bool,
     output_mode: String,
     rt: tokio::runtime::Runtime,
-    rl: Editor<(), FileHistory>,
+    rl: Editor<PengyHelper, FileHistory>,
     hist_path: std::path::PathBuf,
 }
 
@@ -130,7 +235,8 @@ impl PengyCli {
             let _ = std::fs::create_dir_all(dir);
         }
 
-        let mut rl: Editor<(), FileHistory> = Editor::new().expect("rustyline editor");
+        let mut rl: Editor<PengyHelper, FileHistory> = Editor::new().expect("rustyline editor");
+        rl.set_helper(Some(PengyHelper));
         let _ = rl.load_history(&hist_path);
 
         Self {
@@ -1013,6 +1119,21 @@ impl PengyCli {
 
         let target = &chats[idx];
         let title = target.title.clone();
+
+        // Deletion is immediate and unrecoverable; a mistyped index shouldn't
+        // silently destroy a chat.
+        print!(
+            "{}Delete \"{}\"? This cannot be undone. [y/N] {}",
+            YELLOW, title, RESET
+        );
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok();
+        if !answer.trim().eq_ignore_ascii_case("y") && !answer.trim().eq_ignore_ascii_case("yes") {
+            println!("{}Cancelled.{}", DIM, RESET);
+            return;
+        }
+
         let is_current = self
             .current_chat
             .as_ref()
@@ -1256,11 +1377,13 @@ impl PengyCli {
 
     // ── Helpers ──────────────────────────────────────────────────
 
+    // "none" is the *safest* mode — it confirms every call. Labelling it "None"
+    // read as "no confirmations", which is exactly backwards.
     fn confirm_display(&self) -> &str {
         match self.config.tool_confirmation.as_str() {
             "all" => "YOLO",
             "safe" => "Safe",
-            _ => "None",
+            _ => "Confirm All",
         }
     }
 

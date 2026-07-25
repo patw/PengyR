@@ -164,6 +164,21 @@ void MainWindow::createNewChat() {
 }
 
 void MainWindow::deleteChat(const QString& chatId) {
+    // Deletion is immediate and unrecoverable — confirm first.
+    char* json = pengy_chat_get(chatId.toUtf8().constData());
+    QString title = "this chat";
+    if (json) {
+        QJsonObject chat = QJsonDocument::fromJson(QByteArray(json)).object();
+        title = chat["title"].toString("this chat");
+        pengy_free(json);
+    }
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this, "Delete Chat",
+        QString("Delete \"%1\"?\n\nThis cannot be undone.").arg(title),
+        QMessageBox::Yes | QMessageBox::Cancel,
+        QMessageBox::Cancel);
+    if (reply != QMessageBox::Yes) return;
+
     pengy_chat_delete(chatId.toUtf8().constData());
     loadChatList();
     if (m_currentChatId == chatId) {

@@ -966,12 +966,13 @@ async fn chat_command(
         let label = match new_mode.as_str() {
             "all" => "YOLO",
             "safe" => "Safe",
-            _ => "None",
+            _ => "Confirm All",
         };
         return Json(serde_json::json!({
             "type": "config",
             "message": format!("Tool Confirmation: {}", label),
             "config": {
+                "model": config.model,
                 "tool_confirmation": new_mode,
             }
         }))
@@ -1806,7 +1807,23 @@ mod templates {
     .tool-header {{ cursor: pointer; user-select: none; display: flex; align-items: center; gap: 0.4rem; }}
     .tool-args, .tool-output {{ background: #f6f8fa; border-radius: 4px; padding: 0.5rem 0.6rem; margin-top: 0.4rem; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.78rem; color: #24292e; }}
     .msg-thinking {{ display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.85rem; color: var(--bs-secondary-color); font-size: 0.85rem; }}
-    .input-area {{ padding: 0.6rem 0.75rem; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg); padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px)); }}
+    /* ── Jump to bottom ──────────────────────────────────────── */
+    #jumpBottomBtn {{
+      position: absolute;
+      right: 1rem;
+      top: -3rem;
+      z-index: 5;
+      border-radius: 999px;
+      width: 2.5rem;
+      height: 2.5rem;
+      padding: 0;
+      display: none;
+      box-shadow: 0 2px 8px rgba(0,0,0,.25);
+    }}
+    #jumpBottomBtn.show {{ display: block; }}
+    .input-area {{
+      position: relative;
+      padding: 0.6rem 0.75rem; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg); padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px)); }}
     @media (min-width: 576px) {{ .input-area {{ padding: 0.75rem 1rem; }} }}
     #messageInput {{ resize: none; max-height: 180px; overflow-y: auto; font-size: 16px; }}
     .markdown-body {{ line-height: 1.6; }}
@@ -1841,15 +1858,16 @@ mod templates {
       <div class="chat-list px-2 pb-2">
         {sidebar_chats}
       </div>
-      <div class="mt-auto border-top p-2 d-md-none">
-        <a href="/settings" class="btn btn-outline-secondary w-100" data-bs-dismiss="offcanvas">
+      <div class="mt-auto border-top p-2">
+        <a href="/settings" class="btn btn-outline-secondary w-100"
+           onclick="dismissSidebar(event)">
           <i class="bi bi-gear me-1"></i> Settings
         </a>
       </div>
     </div>
   </div>
   <div class="app-shell">
-    <nav class="navbar navbar-light bg-light border-bottom px-2 py-2 flex-shrink-0">
+    <nav class="navbar bg-body-tertiary border-bottom px-2 py-2 flex-shrink-0">
       <div class="d-flex align-items-center gap-1">
         <button class="btn btn-outline-secondary d-md-none" type="button" data-bs-toggle="offcanvas" data-bs-target="#sidebarOffcanvas" aria-label="Open sidebar">
           <i class="bi bi-list"></i>
@@ -1876,6 +1894,19 @@ mod templates {
   </div>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script>
+    function dismissSidebar(event) {{
+      const offcanvas = document.getElementById('sidebarOffcanvas');
+      if (!offcanvas) return;
+      const bsOffcanvas = bootstrap.Offcanvas.getInstance(offcanvas);
+      if (bsOffcanvas && offcanvas.classList.contains('show')) {{
+        event.preventDefault();
+        bsOffcanvas.hide();
+        offcanvas.addEventListener('hidden.bs.offcanvas', function() {{
+          window.location.href = event.currentTarget.href;
+        }}, {{ once: true }});
+      }}
+    }}
+
     document.addEventListener('click', function(e) {{
       const link = e.target.closest('.chat-list-item');
       if (!link) return;
@@ -1916,9 +1947,9 @@ mod templates {
         let sidebar = render_sidebar_chats(chats, &chat.id);
 
         let tc_badge = match config.tool_confirmation.as_str() {
-            "all" => r#"<span class="badge bg-warning text-dark small" id="navConfirmBadge">YOLO</span>"#,
-            "safe" => r#"<span class="badge bg-info text-dark small" id="navConfirmBadge">Safe</span>"#,
-            _ => r#"<span class="badge bg-secondary small" id="navConfirmBadge">None</span>"#,
+            "all" => r#"<span class="badge text-bg-warning small" id="navConfirmBadge">YOLO</span>"#,
+            "safe" => r#"<span class="badge text-bg-info small" id="navConfirmBadge">Safe</span>"#,
+            _ => r#"<span class="badge text-bg-secondary small" id="navConfirmBadge">Confirm All</span>"#,
         };
         let navbar_center = format!(
             r#"<span class="text-muted small d-none d-sm-inline" id="navModel">{}</span> {}
@@ -2023,6 +2054,10 @@ mod templates {
         let main_content = format!(
             r##"<div class="messages-area" id="messagesArea">{messages_html}</div>
 <div class="input-area">
+  <button type="button" id="jumpBottomBtn" class="btn btn-secondary"
+          title="Jump to latest" aria-label="Jump to latest">
+    <i class="bi bi-arrow-down"></i>
+  </button>
   <form id="messageForm" class="d-flex gap-2" novalidate>
     <input type="file" id="fileInput" style="display:none" multiple onchange="handleFiles(this.files)">
     <button type="button" id="attachBtn" class="btn btn-outline-secondary align-self-end"
@@ -2132,6 +2167,8 @@ document.addEventListener('DOMContentLoaded', () => {{
     if (e.key === 'Enter') doRename();
   }});
   document.getElementById('stopBtn').addEventListener('click', stopGeneration);
+  document.getElementById('jumpBottomBtn').addEventListener('click', scrollToBottom);
+  document.getElementById('messagesArea').addEventListener('scroll', updateJumpBtn, {{ passive: true }});
   document.getElementById('navTitle').addEventListener('dblclick', showRename);
 
   // ── Mobile resilience: visibility & bfcache ───────────────────
@@ -2168,6 +2205,26 @@ document.addEventListener('DOMContentLoaded', () => {{
 function scrollToBottom() {{
   const area = document.getElementById('messagesArea');
   area.scrollTop = area.scrollHeight;
+  updateJumpBtn();
+}}
+
+// ── Sticky scroll: only follow new content if user was at bottom ─
+const NEAR_BOTTOM_PX = 60;
+
+function isNearBottom() {{
+  const area = document.getElementById('messagesArea');
+  return area.scrollHeight - area.scrollTop - area.clientHeight <= NEAR_BOTTOM_PX;
+}}
+
+function updateJumpBtn() {{
+  const btn = document.getElementById('jumpBottomBtn');
+  if (btn) btn.classList.toggle('show', !isNearBottom());
+}}
+
+function appendToArea(el) {{
+  const pinned = isNearBottom();
+  document.getElementById('messagesArea').appendChild(el);
+  if (pinned) scrollToBottom(); else updateJumpBtn();
 }}
 
 function escHtml(text) {{
@@ -2253,8 +2310,7 @@ function showThinking() {{
   thinkingEl = document.createElement('div');
   thinkingEl.className = 'msg-thinking';
   thinkingEl.innerHTML = '<div class="spinner-border spinner-border-sm" role="status"></div><span>Thinking...</span>';
-  document.getElementById('messagesArea').appendChild(thinkingEl);
-  scrollToBottom();
+  appendToArea(thinkingEl);
 }}
 
 function hideThinking() {{
@@ -2360,9 +2416,9 @@ function handleSlashCommand(text) {{
           }}
           const badge = document.getElementById('navConfirmBadge');
           const tc = data.config.tool_confirmation;
-          if (tc === 'all') {{ badge.className = 'badge bg-warning text-dark small'; badge.textContent = 'YOLO'; }}
-          else if (tc === 'safe') {{ badge.className = 'badge bg-info text-dark small'; badge.textContent = 'Safe'; }}
-          else {{ badge.className = 'badge bg-secondary small'; badge.textContent = 'None'; }}
+          if (tc === 'all') {{ badge.className = 'badge text-bg-warning small'; badge.textContent = 'YOLO'; }}
+          else if (tc === 'safe') {{ badge.className = 'badge text-bg-info small'; badge.textContent = 'Safe'; }}
+          else {{ badge.className = 'badge text-bg-secondary small'; badge.textContent = 'Confirm All'; }}
         }}
         break;
       case 'redirect':
@@ -2387,8 +2443,7 @@ function appendSystemMessage(msg) {{
   const el = document.createElement('div');
   el.className = 'mb-2';
   el.innerHTML = `<div class="alert alert-info py-1 px-2 mb-0 small"><i class="bi bi-info-circle me-1"></i>${{escHtml(msg)}}</div>`;
-  document.getElementById('messagesArea').appendChild(el);
-  scrollToBottom();
+  appendToArea(el);
 }}
 
 document.getElementById('messageForm').addEventListener('submit', e => {{
@@ -2507,8 +2562,7 @@ function appendToolRequest(data) {{
         </div>
       </div>
     </div>`;
-  document.getElementById('messagesArea').appendChild(el);
-  scrollToBottom();
+  appendToArea(el);
 }}
 
 function updateToolResult(data) {{
@@ -2523,6 +2577,7 @@ function updateToolResult(data) {{
       badge.textContent = data.declined ? 'declined' : 'done';
     }}
   }}
+  const pinned = isNearBottom();
   const resultArea = document.getElementById(`result-${{sid}}`);
   if (resultArea) {{
     if (data.declined) {{
@@ -2531,7 +2586,7 @@ function updateToolResult(data) {{
       resultArea.innerHTML = `<pre class="tool-output">${{escHtml(data.content)}}</pre>`;
     }}
   }}
-  scrollToBottom();
+  if (pinned) scrollToBottom(); else updateJumpBtn();
 }}
 
 function appendAssistantMessage(html, usage) {{
@@ -2551,16 +2606,14 @@ function appendAssistantMessage(html, usage) {{
       <div class="markdown-body">${{html || '<em class="text-muted">(empty response)</em>'}}</div>
       ${{usageHtml}}
     </div>`;
-  document.getElementById('messagesArea').appendChild(el);
-  scrollToBottom();
+  appendToArea(el);
 }}
 
 function appendError(message) {{
   const el = document.createElement('div');
   el.className = 'mb-3';
   el.innerHTML = `<div class="alert alert-danger py-2 mb-0"><i class="bi bi-exclamation-triangle me-2"></i>${{escHtml(message)}}</div>`;
-  document.getElementById('messagesArea').appendChild(el);
-  scrollToBottom();
+  appendToArea(el);
 }}
 
 function confirmTool(confirmed, yoloTurn = false) {{
@@ -2570,7 +2623,7 @@ function confirmTool(confirmed, yoloTurn = false) {{
   const badge = document.getElementById(`badge-${{sid}}`);
   if (badge) {{
     if (confirmed) {{
-      badge.className = 'badge ms-1 ' + (yoloTurn ? 'bg-warning text-dark' : 'bg-secondary');
+      badge.className = 'badge ms-1 ' + (yoloTurn ? 'text-bg-warning' : 'text-bg-secondary');
       badge.textContent = yoloTurn ? 'yolo' : 'running...';
     }} else {{
       badge.className = 'badge ms-1 bg-danger';
@@ -2766,15 +2819,21 @@ async function fetchModels() {{
     }} else if (data.models && data.models.length > 0) {{
       let html = '<div class="small fw-semibold mb-1">Available models (click to select):</div>';
       const current = document.getElementById('modelInput').value;
-      for (const m of data.models) {{
-        const active = m === current ? ' active fw-bold' : '';
-        const escaped = m.replace(/'/g, "&#39;");
-        html += `<span class="badge bg-light text-dark me-1 mb-1${{active}}" style="cursor:pointer;font-size:0.8rem"
-                 onclick="document.getElementById('modelInput').value='${{escaped}}';
-                         document.querySelectorAll('#modelsList .badge').forEach(b=>b.classList.remove('active','fw-bold'));
-                         this.classList.add('active','fw-bold')">${{m}}</span>`;
-      }}
       list.innerHTML = html;
+      for (const m of data.models) {{
+        const badge = document.createElement('span');
+        const isActive = m === current;
+        badge.className = 'badge text-bg-secondary me-1 mb-1' + (isActive ? ' active fw-bold' : '');
+        badge.style.cursor = 'pointer';
+        badge.style.fontSize = '0.8rem';
+        badge.textContent = m;
+        badge.addEventListener('click', () => {{
+          document.getElementById('modelInput').value = m;
+          list.querySelectorAll('.badge').forEach(b => b.classList.remove('active', 'fw-bold'));
+          badge.classList.add('active', 'fw-bold');
+        }});
+        list.appendChild(badge);
+      }}
     }} else {{
       list.innerHTML = '<div class="text-muted small">No models returned.</div>';
     }}
