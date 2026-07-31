@@ -59,8 +59,14 @@ tempfile = "3"
 opt-level = 2
 lto = "thin"
 
-# CI profile: skip LTO and incremental (both add overhead on fresh builds)
+# CI profile: prioritize fast compilation over optimized test binaries.
+# This is intentionally much lighter than release: GitHub-hosted runners
+# have limited CPU/time, and optimized builds of the full workspace can
+# exceed the CI timeout before the GUI build even starts.
 [profile.ci]
 inherits = "release"
+opt-level = 0
 lto = false
-incremental = false
+incremental = true
+codegen-units = 256
+debug = 0

@@ -6,36 +6,66 @@ on:
   pull_request:
     branches: [ main, master ]
 
-env:
-  CARGO_PROFILE_RELEASE_LTO: "off"
-
 jobs:
-  build:
+  rust-tests:
+    name: Rust checks and tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
+      - name: Check Rust workspace
+        run: cargo check --workspace
+
+      - name: Build and test Rust workspace
+        run: cargo test --profile ci --workspace
+
+  gui:
+    name: Qt GUI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GUI dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential cmake qt6-base-dev libgl-dev libssl-dev pkg-config
 
-      - name: Check Rust workspace (fast, no codegen)
-        run: cargo check --workspace
+      - name: Build Rust core for GUI
+        run: cargo build --profile ci -p pengy_core
 
-      - name: Build & test Rust workspace (ci profile — release without LTO)
-        run: cargo test --profile ci --workspace
+      - name: Configure GUI
+        run: cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release -DRUST_TARGET_DIR=${{ github.workspace }}/target/ci
 
       - name: Build GUI
-        run: |
-          mkdir -p gui/build
-          cd gui/build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
+        run: cmake --build gui/build --parallel
 
-      - name: Verify
-        run: |
-          ls -lh gui/build/pengy target/ci/pengy-cli target/ci/pengy-web
+      - name: Verify GUI
+        run: ls -lh gui/build/pengy target/ci/libpengy_core.a
