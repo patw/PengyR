@@ -1,4 +1,4 @@
-use pengy_core::chat_manager::{self, Chat, ChatMessage};
+use pengy_core::chat_manager::{self, Chat, ChatMessage, ChatSummary};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::tools;
@@ -433,7 +433,7 @@ impl WebWorker {
 // ── Routes ───────────────────────────────────────────────────────
 
 async fn index() -> impl IntoResponse {
-    let chats = chat_manager::load_chats();
+    let chats = chat_manager::load_index();
     if !chats.is_empty() {
         Redirect::to(&format!("/chat/{}", chats[0].id))
     } else {
@@ -443,9 +443,9 @@ async fn index() -> impl IntoResponse {
 }
 
 async fn new_chat() -> impl IntoResponse {
-    let chats = chat_manager::load_chats();
+    let chats = chat_manager::load_index();
     if let Some(first) = chats.first() {
-        if first.title == "New Chat" && first.messages.is_empty() {
+        if first.title == "New Chat" && first.msg_count == 0 {
             return Redirect::to(&format!("/chat/{}", first.id));
         }
     }
@@ -458,7 +458,8 @@ async fn chat_view(Path(chat_id): Path<String>, State(state): State<AppState>) -
         Some(c) => c,
         None => return Redirect::to("/").into_response(),
     };
-    let chats = chat_manager::load_chats();
+    // Sidebar summaries only -- no message bodies needed to render the list.
+    let chats = chat_manager::load_index();
     let config = config::load_config();
     let turns = group_messages(&chat.messages);
     let has_active_worker = state.workers.lock().unwrap().contains_key(&chat_id);
@@ -1141,7 +1142,7 @@ async fn serve_file(
 
 async fn settings_get() -> impl IntoResponse {
     let config = config::load_config();
-    let chats = chat_manager::load_chats();
+    let chats = chat_manager::load_index();
     Html(templates::settings_page(&config, &chats, false))
 }
 
@@ -1211,7 +1212,7 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
 
     config::save_config(&config).ok();
 
-    let chats = chat_manager::load_chats();
+    let chats = chat_manager::load_index();
     Html(templates::settings_page(&config, &chats, true))
 }
 
@@ -1922,7 +1923,7 @@ mod templates {
         )
     }
 
-    fn render_sidebar_chats(chats: &[Chat], active_id: &str) -> String {
+    fn render_sidebar_chats(chats: &[ChatSummary], active_id: &str) -> String {
         let mut html = String::new();
         for c in chats {
             let active_class = if c.id == active_id { " active" } else { "" };
@@ -1943,7 +1944,7 @@ mod templates {
         html
     }
 
-    pub fn chat_page(chat: &Chat, chats: &[Chat], config: &Config, turns: &[Turn], has_active_worker: bool) -> String {
+    pub fn chat_page(chat: &Chat, chats: &[ChatSummary], config: &Config, turns: &[Turn], has_active_worker: bool) -> String {
         let sidebar = render_sidebar_chats(chats, &chat.id);
 
         let tc_badge = match config.tool_confirmation.as_str() {
@@ -2664,7 +2665,7 @@ function submitSudo(override) {{
         )
     }
 
-    pub fn settings_page(config: &Config, chats: &[Chat], saved: bool) -> String {
+    pub fn settings_page(config: &Config, chats: &[ChatSummary], saved: bool) -> String {
         let sidebar = {
             let mut html = String::new();
             for c in chats {

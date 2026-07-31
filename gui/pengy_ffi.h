@@ -8,6 +8,7 @@ extern "C" {
     void  pengy_config_set_dir(const char* path);
 
     char* pengy_chats_load();
+    char* pengy_chat_index_load();
     char* pengy_chat_create(const char* title);
     bool  pengy_chat_delete(const char* id);
     bool  pengy_chat_save(const char* json);

@@ -89,140 +89,380 @@ impl Chat {
     }
 }
 
-fn chats_path() -> PathBuf {
+// ---------------------------------------------------------------------------
+// storage layout
+// ---------------------------------------------------------------------------
+// Chats live one per file in `<config>/chats/<id>.json`.
+//
+// The previous layout was a single `<config>/chats.json` array, so every save
+// rewrote the whole corpus. Per-chat files make saving and opening proportional
+// to the chat you touched instead of to everything you have ever said.
+//
+// `<config>/chats/index.json` caches the sidebar summary (id, title,
+// created_at, message count, preview) so listing chats is one small read
+// instead of one per chat. It is a *cache*, never the source of truth: if it is
+// missing, stale, corrupt, or loses a race between two frontends, it is rebuilt
+// by scanning the directory. The per-chat files are authoritative.
+//
+// The legacy `chats.json` is still read, so a machine that switches between the
+// Python, Rust and C++ editions doesn't appear to lose history. It is never
+// written and never deleted.
+
+const CHATS_DIR: &str = "chats";
+const INDEX_FILE: &str = "index.json";
+const INDEX_VERSION: u32 = 1;
+const PREVIEW_CHARS: usize = 200;
+
+/// The per-chat record cached in `index.json`. Every field is derived from the
+/// chat file, so the whole index can be regenerated at any time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSummary {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub msg_count: usize,
+    pub preview: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IndexFile {
+    version: u32,
+    #[serde(default)]
+    legacy_seen: Option<(u64, u64)>, // (mtime nanos, size)
+    #[serde(default)]
+    chats: Vec<ChatSummary>,
+}
+
+/// Serialises index read-modify-write within this process. Across processes the
+/// id-set check in `ensure_current` repairs whatever a lost race dropped.
+static INDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// The pre-split single-file store. Read-only; never written or removed.
+fn legacy_path() -> PathBuf {
     let mut p = crate::config::pengy_config_dir();
     p.push(CHATS_FILE);
     p
 }
 
-// ---------------------------------------------------------------------------
-// in-memory cache
-// ---------------------------------------------------------------------------
-// chats.json is a single (potentially large) file that was fully re-parsed on
-// every read: the GUI loads the list, then `get_chat` re-loads it; `save_chat`
-// loads it again before writing. We cache the parsed Vec keyed by the file's
-// (mtime, size). Any external writer (the CLI, or the Python/C++ editions
-// sharing ~/.config/pengy/) bumps mtime and transparently invalidates us.
-struct ChatCache {
-    key: Option<(u128, u64)>, // (mtime nanos since epoch, size)
-    chats: Vec<Chat>,
+fn chats_dir() -> PathBuf {
+    let mut p = crate::config::pengy_config_dir();
+    p.push(CHATS_DIR);
+    p
 }
 
-static CHAT_CACHE: LazyLock<Mutex<ChatCache>> = LazyLock::new(|| {
-    Mutex::new(ChatCache {
-        key: None,
-        chats: Vec::new(),
-    })
-});
+fn chat_file(chat_id: &str) -> PathBuf {
+    chats_dir().join(format!("{chat_id}.json"))
+}
 
-fn stat_key(path: &std::path::Path) -> Option<(u128, u64)> {
+fn index_path() -> PathBuf {
+    chats_dir().join(INDEX_FILE)
+}
+
+fn stat_key(path: &std::path::Path) -> Option<(u64, u64)> {
     let md = fs::metadata(path).ok()?;
-    let mtime = md
+    let nanos = md
         .modified()
         .ok()?
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()?
-        .as_nanos();
-    Some((mtime, md.len()))
+        .as_nanos() as u64;
+    Some((nanos, md.len()))
 }
 
-/// Drop the in-memory chats cache (forces a re-read on the next load).
-pub fn invalidate_cache() {
-    if let Ok(mut c) = CHAT_CACHE.lock() {
-        c.key = None;
-        c.chats = Vec::new();
-    }
-}
-
-/// Run `f` against the cached chat list without cloning the whole Vec.
-///
-/// This is the cheap path for lookups like [`get_chat`], which previously
-/// parsed the entire file just to return one chat.
-fn with_chats<R>(f: impl FnOnce(&[Chat]) -> R) -> R {
-    let path = chats_path();
-    let mut cache = match CHAT_CACHE.lock() {
-        Ok(c) => c,
-        Err(p) => p.into_inner(), // a poisoned lock still holds usable data
-    };
-
-    let key = stat_key(&path);
-    if key.is_some() && key == cache.key {
-        return f(&cache.chats);
-    }
-
-    let chats = match fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str::<Vec<Chat>>(&text) {
-            Ok(chats) => chats,
-            Err(_) => {
-                backup_corrupt_file(&path);
-                Vec::new()
-            }
-        },
-        Err(_) => Vec::new(),
-    };
-    cache.chats = chats;
-    // Re-stat: backup_corrupt_file may have moved the file aside.
-    cache.key = stat_key(&path);
-    f(&cache.chats)
-}
-
-/// Load all chat sessions from disk.
-pub fn load_chats() -> Vec<Chat> {
-    with_chats(|chats| chats.to_vec())
-}
-
-/// Save all chat sessions to disk atomically.
-pub fn save_chats(chats: &[Chat]) -> io::Result<()> {
-    let path = chats_path();
-    if let Some(parent) = path.parent() {
+/// Write `value` as pretty JSON to `target` atomically (temp file + rename).
+fn atomic_write<T: Serialize>(target: &std::path::Path, value: &T) -> io::Result<()> {
+    if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(chats)?;
-    let mut tmp = path.clone();
-    tmp.set_extension("tmp");
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let tmp = target.with_extension("json.tmp");
     fs::write(&tmp, &json)?;
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, target)
+}
 
-    // Prime the cache with what we just wrote so the next load (e.g. the
-    // load->mutate->save cycle in `save_chat`) skips a re-parse.
-    if let Ok(mut cache) = CHAT_CACHE.lock() {
-        cache.chats = chats.to_vec();
-        cache.key = stat_key(&path);
+/// Read and parse a JSON file, moving it aside if it is corrupt.
+fn read_json<T: for<'de> Deserialize<'de>>(path: &std::path::Path) -> Option<T> {
+    let text = fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<T>(&text) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            backup_corrupt_file(path);
+            None
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// summaries & index
+// ---------------------------------------------------------------------------
+
+/// First user message, truncated -- what `/list` and the sidebar show.
+fn preview_of(chat: &Chat) -> String {
+    for m in &chat.messages {
+        if m.role != "user" {
+            continue;
+        }
+        let text = match &m.content {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            // Multipart (image) content: use the first text part.
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        };
+        return text.chars().take(PREVIEW_CHARS).collect();
+    }
+    String::new()
+}
+
+fn summarize(chat: &Chat) -> ChatSummary {
+    ChatSummary {
+        id: chat.id.clone(),
+        title: chat.title.clone(),
+        created_at: chat.created_at.clone(),
+        msg_count: chat.messages.len(),
+        preview: preview_of(chat),
+    }
+}
+
+/// Newest first. `created_at` is unique in practice; id breaks ties.
+fn sort_summaries(v: &mut [ChatSummary]) {
+    v.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+fn sort_chats(v: &mut [Chat]) {
+    v.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+}
+
+/// ids of the per-chat files, from one directory read.
+fn chat_ids_on_disk() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = fs::read_dir(chats_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == INDEX_FILE || !name.ends_with(".json") {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            out.insert(name[..name.len() - 5].to_string());
+        }
+    }
+    out
+}
+
+/// Read every per-chat file. The fallback when the index can't be trusted.
+fn scan_chats() -> Vec<Chat> {
+    let mut chats: Vec<Chat> = chat_ids_on_disk()
+        .iter()
+        .filter_map(|id| read_json::<Chat>(&chat_file(id)))
+        .collect();
+    sort_chats(&mut chats);
+    chats
+}
+
+fn read_index() -> Option<IndexFile> {
+    let idx = read_json::<IndexFile>(&index_path())?;
+    if idx.version != INDEX_VERSION {
+        return None;
+    }
+    Some(idx)
+}
+
+fn write_index(mut entries: Vec<ChatSummary>, legacy_seen: Option<(u64, u64)>) {
+    sort_summaries(&mut entries);
+    let _ = atomic_write(
+        &index_path(),
+        &IndexFile {
+            version: INDEX_VERSION,
+            legacy_seen,
+            chats: entries,
+        },
+    );
+}
+
+/// Regenerate the index from the authoritative per-chat files.
+fn rebuild_index(legacy_seen: Option<(u64, u64)>) -> Vec<ChatSummary> {
+    let mut entries: Vec<ChatSummary> = scan_chats().iter().map(summarize).collect();
+    sort_summaries(&mut entries);
+    write_index(entries.clone(), legacy_seen);
+    entries
+}
+
+/// Copy `chats.json` entries that have no per-chat file yet.
+///
+/// Existing per-chat files always win -- this only ever adds.
+fn import_legacy() {
+    let Some(legacy) = read_json::<Vec<Chat>>(&legacy_path()) else {
+        return;
+    };
+    let have = chat_ids_on_disk();
+    for chat in legacy {
+        if chat.id.is_empty() || have.contains(&chat.id) {
+            continue;
+        }
+        let _ = atomic_write(&chat_file(&chat.id), &chat);
+    }
+}
+
+/// Bring the index in line with disk, then return its entries.
+///
+/// Steady state is one directory read plus one small parse. The expensive paths
+/// (importing `chats.json`, rescanning every chat) run only when the cheap
+/// checks say something actually changed.
+fn ensure_current() -> Vec<ChatSummary> {
+    let _guard = INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = fs::create_dir_all(chats_dir());
+
+    let idx = read_index();
+    let legacy_now = stat_key(&legacy_path());
+
+    // chats.json appeared or was rewritten -- most likely by the Python or C++
+    // edition on a machine that runs more than one. Re-import so its chats
+    // become visible here.
+    if legacy_now.is_some() && idx.as_ref().and_then(|i| i.legacy_seen) != legacy_now {
+        import_legacy();
+        return rebuild_index(legacy_now);
+    }
+
+    let Some(idx) = idx else {
+        return rebuild_index(legacy_now);
+    };
+
+    // The index is a cache: if it disagrees with the directory (a frontend
+    // crashed mid-write, or two raced on index.json), rebuild from files.
+    let indexed: std::collections::HashSet<String> =
+        idx.chats.iter().map(|c| c.id.clone()).collect();
+    if indexed != chat_ids_on_disk() {
+        return rebuild_index(legacy_now);
+    }
+
+    idx.chats
+}
+
+/// Insert or replace summaries without rescanning everything.
+fn update_index_entries(chats: &[Chat]) {
+    if chats.is_empty() {
+        return;
+    }
+    let _guard = INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let idx = read_index();
+    let legacy_seen = idx
+        .as_ref()
+        .and_then(|i| i.legacy_seen)
+        .or_else(|| stat_key(&legacy_path()));
+
+    let mut entries = match idx {
+        Some(i) => i.chats,
+        None => scan_chats().iter().map(summarize).collect(),
+    };
+    let ids: std::collections::HashSet<&str> = chats.iter().map(|c| c.id.as_str()).collect();
+    entries.retain(|e| !ids.contains(e.id.as_str()));
+    entries.extend(chats.iter().map(summarize));
+    write_index(entries, legacy_seen);
+}
+
+fn drop_index_entry(chat_id: &str) {
+    let _guard = INDEX_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(idx) = read_index() else { return };
+    let legacy_seen = idx.legacy_seen;
+    let mut entries = idx.chats;
+    entries.retain(|e| e.id != chat_id);
+    write_index(entries, legacy_seen);
+}
+
+// ---------------------------------------------------------------------------
+// public API
+// ---------------------------------------------------------------------------
+
+/// Chat summaries, newest first.
+///
+/// This is what sidebars and `/list` want. It reads one small file instead of
+/// every chat, so prefer it over [`load_chats`] where message bodies aren't
+/// actually needed.
+pub fn load_index() -> Vec<ChatSummary> {
+    ensure_current()
+}
+
+/// Every chat in full, newest first.
+///
+/// Only use this when message bodies are genuinely required; it reads every
+/// chat file. [`load_index`] is far cheaper for listing.
+pub fn load_chats() -> Vec<Chat> {
+    ensure_current();
+    scan_chats()
+}
+
+/// Save each of `chats`, leaving every other chat alone.
+///
+/// Additive on purpose: it writes and updates, but never deletes. Use
+/// [`delete_chat`] to remove a chat.
+pub fn save_chats(chats: &[Chat]) -> io::Result<()> {
+    fs::create_dir_all(chats_dir())?;
+    for chat in chats {
+        if chat.id.is_empty() {
+            continue;
+        }
+        atomic_write(&chat_file(&chat.id), chat)?;
+    }
+    update_index_entries(chats);
     Ok(())
 }
 
-/// Create a new chat and persist.
+/// Create a new chat and persist it.
 pub fn create_chat(title: &str) -> io::Result<Chat> {
     let chat = Chat::new(title);
-    let mut chats = load_chats();
-    chats.insert(0, chat.clone());
-    save_chats(&chats)?;
+    ensure_current();
+    fs::create_dir_all(chats_dir())?;
+    atomic_write(&chat_file(&chat.id), &chat)?;
+    update_index_entries(std::slice::from_ref(&chat));
     Ok(chat)
 }
 
 /// Delete a chat by ID.
 pub fn delete_chat(chat_id: &str) -> io::Result<()> {
-    let mut chats = load_chats();
-    chats.retain(|c| c.id != chat_id);
-    save_chats(&chats)
+    ensure_current();
+    let _ = fs::remove_file(chat_file(chat_id));
+    drop_index_entry(chat_id);
+    Ok(())
 }
 
-/// Save a single chat (update or insert).
+/// Save a single chat -- one small file write, not the whole store.
 pub fn save_chat(chat: &Chat) -> io::Result<()> {
-    let mut chats = load_chats();
-    if let Some(pos) = chats.iter().position(|c| c.id == chat.id) {
-        chats[pos] = chat.clone();
-    } else {
-        chats.insert(0, chat.clone());
+    if chat.id.is_empty() {
+        return Ok(());
     }
-    save_chats(&chats)
+    fs::create_dir_all(chats_dir())?;
+    atomic_write(&chat_file(&chat.id), chat)?;
+    update_index_entries(std::slice::from_ref(chat));
+    Ok(())
 }
 
 /// Get a chat by ID.
 pub fn get_chat(chat_id: &str) -> Option<Chat> {
-    // Clone just the one chat, not the whole list.
-    with_chats(|chats| chats.iter().find(|c| c.id == chat_id).cloned())
+    if let Some(chat) = read_json::<Chat>(&chat_file(chat_id)) {
+        return Some(chat);
+    }
+    // Not split out yet (first run after upgrade, or written by another
+    // edition): fall back to the legacy store.
+    ensure_current();
+    read_json::<Chat>(&chat_file(chat_id))
 }
 
 /// Clean dangling tool calls so the message list is valid for the API.

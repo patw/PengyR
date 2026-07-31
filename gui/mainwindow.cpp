@@ -133,7 +133,8 @@ void MainWindow::updateLlmClient() {
 }
 
 void MainWindow::loadChatList() {
-    char* json = pengy_chats_load();
+    // Summaries only — the sidebar needs id and title, not every message.
+    char* json = pengy_chat_index_load();
     m_chats = QJsonDocument::fromJson(QByteArray(json)).array();
     pengy_free(json);
     m_chatHistory->loadChats(m_chats);
@@ -143,7 +144,7 @@ void MainWindow::createNewChat() {
     loadChatList();
     if (!m_chats.isEmpty()) {
         QJsonObject first = m_chats[0].toObject();
-        if (first["title"].toString() == "New Chat" && first["messages"].toArray().isEmpty()) {
+        if (first["title"].toString() == "New Chat" && first["msg_count"].toInt() == 0) {
             m_currentChat = first;
             m_currentChatId = first["id"].toString();
             m_chatHistory->selectChatById(m_currentChatId);

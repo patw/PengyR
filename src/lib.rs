@@ -69,6 +69,16 @@ pub extern "C" fn pengy_chats_load() -> *mut c_char {
     to_c(&serde_json::to_string(&chat_manager::load_chats()).unwrap_or_default())
 }
 
+/// Sidebar summaries only (id, title, created_at, msg_count, preview).
+///
+/// `pengy_chats_load` serialises every message of every chat across the FFI
+/// boundary just to draw a list of titles; this sends a few hundred bytes per
+/// chat instead.
+#[no_mangle]
+pub extern "C" fn pengy_chat_index_load() -> *mut c_char {
+    to_c(&serde_json::to_string(&chat_manager::load_index()).unwrap_or_default())
+}
+
 #[no_mangle]
 pub extern "C" fn pengy_chat_create(title: *const c_char) -> *mut c_char {
     let t = unsafe { cstr(title) };

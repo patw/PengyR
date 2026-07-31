@@ -262,9 +262,10 @@ impl PengyCli {
             Some(71),
         );
 
-        let chats = chat_manager::load_chats();
-        if !chats.is_empty() {
-            self.current_chat = Some(chats[0].clone());
+        // Summaries first; then read just the one chat we're resuming.
+        let chats = chat_manager::load_index();
+        self.current_chat = chats.first().and_then(|e| chat_manager::get_chat(&e.id));
+        if self.current_chat.is_some() {
             let chat = self.current_chat.as_ref().unwrap();
             let msg_count = chat.messages.len();
             let last_user = chat.messages.iter().rev()
@@ -1017,7 +1018,7 @@ impl PengyCli {
     }
 
     fn cmd_list(&self) {
-        let chats = chat_manager::load_chats();
+        let chats = chat_manager::load_index();
         if chats.is_empty() {
             println!("{}No saved chats.{}", DIM, RESET);
             return;
@@ -1039,19 +1040,13 @@ impl PengyCli {
 
         for (i, chat) in chats.iter().enumerate() {
             let prefix = if chat.id == current_id { ">" } else { " " };
-            let preview = chat.messages.iter()
-                .find(|m| m.role == "user")
-                .and_then(|m| m.content.as_ref())
-                .and_then(|v| v.as_str())
-                .map(|s| truncate(s, 28))
-                .unwrap_or_default();
             println!(
                 "  {}{:<4} {:<30} {:>6}  {}",
                 prefix,
                 i + 1,
                 truncate(&chat.title, 28),
-                chat.messages.len(),
-                preview,
+                chat.msg_count,
+                truncate(&chat.preview, 28),
             );
         }
     }
@@ -1075,7 +1070,7 @@ impl PengyCli {
             }
         };
 
-        let chats = chat_manager::load_chats();
+        let chats = chat_manager::load_index();
         if idx >= chats.len() {
             println!("{}Index out of range.{}", RED, RESET);
             return;
@@ -1085,7 +1080,11 @@ impl PengyCli {
             chat_manager::save_chat(chat).ok();
         }
 
-        self.current_chat = Some(chats[idx].clone());
+        let Some(loaded) = chat_manager::get_chat(&chats[idx].id) else {
+            println!("{}Chat could not be loaded.{}", RED, RESET);
+            return;
+        };
+        self.current_chat = Some(loaded);
         let c = self.current_chat.as_ref().unwrap();
         println!(
             "{}Loaded:{} {}{}{} {}({} messages){}",
@@ -1111,7 +1110,7 @@ impl PengyCli {
             }
         };
 
-        let chats = chat_manager::load_chats();
+        let chats = chat_manager::load_index();
         if idx >= chats.len() {
             println!("{}Index out of range.{}", RED, RESET);
             return;
@@ -1144,9 +1143,9 @@ impl PengyCli {
         println!("{}Deleted:{} {}{}{}", GREEN, RESET, BOLD, title, RESET);
 
         if is_current {
-            let remaining = chat_manager::load_chats();
-            if !remaining.is_empty() {
-                self.current_chat = Some(remaining[0].clone());
+            let remaining = chat_manager::load_index();
+            self.current_chat = remaining.first().and_then(|e| chat_manager::get_chat(&e.id));
+            if self.current_chat.is_some() {
                 println!(
                     "{}Loaded:{} {}{}{}",
                     DIM,
