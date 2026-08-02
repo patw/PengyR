@@ -11,6 +11,8 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QThread>
+#include <QTabWidget>
+#include <QMap>
 
 class ChatHistoryWidget;
 class ChatView;
@@ -18,10 +20,24 @@ class ChatInputWidget;
 class ChatWorker;
 class SettingsDialog;
 
+/// Per-tab state for a single chat.
+struct TabSession {
+    QJsonObject chat;
+    ChatView*   chatView = nullptr;
+    ChatWorker* worker   = nullptr;
+    QThread*    workerThread = nullptr;
+    bool        yoloThisTurn  = false;
+    bool        thinking      = false;
+    bool        toolRunning   = false;
+    int         promptTokens     = 0;
+    int         completionTokens = 0;
+};
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    void closeEvent(QCloseEvent* event) override;
 
 private slots:
     void createNewChat();
@@ -37,26 +53,52 @@ private slots:
     void pollToolConfirmation();
 
 private:
+    // ── UI setup ──────────────────────────────────────────────────
     void setupUi();
     void applyTheme();
     void updateLlmClient();
     void loadChatList();
-    void processResponse(const QJsonArray& messages);
-    void handleToolConfirm(const QJsonObject& toolRequest);
+
+    // ── Tab management ────────────────────────────────────────────
+    TabSession* addTab(const QJsonObject& chat, bool switchTo = true);
+    void closeTab(int index);
+    void onTabChanged(int index);
+    TabSession* tabForChat(const QString& chatId);
+    void saveOpenTabs();
+    void updateTabTitle(TabSession* session);
+    void loadIntoNewTab(const QString& chatId);
+
+    // ── Message helpers ───────────────────────────────────────────
+    void renderMessage(ChatView* view, const QJsonObject& msg);
+    void processResponse(TabSession* session, const QJsonArray& apiMessages);
+    void handleToolConfirm(TabSession* session, const QJsonObject& toolRequest);
+    void handleFinalResponse(TabSession* session, const QJsonObject& response);
+    void updateQuickSettingsFor(TabSession* session);
+
+    // ── Worker lifecycle ──────────────────────────────────────────
+    void abandonWorkerFor(TabSession* session);
+    void reapAbandonedWorkers();
 
     QJsonObject m_config;
-    QJsonArray m_chats;
-    QString m_currentChatId;
-    QJsonObject m_currentChat;
+    QJsonArray  m_chats;
+    QString     m_activeChatId;
 
     ChatHistoryWidget* m_chatHistory;
-    ChatView* m_chatView;
-    ChatInputWidget* m_chatInput;
-    QPushButton* m_stopBtn;
+    QTabWidget*        m_tabWidget;
+    ChatInputWidget*   m_chatInput;
+    QPushButton*       m_stopBtn;
 
-    ChatWorker* m_worker = nullptr;
-    QThread* m_workerThread = nullptr;
+    // Tab state
+    QMap<QString, TabSession> m_openTabs;
+    QMap<ChatWorker*, QString> m_workerToChat;
+
+    // Abandoned workers (threads still running, to be reaped later)
+    struct AbandonedWorker {
+        QThread*    thread;
+        ChatWorker* worker;
+    };
+    QList<AbandonedWorker> m_abandonedWorkers;
+
     QTimer* m_confirmTimer = nullptr;
-    bool m_yoloThisTurn = false;
-    bool m_sudoDialogOpen = false;
+    bool    m_sudoDialogOpen = false;
 };
