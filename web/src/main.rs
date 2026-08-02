@@ -269,6 +269,7 @@ impl WebWorker {
         let sse_tx2 = sse_tx.clone();
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
+        *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
 
         {
             let sse_tx_sudo = sse_tx.clone();
@@ -1158,6 +1159,7 @@ struct SettingsForm {
     preserve_reasoning: Option<String>,
     llm_timeout: Option<String>,
     tool_timeout: Option<String>,
+    tool_output_max_chars: Option<String>,
     context_keep_turns: Option<String>,
 }
 
@@ -1202,6 +1204,11 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
     if let Some(v) = &form.tool_timeout {
         if let Ok(n) = v.parse::<u64>() {
             config.tool_timeout = n.max(1);
+        }
+    }
+    if let Some(v) = &form.tool_output_max_chars {
+        if let Ok(n) = v.parse::<usize>() {
+            config.tool_output_max_chars = n;
         }
     }
     if let Some(v) = &form.context_keep_turns {
@@ -2784,6 +2791,10 @@ function submitSudo(override) {{
         <input type="number" name="tool_timeout" class="form-control" value="{tool_timeout}" min="1" max="3600">
       </div>
       <div class="mb-3">
+        <label class="form-label fw-semibold">Max Tool Output (chars, 0=no limit)</label>
+        <input type="number" name="tool_output_max_chars" class="form-control" value="{tool_output_max_chars}" min="0" max="500000" step="1000">
+      </div>
+      <div class="mb-3">
         <label class="form-label fw-semibold">Context Keep Turns</label>
         <input type="number" name="context_keep_turns" class="form-control" value="{context_keep_turns}" min="0">
         <div class="form-text">Elide tool results older than N turns (0 = keep all)</div>
@@ -2852,6 +2863,7 @@ async function fetchModels() {{
             model = escape_html(&config.model),
             llm_timeout = config.llm_timeout,
             tool_timeout = config.tool_timeout,
+            tool_output_max_chars = config.tool_output_max_chars,
             context_keep_turns = config.context_keep_turns,
             user_agent = escape_html(&config.user_agent),
             system_message = escape_html(&config.system_message),

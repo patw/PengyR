@@ -156,6 +156,14 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_toolTimeout->setValue(config["tool_timeout"].toInt(300));
     form->addRow("Tool timeout:", m_toolTimeout);
 
+    m_toolOutputMax = new QSpinBox;
+    m_toolOutputMax->setRange(0, 500000);
+    m_toolOutputMax->setSpecialValueText("No limit");
+    m_toolOutputMax->setSuffix(" chars");
+    m_toolOutputMax->setToolTip("Snipped (head+tail) when tool output exceeds this. 0 = no limit.");
+    m_toolOutputMax->setValue(config["tool_output_max_chars"].toInt(50000));
+    form->addRow("Max tool output:", m_toolOutputMax);
+
     layout->addLayout(form);
     layout->addStretch();
 
@@ -175,6 +183,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["theme_accent"] = m_themeAccent->currentData().toString();
         m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();
+        m_config["tool_output_max_chars"] = m_toolOutputMax->value();
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

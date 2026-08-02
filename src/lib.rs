@@ -179,6 +179,11 @@ pub extern "C" fn pengy_tool_set_timeout(secs: u64) {
     *tools::TOOL_TIMEOUT.lock().unwrap() = secs;
 }
 
+#[no_mangle]
+pub extern "C" fn pengy_tool_set_output_max_chars(chars: usize) {
+    *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = chars;
+}
+
 // ── LLM Chat ──────────────────────────────────────────────────────
 //
 // Called from a QThread. Blocks until the conversation ends.

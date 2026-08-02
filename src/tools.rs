@@ -19,6 +19,7 @@ pub static SUDO_PASSWORD_PROVIDER: Mutex<Option<Box<dyn Fn() -> Option<String> +
 
 pub static CACHED_SUDO_PASSWORD: Mutex<Option<String>> = Mutex::new(None);
 pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
+pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(50000);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
 
 static ACTIVE_PROCESS_GROUPS: once_cell::sync::Lazy<Mutex<HashSet<u32>>> =
@@ -272,6 +273,36 @@ fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// If `text` exceeds the configured `TOOL_OUTPUT_MAX_CHARS`, keep head+tail
+/// and snip the middle.  0 = no limit.
+fn snip_tool_output(text: String) -> String {
+    let limit = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+    if limit == 0 || text.len() <= limit {
+        return text;
+    }
+    let head_chars = (limit / 5).max(500);
+    let tail_chars = limit - head_chars;
+
+    // Find char-boundary cut points
+    let head = truncate_on_char_boundary(&text, head_chars);
+    let tail_start = text.len().saturating_sub(tail_chars);
+    // Back up to nearest char boundary
+    let tail_start = {
+        let mut pos = tail_start;
+        while pos > 0 && !text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        pos
+    };
+    let tail = &text[tail_start..];
+
+    let snipped = text.len() - head.len() - tail.len();
+    format!(
+        "{head}\n\n[... snipped {snipped} chars from middle — set tool_output_max_chars \
+         to change this limit (current: {limit}) ...]\n\n{tail}"
+    )
+}
+
 fn a(args: &serde_json::Value, key: &str, default: &str) -> String {
     args.get(key)
         .and_then(|v| v.as_str())
@@ -321,7 +352,7 @@ fn timeout_secs() -> u64 {
 async fn read_file(path: String) -> String {
     let p = expand_home(&path);
     match std::fs::read_to_string(&p) {
-        Ok(c) => c,
+        Ok(c) => snip_tool_output(c),
         Err(e) => {
             if !p.exists() {
                 format!("Error: File not found: {path}")
@@ -531,7 +562,7 @@ async fn run_bash(command: String) -> String {
             if out.is_empty() {
                 "(No output)".into()
             } else {
-                out
+                snip_tool_output(out)
             }
         })
     })
@@ -1494,7 +1525,7 @@ async fn run_python(code: String) -> String {
             if s.is_empty() {
                 "(No output)".into()
             } else {
-                s
+                snip_tool_output(s)
             }
         })
     })

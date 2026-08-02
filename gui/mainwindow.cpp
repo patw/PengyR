@@ -128,8 +128,10 @@ void MainWindow::applyTheme() {
 void MainWindow::updateLlmClient() {
     QString ua = m_config.value("user_agent").toString("PengyAgent/1.0");
     int timeout = m_config.value("tool_timeout").toInt(60);
+    int outputMax = m_config.value("tool_output_max_chars").toInt(50000);
     pengy_tool_set_user_agent(ua.toUtf8().constData());
     pengy_tool_set_timeout(timeout);
+    pengy_tool_set_output_max_chars(outputMax);
 }
 
 void MainWindow::loadChatList() {

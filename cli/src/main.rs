@@ -220,6 +220,7 @@ impl PengyCli {
         let config = config::load_config();
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
+        *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
 
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
