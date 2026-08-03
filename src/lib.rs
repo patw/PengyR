@@ -280,9 +280,9 @@ pub extern "C" fn pengy_llm_chat_run(
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::unbounded_channel();
-    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let cancel2 = cancel.clone();
+    let cancel = tool_ctx.cancelled.clone();
+    let cancel2 = tool_ctx.cancelled.clone();
     let ctx_for_task = tool_ctx.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
@@ -408,7 +408,11 @@ pub extern "C" fn pengy_run_free(run: *mut Arc<tools::ToolContext>) {
 #[no_mangle]
 pub extern "C" fn pengy_llm_cancel(run: *mut Arc<tools::ToolContext>) {
     if !run.is_null() {
-        unsafe { (*run).kill_all() };
+        unsafe {
+            let ctx = &*run;
+            ctx.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.kill_all();
+        }
     }
 }
 

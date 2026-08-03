@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,8 @@ pub struct ToolContext {
     sudo_provider: Mutex<Option<SudoProvider>>,
     cached_sudo_password: Mutex<Option<String>>,
     active_process_groups: Mutex<HashSet<u32>>,
+    /// Set by `pengy_llm_cancel` so the LLM loop aborts at the next yield point.
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl ToolContext {
@@ -41,6 +44,7 @@ impl ToolContext {
             sudo_provider: Mutex::new(None),
             cached_sudo_password: Mutex::new(None),
             active_process_groups: Mutex::new(HashSet::new()),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 

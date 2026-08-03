@@ -5,6 +5,7 @@
 #include <QWaitCondition>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <atomic>
 #include "pengy_ffi.h"
 
 /// Mirrors Python's ChatWorker — runs the LLM chat in a background QThread.
@@ -41,7 +42,7 @@ private:
     SudoState m_sudoState;
     QMutex m_mutex;
     QWaitCondition m_cond;
-    bool m_cancelled = false;
+    std::atomic<bool> m_cancelled = false;
 
     // Parameters
     QString m_baseUrl, m_apiKey, m_model, m_messagesJson, m_toolConfirmation, m_reasoningEffort;
