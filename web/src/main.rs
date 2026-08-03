@@ -271,10 +271,13 @@ impl WebWorker {
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
         *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
 
+        // Per-request tool context so concurrent chats don't share a sudo
+        // provider or kill each other's subprocesses.
+        let tool_ctx = std::sync::Arc::new(tools::ToolContext::new());
         {
             let sse_tx_sudo = sse_tx.clone();
             let sudo_state_provider = sudo_state.clone();
-            *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(Box::new(move || {
+            tool_ctx.set_sudo_provider(Some(Box::new(move || {
                 let _ = sse_tx_sudo.send(SseEvent::SudoRequest);
                 let (lock, cvar) = &*sudo_state_provider;
                 let mut guard = lock.lock().unwrap();
@@ -282,7 +285,7 @@ impl WebWorker {
                     guard = cvar.wait(guard).unwrap();
                 }
                 guard.take().flatten()
-            }));
+            })));
         }
 
         let tc_mode = ToolConfirmation::from_str(&config.tool_confirmation);
@@ -300,10 +303,12 @@ impl WebWorker {
             let pr = config.preserve_reasoning;
             let lt = config.llm_timeout;
             let cancel2 = cancel.clone();
+            let ctx_for_task = tool_ctx.clone();
 
             tokio::spawn(async move {
                 llm_client::chat(
                     &bu, &ak, &md, messages, tc_mode, &re, pr, lt, event_tx, confirm_rx, cancel2,
+                    ctx_for_task,
                 )
                 .await;
             });
@@ -424,7 +429,7 @@ impl WebWorker {
                 }
             }
 
-            *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = None;
+            tool_ctx.set_sudo_provider(None);
         });
 
         worker

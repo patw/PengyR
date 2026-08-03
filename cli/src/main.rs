@@ -213,6 +213,7 @@ struct PengyCli {
     rt: tokio::runtime::Runtime,
     rl: Editor<PengyHelper, FileHistory>,
     hist_path: std::path::PathBuf,
+    tool_ctx: Arc<tools::ToolContext>,
 }
 
 impl PengyCli {
@@ -249,6 +250,7 @@ impl PengyCli {
             rt,
             rl,
             hist_path,
+            tool_ctx: Arc::new(tools::ToolContext::new()),
         }
     }
 
@@ -406,10 +408,12 @@ impl PengyCli {
         let pr = self.config.preserve_reasoning;
         let lt = self.config.llm_timeout;
         let cancel2 = cancel.clone();
+        let ctx_for_task = self.tool_ctx.clone();
 
         self.rt.spawn(async move {
             llm_client::chat(
                 &bu, &ak, &md, messages, tc_mode, &re, pr, lt, event_tx, confirm_rx, cancel2,
+                ctx_for_task,
             )
             .await;
         });
@@ -637,16 +641,15 @@ impl PengyCli {
     // ── Sudo ─────────────────────────────────────────────────────
 
     fn set_sudo_provider(&self) {
-        *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(Box::new(|| {
+        self.tool_ctx.set_sudo_provider(Some(Box::new(|| {
             eprint!("{}Enter sudo password: {}", YELLOW, RESET);
             io::stderr().flush().ok();
             rpassword::read_password().ok()
-        }));
+        })));
     }
 
     fn clear_sudo_provider(&self) {
-        *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = None;
-        *tools::CACHED_SUDO_PASSWORD.lock().unwrap() = None;
+        self.tool_ctx.set_sudo_provider(None);
     }
 
     // ── Slash commands ───────────────────────────────────────────

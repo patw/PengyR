@@ -223,6 +223,7 @@ pub extern "C" fn pengy_llm_chat_run(
     sudo_state: *mut SudoState,
     on_event: Option<EventFn>,
     userdata: *mut c_void,
+    run: *mut Arc<tools::ToolContext>,
 ) -> bool {
     let bu = unsafe { cstr(base_url) };
     let ak = unsafe { cstr(api_key) };
@@ -234,10 +235,20 @@ pub extern "C" fn pengy_llm_chat_run(
     let messages: Vec<chat_manager::ChatMessage> = serde_json::from_str(&ms).unwrap_or_default();
     let tc_mode = llm_client::ToolConfirmation::from_str(&tc_str);
 
-    // Wire up sudo password provider if a SudoState pointer was given
+    // Per-run tool context: either the handle the GUI created (so cancel can
+    // target this run's subprocesses) or a fresh one if none was supplied.
+    let tool_ctx: Arc<tools::ToolContext> = if run.is_null() {
+        Arc::new(tools::ToolContext::new())
+    } else {
+        unsafe { (*run).clone() }
+    };
+
+    // Wire up a per-run sudo password provider if a SudoState pointer was given.
+    // Scoped to this run's ToolContext so concurrent tabs never clobber one
+    // another's provider or cached password.
     if !sudo_state.is_null() {
         let sudo_ptr = sudo_state as usize; // safe to send across threads
-        *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(Box::new(move || {
+        tool_ctx.set_sudo_provider(Some(Box::new(move || {
             let state = sudo_ptr as *mut SudoState;
             unsafe {
                 std::ptr::write_volatile(&mut (*state).status, 1);
@@ -264,7 +275,7 @@ pub extern "C" fn pengy_llm_chat_run(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-        }));
+        })));
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -272,9 +283,11 @@ pub extern "C" fn pengy_llm_chat_run(
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let cancel2 = cancel.clone();
+    let ctx_for_task = tool_ctx.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
             &bu, &ak, &md, messages, tc_mode, &re_str, preserve_reasoning, 300, event_tx, confirm_rx, cancel2,
+            ctx_for_task,
         )
         .await;
     }));
@@ -371,21 +384,32 @@ pub extern "C" fn pengy_llm_chat_run(
         }
     };
 
-    // Clean up sudo provider
-    *tools::SUDO_PASSWORD_PROVIDER.lock().unwrap() = None;
-    *tools::CACHED_SUDO_PASSWORD.lock().unwrap() = None;
+    // Clean up this run's sudo provider + cached password.
+    tool_ctx.set_sudo_provider(None);
 
     result
 }
 
+/// Create a per-run tool context.  The GUI owns the handle for the lifetime of
+/// a worker and passes it to `pengy_llm_chat_run` and `pengy_llm_cancel` so a
+/// Stop only kills that run's subprocesses.  Free it with `pengy_run_free`.
 #[no_mangle]
-pub extern "C" fn pengy_llm_cancel(cancel_flag: *mut bool) {
-    if !cancel_flag.is_null() {
-        unsafe {
-            *cancel_flag = true;
-        }
+pub extern "C" fn pengy_run_new() -> *mut Arc<tools::ToolContext> {
+    Box::into_raw(Box::new(Arc::new(tools::ToolContext::new())))
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_run_free(run: *mut Arc<tools::ToolContext>) {
+    if !run.is_null() {
+        drop(unsafe { Box::from_raw(run) });
     }
-    tools::kill_active_process();
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_llm_cancel(run: *mut Arc<tools::ToolContext>) {
+    if !run.is_null() {
+        unsafe { (*run).kill_all() };
+    }
 }
 
 // ── Config dir override ──────────────────────────────────────────

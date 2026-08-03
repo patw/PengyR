@@ -950,5 +950,24 @@ void MainWindow::closeEvent(QCloseEvent* event) {
             pengy_chat_save(json.constData());
         }
     }
+
+    // Cancel every live worker (open tabs + already-abandoned ones) and wait
+    // for its thread to stop, so no QThread is destroyed while still running.
+    QList<QThread*> threads;
+    for (auto& session : m_openTabs) {
+        if (session.worker) session.worker->cancel();
+        if (session.workerThread) threads.append(session.workerThread);
+    }
+    for (const auto& aw : m_abandonedWorkers) {
+        if (aw.worker) aw.worker->cancel();
+        if (aw.thread) threads.append(aw.thread);
+    }
+    for (QThread* t : threads) {
+        if (t && t->isRunning()) t->quit();
+    }
+    for (QThread* t : threads) {
+        if (t && t->isRunning()) t->wait(3000);
+    }
+
     QMainWindow::closeEvent(event);
 }

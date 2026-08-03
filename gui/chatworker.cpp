@@ -8,9 +8,17 @@ ChatWorker::ChatWorker(QObject* parent) : QObject(parent) {
     m_confirmState.yolo_turn = false;
     m_sudoState.status = 0;
     memset(m_sudoState.password, 0, sizeof(m_sudoState.password));
+    // Per-run tool context so concurrent tabs don't share a sudo provider or
+    // kill each other's subprocesses.  The Rust side clones the Arc internally,
+    // so freeing this handle while a run is still in flight is refcount-safe.
+    m_run = pengy_run_new();
 }
 
-ChatWorker::~ChatWorker() { cancel(); }
+ChatWorker::~ChatWorker() {
+    cancel();
+    pengy_run_free(m_run);
+    m_run = nullptr;
+}
 
 void ChatWorker::start(const QString& baseUrl, const QString& apiKey,
                        const QString& model, const QJsonArray& messages,
@@ -34,7 +42,7 @@ void ChatWorker::start(const QString& baseUrl, const QString& apiKey,
 
 void ChatWorker::cancel() {
     m_cancelled = true;
-    pengy_llm_cancel(nullptr);
+    pengy_llm_cancel(m_run);   // kills only this run's subprocesses
 
     // Wake up any waiting confirmation or sudo prompt
     QMutexLocker lock(&m_mutex);
@@ -81,7 +89,7 @@ void ChatWorker::run() {
         baseUrl.constData(), apiKey.constData(), model.constData(),
         msgs.constData(), tc.constData(), re.constData(), m_preserveReasoning,
         &m_confirmState, &m_sudoState,
-        callback, this
+        callback, this, m_run
     );
 
     if (m_cancelled) return;

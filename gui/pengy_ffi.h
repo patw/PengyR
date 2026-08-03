@@ -45,6 +45,13 @@ extern "C" {
 
     typedef void (*EventFn)(const char* event_json, void* userdata);
 
+    // Opaque per-run tool context handle (Rust Arc<ToolContext>).  Create one
+    // per worker so a Stop kills only that run's subprocesses and its sudo
+    // provider is never clobbered by another tab.
+    typedef struct PengyRun PengyRun;
+    PengyRun* pengy_run_new(void);
+    void      pengy_run_free(PengyRun* run);
+
     bool pengy_llm_chat_run(
         const char* base_url,
         const char* api_key,
@@ -56,9 +63,10 @@ extern "C" {
         ConfirmState* confirm_state,
         SudoState* sudo_state,
         EventFn on_event,
-        void* userdata
+        void* userdata,
+        PengyRun* run
     );
 
-    void pengy_llm_cancel(bool* cancel_flag);
+    void pengy_llm_cancel(PengyRun* run);
     void pengy_free(char* s);
 }

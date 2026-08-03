@@ -141,6 +141,7 @@ pub async fn chat(
     event_tx: mpsc::UnboundedSender<LlmEvent>,
     mut confirm_rx: mpsc::UnboundedReceiver<Confirmation>,
     cancel: Arc<AtomicBool>,
+    tool_ctx: Arc<tools::ToolContext>,
 ) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(llm_timeout))
@@ -371,7 +372,7 @@ pub async fn chat(
                             tool_call_id: tc_id.clone(),
                         });
 
-                        let result = tools::execute_tool(&name, &args).await;
+                        let result = tools::execute_tool(&name, &args, &tool_ctx).await;
 
                         current_messages.push(ChatMessage {
                             role: "tool".into(),
@@ -405,7 +406,7 @@ pub async fn chat(
                                     yolo_this_turn = true;
                                 }
 
-                                let result = tools::execute_tool(&name, &args).await;
+                                let result = tools::execute_tool(&name, &args, &tool_ctx).await;
 
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
@@ -721,6 +722,7 @@ mod loop_tests {
                 event_tx,
                 confirm_rx,
                 cancel,
+                Arc::new(tools::ToolContext::new()),
             )
             .await;
         });

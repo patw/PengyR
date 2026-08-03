@@ -46,4 +46,7 @@ private:
     // Parameters
     QString m_baseUrl, m_apiKey, m_model, m_messagesJson, m_toolConfirmation, m_reasoningEffort;
     bool m_preserveReasoning = false;
+
+    // Per-run tool context handle (Rust Arc<ToolContext>).
+    PengyRun* m_run = nullptr;
 };

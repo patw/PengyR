@@ -9,21 +9,80 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ── Global state ────────────────────────────────────────────────────
 
-pub static SUDO_PASSWORD_PROVIDER: Mutex<Option<Box<dyn Fn() -> Option<String> + Send + Sync>>> =
-    Mutex::new(None);
-
-pub static CACHED_SUDO_PASSWORD: Mutex<Option<String>> = Mutex::new(None);
 pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
 pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(50000);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
 
-static ACTIVE_PROCESS_GROUPS: once_cell::sync::Lazy<Mutex<HashSet<u32>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashSet::new()));
+/// A blocking callback that prompts the user for a sudo password.
+/// Returns the password, or `None` if the user cancels.
+pub type SudoProvider = Box<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Per-run tool state: sudo provider, cached sudo password, and the set of
+/// active subprocess groups.
+///
+/// Each concurrent run (e.g. one per GUI tab) gets its own context so a sudo
+/// prompt is routed to the right run and pressing Stop on one run kills only
+/// that run's subprocesses — never another tab's.  Shared as `Arc<ToolContext>`
+/// so it can be cloned into `spawn_blocking` closures and across the FFI.
+pub struct ToolContext {
+    sudo_provider: Mutex<Option<SudoProvider>>,
+    cached_sudo_password: Mutex<Option<String>>,
+    active_process_groups: Mutex<HashSet<u32>>,
+}
+
+impl ToolContext {
+    pub fn new() -> Self {
+        Self {
+            sudo_provider: Mutex::new(None),
+            cached_sudo_password: Mutex::new(None),
+            active_process_groups: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Install (or clear) the sudo provider; clears any cached password.
+    pub fn set_sudo_provider(&self, provider: Option<SudoProvider>) {
+        *self.sudo_provider.lock().unwrap() = provider;
+        *self.cached_sudo_password.lock().unwrap() = None;
+    }
+
+    pub fn clear_sudo(&self) {
+        *self.cached_sudo_password.lock().unwrap() = None;
+    }
+
+    fn register_process(&self, pid: u32) {
+        self.active_process_groups.lock().unwrap().insert(pid);
+    }
+
+    fn unregister_process(&self, pid: u32) {
+        self.active_process_groups.lock().unwrap().remove(&pid);
+    }
+
+    /// Kill every subprocess group registered in this context.
+    pub fn kill_all(&self) {
+        let pids: Vec<u32> = self
+            .active_process_groups
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        for pid in pids {
+            terminate_process_group(pid);
+        }
+        self.active_process_groups.lock().unwrap().clear();
+    }
+}
+
+impl Default for ToolContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Tool schema definitions ─────────────────────────────────────────
 
@@ -152,14 +211,18 @@ pub fn is_readonly_tool(name: &str) -> bool {
 
 // ── Tool execution dispatcher ───────────────────────────────────────
 
-pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
+pub async fn execute_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    ctx: &Arc<ToolContext>,
+) -> String {
     let timeout = timeout_secs();
     if timeout == 0 {
-        return execute_tool_inner(name, arguments).await;
+        return execute_tool_inner(name, arguments, ctx).await;
     }
 
     let outer = Duration::from_secs(timeout.saturating_add(30));
-    match tokio::time::timeout(outer, execute_tool_inner(name, arguments)).await {
+    match tokio::time::timeout(outer, execute_tool_inner(name, arguments, ctx)).await {
         Ok(result) => result,
         Err(_) => format!(
             "Tool timed out (outer safety net after {}s)",
@@ -168,7 +231,11 @@ pub async fn execute_tool(name: &str, arguments: &serde_json::Value) -> String {
     }
 }
 
-async fn execute_tool_inner(name: &str, arguments: &serde_json::Value) -> String {
+async fn execute_tool_inner(
+    name: &str,
+    arguments: &serde_json::Value,
+    ctx: &Arc<ToolContext>,
+) -> String {
     match name {
         "read_file" => read_file(a(arguments, "path", "")).await,
         "write_file" => write_file(a(arguments, "path", ""), a(arguments, "content", "")).await,
@@ -180,7 +247,7 @@ async fn execute_tool_inner(name: &str, arguments: &serde_json::Value) -> String
             )
             .await
         }
-        "run_bash" => run_bash(a(arguments, "command", "")).await,
+        "run_bash" => run_bash(a(arguments, "command", ""), ctx.clone()).await,
         "web_search" => {
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
         }
@@ -188,7 +255,7 @@ async fn execute_tool_inner(name: &str, arguments: &serde_json::Value) -> String
             download_file(a(arguments, "url", ""), aopt(arguments, "filename")).await
         }
         "fetch_url" => fetch_url(a(arguments, "url", "")).await,
-        "run_python" => run_python(a(arguments, "code", "")).await,
+        "run_python" => run_python(a(arguments, "code", ""), ctx.clone()).await,
         "directory_tree" => {
             directory_tree(
                 a(arguments, "path", ""),
@@ -223,25 +290,6 @@ async fn execute_tool_inner(name: &str, arguments: &serde_json::Value) -> String
     }
 }
 
-pub fn kill_active_process() {
-    let pids: Vec<u32> = ACTIVE_PROCESS_GROUPS
-        .lock()
-        .unwrap()
-        .iter()
-        .copied()
-        .collect();
-    for pid in pids {
-        terminate_process_group(pid);
-    }
-}
-
-fn register_active_process(pid: u32) {
-    ACTIVE_PROCESS_GROUPS.lock().unwrap().insert(pid);
-}
-
-fn unregister_active_process(pid: u32) {
-    ACTIVE_PROCESS_GROUPS.lock().unwrap().remove(&pid);
-}
 
 fn terminate_process_group(pid: u32) {
     #[cfg(unix)]
@@ -451,18 +499,18 @@ fn rewrite_first_sudo(command: &str) -> String {
     command.to_string()
 }
 
-async fn run_bash(command: String) -> String {
+async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
     let timeout = timeout_secs();
 
     let password_needed = SUDO_WORD_RE.is_match(&command);
     if password_needed {
-        let need_pw = { CACHED_SUDO_PASSWORD.lock().unwrap().is_none() };
+        let need_pw = { ctx.cached_sudo_password.lock().unwrap().is_none() };
         if need_pw {
-            let provider = SUDO_PASSWORD_PROVIDER.lock().unwrap().take();
+            let provider = ctx.sudo_provider.lock().unwrap().take();
             let pw = match provider {
                 Some(cb) => {
                     let result = cb();
-                    *SUDO_PASSWORD_PROVIDER.lock().unwrap() = Some(cb);
+                    *ctx.sudo_provider.lock().unwrap() = Some(cb);
                     result
                 }
                 None => {
@@ -471,7 +519,7 @@ async fn run_bash(command: String) -> String {
             };
             match pw {
                 Some(p) => {
-                    *CACHED_SUDO_PASSWORD.lock().unwrap() = Some(p);
+                    *ctx.cached_sudo_password.lock().unwrap() = Some(p);
                 }
                 None => return "Cancelled: sudo password not provided.".into(),
             }
@@ -512,10 +560,10 @@ async fn run_bash(command: String) -> String {
     };
 
     let pid = child.id();
-    register_active_process(pid);
+    ctx.register_process(pid);
 
     if password_needed {
-        let pw_guard = CACHED_SUDO_PASSWORD.lock().unwrap();
+        let pw_guard = ctx.cached_sudo_password.lock().unwrap();
         if let Some(ref pw) = *pw_guard {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = writeln!(stdin, "{pw}");
@@ -526,6 +574,7 @@ async fn run_bash(command: String) -> String {
     // Use tokio::task::spawn_blocking to avoid blocking the async runtime.
     // Output is redirected to files instead of piped: a child that writes more
     // than an OS pipe buffer can otherwise block forever before it exits.
+    let ctx_blocking = ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
         let wait_result = if timeout > 0 {
             match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
@@ -544,7 +593,7 @@ async fn run_bash(command: String) -> String {
                 .wait()
                 .map_err(|e| format!("Error running command: {e}"))
         };
-        unregister_active_process(pid);
+        ctx_blocking.unregister_process(pid);
 
         let mut out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
@@ -1450,7 +1499,7 @@ async fn fetch_url(url_str: String) -> String {
     }
 }
 
-async fn run_python(code: String) -> String {
+async fn run_python(code: String, ctx: Arc<ToolContext>) -> String {
     let timeout = timeout_secs();
     let mut tmp = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
@@ -1489,8 +1538,9 @@ async fn run_python(code: String) -> String {
         }
     };
     let pid = child.id();
-    register_active_process(pid);
+    ctx.register_process(pid);
 
+    let ctx_blocking = ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
         let wait_result = if timeout > 0 {
             match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
@@ -1510,7 +1560,7 @@ async fn run_python(code: String) -> String {
                 .wait()
                 .map_err(|e| format!("Error running Python: {e}"))
         };
-        unregister_active_process(pid);
+        ctx_blocking.unregister_process(pid);
 
         let mut s = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
@@ -2273,7 +2323,8 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result = run_python("import time; time.sleep(5)".into()).await;
+        let result =
+            run_python("import time; time.sleep(5)".into(), Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Python execution timed out after 1 seconds"));
     }
@@ -2283,7 +2334,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result = run_bash("sleep 5".into()).await;
+        let result = run_bash("sleep 5".into(), Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Command timed out after 1 seconds"));
     }
@@ -2294,10 +2345,13 @@ mod tests {
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
         let args = serde_json::json!({"code": "import time; time.sleep(60)"});
-        let result =
-            tokio::time::timeout(Duration::from_secs(35), execute_tool("run_python", &args))
-                .await
-                .expect("outer safety net should finish before test timeout");
+        let ctx = Arc::new(ToolContext::new());
+        let result = tokio::time::timeout(
+            Duration::from_secs(35),
+            execute_tool("run_python", &args, &ctx),
+        )
+        .await
+        .expect("outer safety net should finish before test timeout");
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(
             result.contains("Python execution timed out")
@@ -2306,28 +2360,64 @@ mod tests {
     }
 
     #[test]
-    fn kill_active_process_removes_registered_process_group() {
+    fn kill_all_only_affects_own_context() {
         let _guard = test_tool_timeout_guard();
-        let mut command = std::process::Command::new("bash");
-        command
-            .arg("-c")
-            .arg("sleep 30")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().unwrap();
+        let spawn_sleep = || {
+            let mut command = std::process::Command::new("bash");
+            command
+                .arg("-c")
+                .arg("sleep 30")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            command.spawn().unwrap()
+        };
+
+        let ctx_a = Arc::new(ToolContext::new());
+        let ctx_b = Arc::new(ToolContext::new());
+
+        let mut child = spawn_sleep();
         let pid = child.id();
-        register_active_process(pid);
-        kill_active_process();
+        ctx_b.register_process(pid);
+
+        // Killing ctx_a must not touch ctx_b's process.
+        ctx_a.kill_all();
+        assert!(matches!(child.try_wait(), Ok(None)));
+
+        // ctx_b owns it, so this kills it.
+        ctx_b.kill_all();
         let _ = child.kill();
         let _ = child.wait();
-        unregister_active_process(pid);
-        assert!(!ACTIVE_PROCESS_GROUPS.lock().unwrap().contains(&pid));
+        assert!(!ctx_b
+            .active_process_groups
+            .lock()
+            .unwrap()
+            .contains(&pid));
+    }
+
+    #[test]
+    fn tool_context_sudo_provider_is_per_context() {
+        let ctx_a = ToolContext::new();
+        let ctx_b = ToolContext::new();
+        ctx_a.set_sudo_provider(Some(Box::new(|| Some("pw-a".into()))));
+        ctx_b.set_sudo_provider(Some(Box::new(|| Some("pw-b".into()))));
+        let call = |c: &ToolContext| c.sudo_provider.lock().unwrap().as_ref().unwrap()();
+        assert_eq!(call(&ctx_a), Some("pw-a".to_string()));
+        assert_eq!(call(&ctx_b), Some("pw-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_bash_refuses_sudo_without_provider() {
+        let _guard = test_tool_timeout_guard();
+        // A context with no provider must refuse sudo regardless of any other.
+        let ctx = Arc::new(ToolContext::new());
+        let result = run_bash("sudo true".into(), ctx).await;
+        assert!(result.contains("no password provider"));
     }
 
     #[test]
@@ -2665,7 +2755,8 @@ mod tests {
     #[tokio::test]
     async fn execute_tool_unknown_tool() {
         let args = serde_json::json!({});
-        let result = execute_tool("nonexistent_tool", &args).await;
+        let ctx = Arc::new(ToolContext::new());
+        let result = execute_tool("nonexistent_tool", &args, &ctx).await;
         assert!(result.contains("Unknown tool"));
     }
 
@@ -2675,7 +2766,8 @@ mod tests {
         let path = dir.path().join("dispatch_test.txt");
         std::fs::write(&path, "dispatch content").unwrap();
         let args = serde_json::json!({"path": path.to_str().unwrap()});
-        let result = execute_tool("read_file", &args).await;
+        let ctx = Arc::new(ToolContext::new());
+        let result = execute_tool("read_file", &args, &ctx).await;
         assert_eq!(result, "dispatch content");
     }
 
