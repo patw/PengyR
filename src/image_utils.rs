@@ -43,16 +43,17 @@ pub fn preprocess(
 
     // Step 1: dimension cap
     let img = if w > max_dimension || h > max_dimension {
-        img.resize(max_dimension, max_dimension, image::imageops::FilterType::Lanczos3)
+        img.resize(
+            max_dimension,
+            max_dimension,
+            image::imageops::FilterType::Lanczos3,
+        )
     } else {
         img
     };
 
     // Step 2: format conversion
-    let is_lossless = matches!(
-        mime.as_str(),
-        "image/png" | "image/gif" | "image/bmp"
-    );
+    let is_lossless = matches!(mime.as_str(), "image/png" | "image/gif" | "image/bmp");
     if is_lossless {
         // Try JPEG encoding
         let jpeg_bytes = encode_jpeg(&img, quality);
@@ -67,10 +68,7 @@ pub fn preprocess(
     // Step 3: size cap
     let buf = encode_image(&img, &mime, quality)?;
     if buf.len() <= max_bytes {
-        return Ok(Preprocessed {
-            bytes: buf,
-            mime,
-        });
+        return Ok(Preprocessed { bytes: buf, mime });
     }
 
     // Try lower JPEG quality

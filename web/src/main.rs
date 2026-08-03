@@ -83,9 +83,7 @@ async fn main() {
                 let v = require_value(&args, &mut i, "--port");
                 port = parse_port(&v);
             }
-            "--trusted-host" => {
-                trusted_hosts.push(require_value(&args, &mut i, "--trusted-host"))
-            }
+            "--trusted-host" => trusted_hosts.push(require_value(&args, &mut i, "--trusted-host")),
             "--config-dir" => config_dir = Some(require_value(&args, &mut i, "--config-dir")),
             other => {
                 // Unrecognised flags used to be discarded silently, so a typo
@@ -390,28 +388,39 @@ fn sse_event_to_json(event: &SseEvent) -> String {
         })
         .to_string(),
         SseEvent::SudoRequest => r#"{"type":"sudo_request"}"#.to_string(),
-        SseEvent::QuestionRequest { questions, tool_call_id } => serde_json::json!({
+        SseEvent::QuestionRequest {
+            questions,
+            tool_call_id,
+        } => serde_json::json!({
             "type": "question_request",
             "questions": questions,
             "tool_call_id": tool_call_id,
         })
         .to_string(),
-        SseEvent::QuestionResult { tool_call_id, content } => serde_json::json!({
+        SseEvent::QuestionResult {
+            tool_call_id,
+            content,
+        } => serde_json::json!({
             "type": "question_result",
             "tool_call_id": tool_call_id,
             "content": content,
         })
         .to_string(),
-        SseEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message } => {
-            serde_json::json!({
-                "type": "retrying",
-                "attempt": attempt,
-                "max_attempts": max_attempts,
-                "delay_secs": delay_secs,
-                "status_code": status_code,
-                "message": message,
-            }).to_string()
-        }
+        SseEvent::Retrying {
+            attempt,
+            max_attempts,
+            delay_secs,
+            status_code,
+            message,
+        } => serde_json::json!({
+            "type": "retrying",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "delay_secs": delay_secs,
+            "status_code": status_code,
+            "message": message,
+        })
+        .to_string(),
         SseEvent::Error { message } => {
             serde_json::json!({"type": "error", "message": message}).to_string()
         }
@@ -487,7 +496,17 @@ impl WebWorker {
 
             tokio::spawn(async move {
                 llm_client::chat(
-                    &bu, &ak, &md, messages, tc_mode, &re, pr, lt, event_tx, confirm_rx, cancel2,
+                    &bu,
+                    &ak,
+                    &md,
+                    messages,
+                    tc_mode,
+                    &re,
+                    pr,
+                    lt,
+                    event_tx,
+                    confirm_rx,
+                    cancel2,
                     ctx_for_task,
                 )
                 .await;
@@ -501,7 +520,13 @@ impl WebWorker {
                         yolo_this_turn = false;
                         chat.messages.push(message);
                     }
-                    Some(LlmEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message }) => {
+                    Some(LlmEvent::Retrying {
+                        attempt,
+                        max_attempts,
+                        delay_secs,
+                        status_code,
+                        message,
+                    }) => {
                         let _ = sse_tx2.send(SseEvent::Retrying {
                             attempt,
                             max_attempts,
@@ -597,9 +622,7 @@ impl WebWorker {
                         // Always wait for user answers (ask_user_question is always interactive)
                         match cmd_rx.recv().await {
                             Some(WorkerCommand::Confirm {
-                                confirmed,
-                                answers,
-                                ..
+                                confirmed, answers, ..
                             }) => {
                                 let _ = confirm_tx.send(Confirmation {
                                     tool_call_id,
@@ -615,12 +638,17 @@ impl WebWorker {
                         tool_call_id,
                         name: _name,
                         content,
-                    }) => {                        let _ = sse_tx2.send(SseEvent::QuestionResult {
+                    }) => {
+                        let _ = sse_tx2.send(SseEvent::QuestionResult {
                             tool_call_id,
                             content,
                         });
                     }
-                    Some(LlmEvent::FinalResponse { content, message, usage }) => {
+                    Some(LlmEvent::FinalResponse {
+                        content,
+                        message,
+                        usage,
+                    }) => {
                         chat.messages.push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
                             content: Some(serde_json::Value::String(content.clone())),
@@ -677,7 +705,10 @@ async fn new_chat() -> impl IntoResponse {
     Redirect::to(&format!("/chat/{}", chat.id))
 }
 
-async fn chat_view(Path(chat_id): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
+async fn chat_view(
+    Path(chat_id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let chat = match chat_manager::get_chat(&chat_id) {
         Some(c) => c,
         None => return Redirect::to("/").into_response(),
@@ -688,7 +719,14 @@ async fn chat_view(Path(chat_id): Path<String>, State(state): State<AppState>) -
     let turns = group_messages(&chat.messages);
     let has_active_worker = state.workers.lock().unwrap().contains_key(&chat_id);
 
-    Html(templates::chat_page(&chat, &chats, &config, &turns, has_active_worker)).into_response()
+    Html(templates::chat_page(
+        &chat,
+        &chats,
+        &config,
+        &turns,
+        has_active_worker,
+    ))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -726,8 +764,11 @@ async fn chat_send(
                         .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or("png");
-                    let tmp = std::env::temp_dir()
-                        .join(format!("pengy_web_{}.{}", std::process::id(), ext));
+                    let tmp = std::env::temp_dir().join(format!(
+                        "pengy_web_{}.{}",
+                        std::process::id(),
+                        ext
+                    ));
                     if std::fs::write(&tmp, &decoded).is_ok() {
                         if let Ok(result) = pengy_core::image_utils::preprocess(
                             &tmp,
@@ -736,8 +777,8 @@ async fn chat_send(
                             config.image_quality,
                         ) {
                             use base64::Engine;
-                            let b64 = base64::engine::general_purpose::STANDARD
-                                .encode(&result.bytes);
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(&result.bytes);
                             image_parts.push(serde_json::json!({
                                 "type": "image_url",
                                 "image_url": {"url": format!("data:{};base64,{}", result.mime, b64)}
@@ -1054,10 +1095,7 @@ async fn chat_export(Path(chat_id): Path<String>) -> impl IntoResponse {
                 lines.push("### 🤖 Assistant (tool calls)".to_string());
                 for tc in &msg.tool_calls {
                     lines.push(format!("- **{}**", tc.function.name));
-                    lines.push(format!(
-                        "  ```json\n  {}\n  ```",
-                        tc.function.arguments
-                    ));
+                    lines.push(format!("  ```json\n  {}\n  ```", tc.function.arguments));
                 }
                 lines.push(String::new());
             }
@@ -1334,9 +1372,9 @@ async fn serve_file(
         std::path::PathBuf::from("/tmp"),
     ];
 
-    let is_allowed = allowed.iter().any(|root| {
-        path == *root || path.starts_with(root)
-    });
+    let is_allowed = allowed
+        .iter()
+        .any(|root| path == *root || path.starts_with(root));
 
     if !is_allowed {
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
@@ -1415,7 +1453,10 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
         }
     }
     if let Some(v) = &form.reasoning_effort {
-        if ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&v.as_str())
+        if [
+            "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ]
+        .contains(&v.as_str())
         {
             config.reasoning_effort = v.clone();
         }
@@ -1902,8 +1943,9 @@ fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for b in path.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'/' | b'.' | b'-' | b'_' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -2176,13 +2218,23 @@ mod templates {
         html
     }
 
-    pub fn chat_page(chat: &Chat, chats: &[ChatSummary], config: &Config, turns: &[Turn], has_active_worker: bool) -> String {
+    pub fn chat_page(
+        chat: &Chat,
+        chats: &[ChatSummary],
+        config: &Config,
+        turns: &[Turn],
+        has_active_worker: bool,
+    ) -> String {
         let sidebar = render_sidebar_chats(chats, &chat.id);
 
         let tc_badge = match config.tool_confirmation.as_str() {
-            "all" => r#"<span class="badge text-bg-warning small" id="navConfirmBadge">YOLO</span>"#,
+            "all" => {
+                r#"<span class="badge text-bg-warning small" id="navConfirmBadge">YOLO</span>"#
+            }
             "safe" => r#"<span class="badge text-bg-info small" id="navConfirmBadge">Safe</span>"#,
-            _ => r#"<span class="badge text-bg-secondary small" id="navConfirmBadge">Confirm All</span>"#,
+            _ => {
+                r#"<span class="badge text-bg-secondary small" id="navConfirmBadge">Confirm All</span>"#
+            }
         };
         let navbar_center = format!(
             r#"<span class="text-muted small d-none d-sm-inline" id="navModel">{}</span> {}
@@ -2236,8 +2288,7 @@ mod templates {
                             r#"<span class="badge bg-secondary ms-1">?</span>"#
                         };
 
-                        let args_str =
-                            serde_json::to_string_pretty(&ev.args).unwrap_or_default();
+                        let args_str = serde_json::to_string_pretty(&ev.args).unwrap_or_default();
 
                         let result_html = match &ev.result {
                             Some(r) if ev.declined => {
@@ -3023,15 +3074,51 @@ function submitQuestion(override) {{
         } else {
             ""
         };
-        let reasoning_default_sel = if config.reasoning_effort.is_empty() { " selected" } else { "" };
-        let reasoning_none_sel = if config.reasoning_effort == "none" { " selected" } else { "" };
-        let reasoning_minimal_sel = if config.reasoning_effort == "minimal" { " selected" } else { "" };
-        let reasoning_low_sel = if config.reasoning_effort == "low" { " selected" } else { "" };
-        let reasoning_medium_sel = if config.reasoning_effort == "medium" { " selected" } else { "" };
-        let reasoning_high_sel = if config.reasoning_effort == "high" { " selected" } else { "" };
-        let reasoning_xhigh_sel = if config.reasoning_effort == "xhigh" { " selected" } else { "" };
-        let reasoning_max_sel = if config.reasoning_effort == "max" { " selected" } else { "" };
-        let preserve_reasoning_checked = if config.preserve_reasoning { " checked" } else { "" };
+        let reasoning_default_sel = if config.reasoning_effort.is_empty() {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_none_sel = if config.reasoning_effort == "none" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_minimal_sel = if config.reasoning_effort == "minimal" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_low_sel = if config.reasoning_effort == "low" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_medium_sel = if config.reasoning_effort == "medium" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_high_sel = if config.reasoning_effort == "high" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_xhigh_sel = if config.reasoning_effort == "xhigh" {
+            " selected"
+        } else {
+            ""
+        };
+        let reasoning_max_sel = if config.reasoning_effort == "max" {
+            " selected"
+        } else {
+            ""
+        };
+        let preserve_reasoning_checked = if config.preserve_reasoning {
+            " checked"
+        } else {
+            ""
+        };
         let api_key_status = if config.api_key.is_empty() {
             "not set"
         } else {

@@ -23,7 +23,7 @@ else()
 endif()
 message(STATUS "Platform: ${PENGY_PLATFORM}")
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network Svg)
 
 # ── Find Rust library ─────────────────────────────────────────────
 
@@ -85,14 +85,14 @@ add_executable(pengy
 if(PENGY_RUST_STATIC)
   if(WIN32)
     target_link_libraries(pengy PRIVATE
-      Qt6::Core Qt6::Widgets Qt6::Network
+      Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
       ${PENGY_CORE_LIB}
       ws2_32 userenv ntdll bcrypt advapi32
     )
   elseif(APPLE)
     find_package(OpenSSL REQUIRED)
     target_link_libraries(pengy PRIVATE
-      Qt6::Core Qt6::Widgets Qt6::Network
+      Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
       ${PENGY_CORE_LIB}
       OpenSSL::SSL OpenSSL::Crypto
       "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration"
@@ -101,7 +101,7 @@ if(PENGY_RUST_STATIC)
   else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(pengy PRIVATE
-      Qt6::Core Qt6::Widgets Qt6::Network
+      Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
       ${PENGY_CORE_LIB}
       OpenSSL::SSL OpenSSL::Crypto
       pthread dl m
@@ -109,7 +109,7 @@ if(PENGY_RUST_STATIC)
   endif()
 else()
   target_link_libraries(pengy PRIVATE
-    Qt6::Core Qt6::Widgets Qt6::Network
+    Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
     ${PENGY_CORE_LIB}
   )
 endif()
@@ -142,7 +142,7 @@ if(PENGY_BUILD_TESTS)
     tests/test_chatview_markdown.cpp chatview.cpp
   )
   target_compile_definitions(pengy_chatview_markdown_test PRIVATE PENGY_UNIT_TEST)
-  target_link_libraries(pengy_chatview_markdown_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Network)
+  target_link_libraries(pengy_chatview_markdown_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg)
   target_include_directories(pengy_chatview_markdown_test PRIVATE ${CMAKE_SOURCE_DIR})
   add_test(NAME pengy_chatview_markdown_test COMMAND pengy_chatview_markdown_test)
 endif()

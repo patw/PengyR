@@ -16,6 +16,8 @@
 #include <QPointer>
 #include <QAbstractItemView>
 #include <QTabWidget>
+#include "themehelper.h"
+#include "iconhelper.h"
 
 /* ComboBox whose dropdown popup is ~50% wider than the combo itself,
    so short-content combos (scale %, theme, accent) feel proportional
@@ -59,9 +61,12 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         if (scales[i] == currentScale) idx = i;
     }
     m_uiScale->setCurrentIndex(idx);
-    m_uiScale->setToolTip("Scales the entire UI. A restart is needed for the change to take full effect.");
-    uiForm->addRow(labelWithTip("UI Scale:", "Scales the entire UI. A restart is needed for the change to take full effect."), m_uiScale);
-
+    m_uiScale->setToolTip("Scales the entire UI. Restart Pengy to apply a change.");
+    uiForm->addRow(labelWithTip("UI Scale:", "Scales the entire UI. Restart Pengy to apply a change."), m_uiScale);
+    auto* scaleNote = new QLabel("UI scale changes take effect after restarting Pengy.");
+    scaleNote->setWordWrap(true);
+    scaleNote->setStyleSheet(QString("color:%1;").arg(makeTheme(config["theme_mode"].toString("system"), config["theme_accent"].toString("default"))["muted"]));
+    uiForm->addRow("", scaleNote);
     m_themeMode = new WidePopupComboBox;
     m_themeMode->addItem("System", "system");
     m_themeMode->addItem("Light", "light");
@@ -106,16 +111,17 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_model->setToolTip("Model name sent in chat completion requests. Use Fetch to list available models from the endpoint.");
     modelRow->addWidget(m_model, 1);
 
-    m_fetchBtn = new QPushButton("↻ Fetch");
+    m_fetchBtn = new QPushButton("Fetch");
     m_fetchBtn->setToolTip("Fetch available models from the /models endpoint");
     m_fetchBtn->setFixedWidth(80);
+    applyPengyIcon(m_fetchBtn, "refresh", makeTheme(config["theme_mode"].toString("system"), config["theme_accent"].toString("default")), 15);
     connect(m_fetchBtn, &QPushButton::clicked, this, &SettingsDialog::fetchModels);
     modelRow->addWidget(m_fetchBtn);
 
     llmForm->addRow(labelWithTip("Model:", "Model name sent in chat completion requests. Use Fetch to list available models from the endpoint."), modelRow);
 
     m_systemMsg = new QTextEdit(config["system_message"].toString("You are a helpful assistant."));
-    m_systemMsg->setMaximumHeight(100);
+    m_systemMsg->setMaximumHeight(scaledSize(100, config["ui_scale"].toInt(100)));
     m_systemMsg->setToolTip("The system prompt that sets the assistant's behavior, tone, and constraints.");
     llmForm->addRow(labelWithTip("System Message:", "The system prompt that sets the assistant's behavior, tone, and constraints."), m_systemMsg);
 
@@ -192,7 +198,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_toolOutputMax->setSpecialValueText("No limit");
     m_toolOutputMax->setSuffix(" chars");
     m_toolOutputMax->setToolTip("Tool output longer than this is snipped (head+tail) to avoid blowing up the context window. 0 = no limit.");
-    m_toolOutputMax->setValue(config["tool_output_max_chars"].toInt(50000));
+    m_toolOutputMax->setValue(config["tool_output_max_chars"].toInt(250000));
     toolsForm->addRow(labelWithTip("Max tool output:", "Tool output longer than this is snipped (head+tail) to avoid blowing up the context window. 0 = no limit."), m_toolOutputMax);
 
     m_userAgent = new QLineEdit(config["user_agent"].toString("PengyAgent/1.0"));
@@ -268,7 +274,7 @@ void SettingsDialog::fetchModels() {
 
             QMetaObject::invokeMethod(model, [model, btn, modelIds, self]() {
                 btn->setEnabled(true);
-                btn->setText("↻ Fetch");
+                btn->setText("Fetch");
                 if (modelIds.isEmpty()) {
                     if (self) QMessageBox::information(self, "No Models", "The endpoint returned an empty model list.");
                     return;
@@ -288,7 +294,7 @@ void SettingsDialog::fetchModels() {
                 .arg(code).arg(baseUrl);
             QMetaObject::invokeMethod(model, [btn, err, self]() {
                 btn->setEnabled(true);
-                btn->setText("↻ Fetch");
+                btn->setText("Fetch");
                 if (self) QMessageBox::warning(self, "Fetch Failed", err);
             }, Qt::QueuedConnection);
         }

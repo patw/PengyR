@@ -167,7 +167,6 @@ fn format_question_answers(questions: &serde_json::Value, answers: &[String]) ->
     lines.join("\n")
 }
 
-
 pub async fn chat(
     base_url: &str,
     api_key: &str,
@@ -372,9 +371,21 @@ pub async fn chat(
                         })
                         .collect(),
                     tool_call_id: None,
-                    reasoning_content: if preserve_reasoning { msg.get("reasoning_content").cloned() } else { None },
-                    reasoning: if preserve_reasoning { msg.get("reasoning").cloned() } else { None },
-                    reasoning_details: if preserve_reasoning { msg.get("reasoning_details").cloned() } else { None },
+                    reasoning_content: if preserve_reasoning {
+                        msg.get("reasoning_content").cloned()
+                    } else {
+                        None
+                    },
+                    reasoning: if preserve_reasoning {
+                        msg.get("reasoning").cloned()
+                    } else {
+                        None
+                    },
+                    reasoning_details: if preserve_reasoning {
+                        msg.get("reasoning_details").cloned()
+                    } else {
+                        None
+                    },
                 };
 
                 let _ = event_tx.send(LlmEvent::AssistantToolCalls {
@@ -399,7 +410,10 @@ pub async fn chat(
 
                     // ask_user_question is a special harness-level tool
                     if name == "ask_user_question" {
-                        let questions = args.get("questions").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                        let questions = args
+                            .get("questions")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Array(vec![]));
                         let _ = event_tx.send(LlmEvent::QuestionRequest {
                             name: name.clone(),
                             args: args.clone(),
@@ -553,9 +567,21 @@ pub async fn chat(
             content: Some(serde_json::Value::String(content.clone())),
             tool_calls: vec![],
             tool_call_id: None,
-            reasoning_content: if preserve_reasoning { msg.get("reasoning_content").cloned() } else { None },
-            reasoning: if preserve_reasoning { msg.get("reasoning").cloned() } else { None },
-            reasoning_details: if preserve_reasoning { msg.get("reasoning_details").cloned() } else { None },
+            reasoning_content: if preserve_reasoning {
+                msg.get("reasoning_content").cloned()
+            } else {
+                None
+            },
+            reasoning: if preserve_reasoning {
+                msg.get("reasoning").cloned()
+            } else {
+                None
+            },
+            reasoning_details: if preserve_reasoning {
+                msg.get("reasoning_details").cloned()
+            } else {
+                None
+            },
         };
         let _ = event_tx.send(LlmEvent::FinalResponse {
             content,
@@ -817,13 +843,27 @@ mod loop_tests {
             )
             .await;
         });
-        Driver { rx, confirm_tx, handle }
+        Driver {
+            rx,
+            confirm_tx,
+            handle,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn final_response_no_tools() {
-        let (base, requests) = stub_server(vec![completion("hello there", serde_json::Value::Null, (10, 5))]);
-        let mut d = start_chat(&base, vec![user_msg("hi")], ToolConfirmation::None, "", false);
+        let (base, requests) = stub_server(vec![completion(
+            "hello there",
+            serde_json::Value::Null,
+            (10, 5),
+        )]);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("hi")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
 
         match d.rx.recv().await.unwrap() {
             LlmEvent::FinalResponse { content, usage, .. } => {
@@ -836,14 +876,20 @@ mod loop_tests {
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs[0]["model"], "stub-model");
-        assert!(reqs[0]["tools"].as_array().unwrap().len() == 14);
+        assert!(reqs[0]["tools"].as_array().unwrap().len() == 15);
         assert!(reqs[0].get("reasoning_effort").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reasoning_effort_included_when_set() {
         let (base, requests) = stub_server(vec![completion("ok", serde_json::Value::Null, (1, 1))]);
-        let mut d = start_chat(&base, vec![user_msg("hi")], ToolConfirmation::None, "high", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("hi")],
+            ToolConfirmation::None,
+            "high",
+            false,
+        );
         d.rx.recv().await.unwrap();
         d.handle.await.unwrap();
         assert_eq!(requests.lock().unwrap()[0]["reasoning_effort"], "high");
@@ -857,15 +903,33 @@ mod loop_tests {
         let args = serde_json::json!({"path": file.to_str().unwrap()});
 
         let (base, requests) = stub_server(vec![
-            completion("", serde_json::json!([tool_call("tc1", "read_file", &args)]), (100, 20)),
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "read_file", &args)]),
+                (100, 20),
+            ),
             completion("done", serde_json::Value::Null, (200, 30)),
         ]);
-        let mut d = start_chat(&base, vec![user_msg("read it")], ToolConfirmation::All, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("read it")],
+            ToolConfirmation::All,
+            "",
+            false,
+        );
 
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::AssistantToolCalls { .. }));
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::AssistantToolCalls { .. }
+        ));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::ToolRequest { .. }
+        ));
         match d.rx.recv().await.unwrap() {
-            LlmEvent::ToolResult { content, declined, .. } => {
+            LlmEvent::ToolResult {
+                content, declined, ..
+            } => {
                 assert!(!declined);
                 assert!(content.contains("file body here"));
             }
@@ -894,17 +958,38 @@ mod loop_tests {
         let args = serde_json::json!({"path": target.to_str().unwrap(), "content": "written!"});
 
         let (base, _requests) = stub_server(vec![
-            completion("", serde_json::json!([tool_call("tc1", "write_file", &args)]), (1, 1)),
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "write_file", &args)]),
+                (1, 1),
+            ),
             completion("done", serde_json::Value::Null, (1, 1)),
         ]);
-        let mut d = start_chat(&base, vec![user_msg("write")], ToolConfirmation::Safe, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("write")],
+            ToolConfirmation::Safe,
+            "",
+            false,
+        );
 
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::AssistantToolCalls { .. }));
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::AssistantToolCalls { .. }
+        ));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::ToolRequest { .. }
+        ));
         assert!(!target.exists(), "tool must not run before confirmation");
 
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: false, answers: None })
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: true,
+                yolo_turn: false,
+                answers: None,
+            })
             .unwrap();
 
         match d.rx.recv().await.unwrap() {
@@ -912,7 +997,10 @@ mod loop_tests {
             other => panic!("expected ToolResult, got {other:?}"),
         }
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "written!");
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { .. }));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::FinalResponse { .. }
+        ));
         d.handle.await.unwrap();
     }
 
@@ -923,20 +1011,36 @@ mod loop_tests {
         let args = serde_json::json!({"path": target.to_str().unwrap(), "content": "x"});
 
         let (base, requests) = stub_server(vec![
-            completion("", serde_json::json!([tool_call("tc1", "write_file", &args)]), (1, 1)),
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "write_file", &args)]),
+                (1, 1),
+            ),
             completion("understood", serde_json::Value::Null, (1, 1)),
         ]);
-        let mut d = start_chat(&base, vec![user_msg("write")], ToolConfirmation::None, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("write")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
 
         d.rx.recv().await.unwrap(); // AssistantToolCalls
         d.rx.recv().await.unwrap(); // ToolRequest
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: false, yolo_turn: false,
-            answers: None })
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: false,
+                yolo_turn: false,
+                answers: None,
+            })
             .unwrap();
 
         match d.rx.recv().await.unwrap() {
-            LlmEvent::ToolResult { declined, content, .. } => {
+            LlmEvent::ToolResult {
+                declined, content, ..
+            } => {
                 assert!(declined);
                 assert_eq!(content, "Tool execution was declined by user.");
             }
@@ -963,24 +1067,41 @@ mod loop_tests {
         let args2 = serde_json::json!({"path": f2.to_str().unwrap(), "content": "two"});
 
         let (base, _requests) = stub_server(vec![
-            completion("", serde_json::json!([
-                tool_call("tc1", "write_file", &args1),
-                tool_call("tc2", "write_file", &args2),
-            ]), (1, 1)),
+            completion(
+                "",
+                serde_json::json!([
+                    tool_call("tc1", "write_file", &args1),
+                    tool_call("tc2", "write_file", &args2),
+                ]),
+                (1, 1),
+            ),
             completion("done", serde_json::Value::Null, (1, 1)),
         ]);
-        let mut d = start_chat(&base, vec![user_msg("write both")], ToolConfirmation::None, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("write both")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
 
         d.rx.recv().await.unwrap(); // AssistantToolCalls
         d.rx.recv().await.unwrap(); // ToolRequest tc1
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true,
-            answers: None })
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: true,
+                yolo_turn: true,
+                answers: None,
+            })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
 
         // tc2 must run WITHOUT another confirmation being sent
-        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+        assert!(matches!(
+            d.rx.recv().await.unwrap(),
+            LlmEvent::ToolRequest { .. }
+        ));
         match d.rx.recv().await.unwrap() {
             LlmEvent::ToolResult { declined, .. } => assert!(!declined),
             other => panic!("expected ToolResult, got {other:?}"),
@@ -999,17 +1120,35 @@ mod loop_tests {
         let args2 = serde_json::json!({"path": f2.to_str().unwrap(), "content": "two"});
 
         let (base, _requests) = stub_server(vec![
-            completion("", serde_json::json!([tool_call("tc1", "write_file", &args1)]), (1, 1)),
-            completion("", serde_json::json!([tool_call("tc2", "write_file", &args2)]), (1, 1)),
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "write_file", &args1)]),
+                (1, 1),
+            ),
+            completion(
+                "",
+                serde_json::json!([tool_call("tc2", "write_file", &args2)]),
+                (1, 1),
+            ),
             completion("done", serde_json::Value::Null, (1, 1)),
         ]);
-        let mut d = start_chat(&base, vec![user_msg("write twice")], ToolConfirmation::None, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("write twice")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
 
         d.rx.recv().await.unwrap(); // AssistantToolCalls round 1
         d.rx.recv().await.unwrap(); // ToolRequest tc1
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true,
-            answers: None })
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: true,
+                yolo_turn: true,
+                answers: None,
+            })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
 
@@ -1017,8 +1156,12 @@ mod loop_tests {
         d.rx.recv().await.unwrap(); // AssistantToolCalls round 2
         d.rx.recv().await.unwrap(); // ToolRequest tc2
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc2".into(), confirmed: false, yolo_turn: false,
-            answers: None })
+            .send(Confirmation {
+                tool_call_id: "tc2".into(),
+                confirmed: false,
+                yolo_turn: false,
+                answers: None,
+            })
             .unwrap();
         match d.rx.recv().await.unwrap() {
             LlmEvent::ToolResult { declined, .. } => {
@@ -1044,13 +1187,20 @@ mod loop_tests {
                 let resp = format!(
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
+                    body.len(),
+                    body
                 );
                 let _ = sock.write_all(resp.as_bytes());
             }
         });
 
-        let mut d = start_chat(&base, vec![user_msg("hi")], ToolConfirmation::None, "", false);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("hi")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
         match d.rx.recv().await.unwrap() {
             LlmEvent::FinalResponse { content, .. } => {
                 assert!(content.contains("API error"), "got: {content}");

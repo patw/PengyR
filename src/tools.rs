@@ -5,7 +5,7 @@
 use futures_util::StreamExt;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -142,6 +142,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("old_str", "string", "The exact text to find and replace. Must match exactly one location."),
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
+        apply_changes_definition(),
         td("run_bash", "Run a bash command in the terminal",
             &[("command", "string", "The bash command to execute")],
             &["command"]),
@@ -185,6 +186,24 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("questions", "array", "One or more questions with header, question text, and options")],
             &["questions"]),
     ]
+}
+
+fn apply_changes_definition() -> ToolDef {
+    ToolDef { tool_type: "function".into(), function: FunctionDef {
+        name: "apply_changes".into(),
+        description: "Apply bounded transactional exact-text edits across files. Validate all operations in memory first; if any operation fails, no files are changed. Use dry_run to preview the unified diff.".into(),
+        parameters: ParametersDef {
+            param_type: "object".into(),
+            properties: serde_json::json!({
+                "changes": {"type":"array", "description":"Files and operations to apply", "items": {"type":"object", "properties": {
+                    "path":{"type":"string"}, "operations":{"type":"array", "items":{"type":"object"}}
+                }, "required":["path","operations"]}},
+                "dry_run":{"type":"boolean"},
+                "postconditions":{"type":"array", "items":{"type":"object"}}
+            }),
+            required: vec!["changes".into()],
+        }
+    }}
 }
 
 fn td(name: &str, desc: &str, props: &[(&str, &str, &str)], required: &[&str]) -> ToolDef {
@@ -260,9 +279,9 @@ async fn execute_tool_inner(
                 a(arguments, "path", ""),
                 a(arguments, "old_str", ""),
                 a(arguments, "new_str", ""),
-            )
-            .await
+            ).await
         }
+        "apply_changes" => apply_changes(arguments).await,
         "run_bash" => run_bash(a(arguments, "command", ""), ctx.clone()).await,
         "web_search" => {
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
@@ -316,6 +335,229 @@ async fn execute_tool_inner(
     }
 }
 
+async fn apply_changes(args: &serde_json::Value) -> String {
+    const MAX_FILES: usize = 20;
+    const MAX_OPS: usize = 100;
+    const MAX_BLOCK: usize = 256_000;
+    const MAX_RESULT: usize = 1_000_000;
+    let changes = match args.get("changes").and_then(|v| v.as_array()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return "Error: changes must be a non-empty list.".into(),
+    };
+    if changes.len() > MAX_FILES {
+        return format!(
+            "Error: too many files ({}). Maximum is {MAX_FILES}.",
+            changes.len()
+        );
+    }
+    let mut prepared: HashMap<PathBuf, (String, String)> = HashMap::new();
+    let mut errors = Vec::new();
+    let mut ops = 0usize;
+    let mut result_bytes = 0usize;
+    for (fi, change) in changes.iter().enumerate() {
+        let obj = match change.as_object() {
+            Some(x) => x,
+            None => {
+                errors.push(format!("file {fi}: must be an object"));
+                continue;
+            }
+        };
+        let raw = obj.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let path = expand_home(raw)
+            .canonicalize()
+            .unwrap_or_else(|_| expand_home(raw));
+        if prepared.contains_key(&path) {
+            errors.push(format!("{raw}: duplicate path"));
+            continue;
+        }
+        if !path.exists() {
+            errors.push(format!("{raw}: file not found"));
+            continue;
+        }
+        if !path.is_file() {
+            errors.push(format!("{raw}: not a file"));
+            continue;
+        }
+        let original = match std::fs::read_to_string(&path) {
+            Ok(x) => x,
+            Err(_) => {
+                errors.push(format!("{raw}: binary or non-UTF-8 file"));
+                continue;
+            }
+        };
+        let mut current = original.clone();
+        let arr = match obj.get("operations").and_then(|v| v.as_array()) {
+            Some(x) if !x.is_empty() => x,
+            _ => {
+                errors.push(format!("{raw}: operations must be non-empty"));
+                continue;
+            }
+        };
+        ops += arr.len();
+        if ops > MAX_OPS {
+            errors.push(format!("too many operations; maximum is {MAX_OPS}"));
+            break;
+        }
+        for (oi, op) in arr.iter().enumerate() {
+            let o = match op.as_object() {
+                Some(x) => x,
+                None => {
+                    errors.push(format!("{raw} operation {oi}: must be an object"));
+                    continue;
+                }
+            };
+            let kind = o.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let expected = o
+                .get("expected_matches")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as usize;
+            if expected == 0 {
+                errors.push(format!(
+                    "{raw} operation {oi}: expected_matches must be positive"
+                ));
+                continue;
+            }
+            let (needle, replacement) = match kind {
+                "replace" => (
+                    o.get("old").and_then(|v| v.as_str()).unwrap_or(""),
+                    o.get("new").and_then(|v| v.as_str()).unwrap_or(""),
+                ),
+                "delete" => (o.get("old").and_then(|v| v.as_str()).unwrap_or(""), ""),
+                "insert_after" => (
+                    o.get("anchor").and_then(|v| v.as_str()).unwrap_or(""),
+                    o.get("text").and_then(|v| v.as_str()).unwrap_or(""),
+                ),
+                _ => {
+                    errors.push(format!("{raw} operation {oi}: unknown kind {kind:?}"));
+                    continue;
+                }
+            };
+            if needle.is_empty() {
+                errors.push(format!(
+                    "{raw} operation {oi}: match text must be non-empty"
+                ));
+                continue;
+            }
+            if needle.len() > MAX_BLOCK || replacement.len() > MAX_BLOCK {
+                errors.push(format!(
+                    "{raw} operation {oi}: text block exceeds {MAX_BLOCK} bytes"
+                ));
+                continue;
+            }
+            let count = current.matches(needle).count();
+            if count != expected {
+                errors.push(format!(
+                    "{raw} operation {oi}: matches {count} locations; expected {expected}"
+                ));
+                continue;
+            }
+            let repl = if kind == "insert_after" {
+                format!("{needle}{replacement}")
+            } else {
+                replacement.to_string()
+            };
+            current = current.replacen(needle, &repl, expected);
+        }
+        result_bytes += original.len() + current.len();
+        prepared.insert(path, (original, current));
+    }
+    if result_bytes > MAX_RESULT {
+        errors.push(format!("result exceeds {MAX_RESULT} bytes"));
+    }
+    if let Some(conditions) = args.get("postconditions").and_then(|v| v.as_array()) {
+        for (i, c) in conditions.iter().enumerate() {
+            let o = match c.as_object() {
+                Some(x) => x,
+                None => {
+                    errors.push(format!("postcondition {i}: must be object"));
+                    continue;
+                }
+            };
+            let raw = o.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = expand_home(raw)
+                .canonicalize()
+                .unwrap_or_else(|_| expand_home(raw));
+            let content = prepared
+                .get(&path)
+                .map(|(_, x)| x.clone())
+                .or_else(|| std::fs::read_to_string(&path).ok())
+                .unwrap_or_default();
+            if let Some(x) = o.get("contains").and_then(|v| v.as_str()) {
+                if !content.contains(x) {
+                    errors.push(format!(
+                        "postcondition {i}: {raw} does not contain expected text"
+                    ));
+                }
+            }
+            if let Some(x) = o.get("does_not_contain").and_then(|v| v.as_str()) {
+                if content.contains(x) {
+                    errors.push(format!(
+                        "postcondition {i}: {raw} still contains forbidden text"
+                    ));
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return format!(
+            "Error: no changes applied.\n{}",
+            errors
+                .iter()
+                .map(|x| format!("- {x}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    let dry = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut diff = String::new();
+    for (path, (old, new)) in &prepared {
+        if old != new {
+            diff.push_str(&format!("--- {}\n+++ {}\n", path.display(), path.display()));
+            diff.push_str(&format!(
+                "@@ changed content: {} -> {} bytes @@\n",
+                old.len(),
+                new.len()
+            ));
+        }
+    }
+    if dry {
+        return format!(
+            "Dry run: no changes applied.\nFiles: {}\n\n{}",
+            prepared.len(),
+            diff
+        )
+        .trim_end()
+        .into();
+    }
+    let mut temps = Vec::new();
+    for (path, (_, new)) in &prepared {
+        let tmp = path.with_file_name(format!(
+            ".{}.pengy-tmp-{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        if let Err(e) = std::fs::write(&tmp, new) {
+            for t in temps {
+                let _ = std::fs::remove_file(t);
+            }
+            return format!("Error: write failed; no changes applied: {e}");
+        }
+        temps.push(tmp);
+    }
+    for (i, (path, _)) in prepared.iter().enumerate() {
+        if let Err(e) = std::fs::rename(&temps[i], path) {
+            return format!(
+                "Error: rename failed after validation; changes may be partially applied: {e}"
+            );
+        }
+    }
+    format!("Applied changes to {} file(s).\n\n{}", prepared.len(), diff)
+        .trim_end()
+        .into()
+}
 
 fn terminate_process_group(pid: u32) {
     #[cfg(unix)]
@@ -624,9 +866,7 @@ async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
         let mut out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
-            let err = SUDO_PROMPT_RE
-                .replace_all(&err, "")
-                .to_string();
+            let err = SUDO_PROMPT_RE.replace_all(&err, "").to_string();
             if !err.is_empty() {
                 out.push('\n');
                 out.push_str(&err);
@@ -1774,7 +2014,7 @@ fn format_size(size: u64) -> String {
 async fn read_multiple_files(paths: Vec<String>) -> String {
     const MAX_FILES: usize = 20;
     const MAX_PER_FILE: usize = 250_000;
-    const MAX_TOTAL: usize = 1_250_000;  // 5× the global tool output limit
+    const MAX_TOTAL: usize = 1_250_000; // 5× the global tool output limit
 
     if paths.is_empty() {
         return "Error: no paths provided.".into();
@@ -1832,10 +2072,7 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
             if remaining > 200 {
                 let short_block = format!(
                     "{header}\n{}...",
-                    truncate_on_char_boundary(
-                        &content,
-                        remaining.saturating_sub(header.len() + 4)
-                    )
+                    truncate_on_char_boundary(&content, remaining.saturating_sub(header.len() + 4))
                 );
                 parts.push(short_block);
             } else {
@@ -2271,21 +2508,20 @@ mod tests {
     // ── tool_definitions ───────────────────────────────────────────
 
     #[test]
-    fn tool_definitions_has_fourteen_tools() {
-        assert_eq!(tool_definitions().len(), 14);
+    fn tool_definitions_has_fifteen_tools() {
+        assert_eq!(tool_definitions().len(), 15);
     }
 
     #[test]
-    fn tool_definitions_json_has_fourteen_tools() {
+    fn tool_definitions_json_has_fifteen_tools() {
         let json = tool_definitions_json();
         assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 14);
+        assert_eq!(json.as_array().unwrap().len(), 15);
     }
 
     #[test]
     fn tool_definitions_json_matches_struct() {
-        let from_struct: serde_json::Value =
-            serde_json::to_value(tool_definitions()).unwrap();
+        let from_struct: serde_json::Value = serde_json::to_value(tool_definitions()).unwrap();
         let from_cache = tool_definitions_json();
         assert_eq!(from_struct, from_cache);
     }
@@ -2303,7 +2539,7 @@ mod tests {
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 15);
     }
 
     #[test]
@@ -2322,7 +2558,7 @@ mod tests {
         let json = serde_json::to_string(&defs).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_array());
-        assert_eq!(parsed.as_array().unwrap().len(), 14);
+        assert_eq!(parsed.as_array().unwrap().len(), 15);
     }
 
     #[test]
@@ -2342,8 +2578,11 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result =
-            run_python("import time; time.sleep(5)".into(), Arc::new(ToolContext::new())).await;
+        let result = run_python(
+            "import time; time.sleep(5)".into(),
+            Arc::new(ToolContext::new()),
+        )
+        .await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Python execution timed out after 1 seconds"));
     }
@@ -2412,11 +2651,7 @@ mod tests {
         ctx_b.kill_all();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!ctx_b
-            .active_process_groups
-            .lock()
-            .unwrap()
-            .contains(&pid));
+        assert!(!ctx_b.active_process_groups.lock().unwrap().contains(&pid));
     }
 
     #[test]
@@ -2919,13 +3154,15 @@ mod tests {
     async fn read_multiple_files_truncates_on_char_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unicode.txt");
-        // write a file where a multibyte char straddles the 50_000-byte limit
-        let content = "a".repeat(49_999) + "🐧extra";
+        // Write a file where a multibyte character straddles the current
+        // 250_000-byte per-file limit. The reader must back up to a UTF-8
+        // boundary before appending its truncation marker.
+        let content = "a".repeat(249_999) + "🐧extra";
         std::fs::write(&path, &content).unwrap();
         let result = read_multiple_files(vec![path.to_str().unwrap().into()]).await;
-        // must not panic, must contain truncation marker, must be valid UTF-8
-        assert!(result.contains("[... truncated"));
+        assert!(result.contains("[... truncated at 250000 characters"));
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(!result.contains("🐧extra"));
     }
 
     // ── glob_tool ──────────────────────────────────────────────────
@@ -3002,18 +3239,14 @@ mod tests {
 
     #[tokio::test]
     async fn todowrite_rejects_invalid_status() {
-        let todos = vec![
-            serde_json::json!({"content": "Task A", "status": "done"}),
-        ];
+        let todos = vec![serde_json::json!({"content": "Task A", "status": "done"})];
         let result = todowrite(todos).await;
         assert!(result.contains("invalid status"));
     }
 
     #[tokio::test]
     async fn todowrite_rejects_empty_content() {
-        let todos = vec![
-            serde_json::json!({"content": "", "status": "pending"}),
-        ];
+        let todos = vec![serde_json::json!({"content": "", "status": "pending"})];
         let result = todowrite(todos).await;
         assert!(result.contains("content is empty"));
     }
@@ -3083,20 +3316,43 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         }
     };
 
-    let search_dir = if root.is_dir() { root.clone() } else {
-        root.parent().map(|p: &std::path::Path| p.to_path_buf()).unwrap_or(root.clone())
+    let search_dir = if root.is_dir() {
+        root.clone()
+    } else {
+        root.parent()
+            .map(|p: &std::path::Path| p.to_path_buf())
+            .unwrap_or(root.clone())
     };
 
     let skip_dirs: std::collections::HashSet<&str> = [
-        ".git", ".svn", ".hg", "__pycache__", "node_modules",
-        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".eggs",
-        ".venv", "venv", "build", "dist", "target",
-    ].iter().cloned().collect();
+        ".git",
+        ".svn",
+        ".hg",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".eggs",
+        ".venv",
+        "venv",
+        "build",
+        "dist",
+        "target",
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     // Split pattern into prefix and glob parts for simple matching
     let has_recursive = pattern.contains("**");
     let glob_suffix = if has_recursive {
-        pattern.rsplit("**").next().unwrap_or(&pattern).trim_start_matches('/')
+        pattern
+            .rsplit("**")
+            .next()
+            .unwrap_or(&pattern)
+            .trim_start_matches('/')
     } else {
         &pattern
     };
@@ -3109,28 +3365,42 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
-            if e.depth() == 0 { return true; } // never skip the root
+            if e.depth() == 0 {
+                return true;
+            } // never skip the root
             if let Some(name) = e.file_name().to_str() {
-                if name.starts_with('.') && !pattern.starts_with('.') { return false; }
-                if skip_dirs.contains(name) { return false; }
+                if name.starts_with('.') && !pattern.starts_with('.') {
+                    return false;
+                }
+                if skip_dirs.contains(name) {
+                    return false;
+                }
             }
             true
         });
 
     for entry in walker.flatten() {
-        if entry.file_type().is_dir() { continue; }
+        if entry.file_type().is_dir() {
+            continue;
+        }
         let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
         let rel_str = rel.to_string_lossy();
 
         // Simple glob matching: check suffix pattern against the path
-        if !simple_glob_match(&rel_str, glob_suffix) { continue; }
+        if !simple_glob_match(&rel_str, glob_suffix) {
+            continue;
+        }
 
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         matches.push((rel_str.to_string(), false, size));
     }
 
     if matches.is_empty() {
-        return format!("No files matching '{}' in {}", pattern, search_dir.display());
+        return format!(
+            "No files matching '{}' in {}",
+            pattern,
+            search_dir.display()
+        );
     }
 
     matches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3139,7 +3409,10 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
     let mut lines: Vec<String> = Vec::new();
     for (i, (path_str, _is_dir, size)) in matches.iter().enumerate() {
         if i >= max_results {
-            lines.push(format!("... and {} more (truncated at {max_results})", matches.len() - max_results));
+            lines.push(format!(
+                "... and {} more (truncated at {max_results})",
+                matches.len() - max_results
+            ));
             break;
         }
         lines.push(format!("{path_str}  ({} B)", size));
@@ -3148,7 +3421,6 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
     let result = lines.join("\n");
     snip_tool_output(result)
 }
-
 
 // ---------------------------------------------------------------------------
 // todowrite — task list management
@@ -3165,7 +3437,10 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
     for (i, t) in todos.iter().enumerate() {
         let obj = match t.as_object() {
             Some(o) => o,
-            None => { errors.push(format!("Item {i}: not an object")); continue; }
+            None => {
+                errors.push(format!("Item {i}: not an object"));
+                continue;
+            }
         };
         let content_text = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
         let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -3174,8 +3449,10 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
             errors.push(format!("Item {i}: content is empty"));
         }
         match status {
-            "pending" | "in_progress" | "completed" => {},
-            _ => errors.push(format!("Item {i}: invalid status '{status}' — must be pending, in_progress, or completed")),
+            "pending" | "in_progress" | "completed" => {}
+            _ => errors.push(format!(
+                "Item {i}: invalid status '{status}' — must be pending, in_progress, or completed"
+            )),
         }
         if status == "in_progress" {
             in_progress_count += 1;
@@ -3183,7 +3460,14 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
     }
 
     if !errors.is_empty() {
-        return format!("Error validating todos:\n{}", errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n"));
+        return format!(
+            "Error validating todos:\n{}",
+            errors
+                .iter()
+                .map(|e| format!("  - {e}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     if in_progress_count > 1 {
@@ -3196,17 +3480,21 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
         ("pending", "[ ]"),
         ("in_progress", "[→]"),
         ("completed", "[✓]"),
-    ].iter().cloned().collect();
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
-    let lines: Vec<String> = todos.iter().map(|t| {
-        let obj = t.as_object().unwrap();
-        let content_text = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let icon = icons.get(status).unwrap_or(&"[?]");
-        format!("{icon} {content_text}")
-    }).collect();
+    let lines: Vec<String> = todos
+        .iter()
+        .map(|t| {
+            let obj = t.as_object().unwrap();
+            let content_text = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let icon = icons.get(status).unwrap_or(&"[?]");
+            format!("{icon} {content_text}")
+        })
+        .collect();
 
     lines.join("\n")
 }
-
-

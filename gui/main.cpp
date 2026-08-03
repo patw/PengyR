@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include "pengy_ffi.h"
 #include "mainwindow.h"
+#include "themehelper.h"
 #include "version.h"
 
 static void showHelp(const char* argv0) {
@@ -42,15 +43,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Load config to get UI scale, then set QT_SCALE_FACTOR before QApplication
+    // Load the saved preference before QApplication; Qt continues to own OS DPI.
     char* cfgJson = pengy_config_load();
     QJsonObject cfg = QJsonDocument::fromJson(QByteArray(cfgJson)).object();
     pengy_free(cfgJson);
-
-    int scale = cfg.value("ui_scale").toInt(100);
-    if (scale != 100) {
-        qputenv("QT_SCALE_FACTOR", QByteArray::number(scale / 100.0, 'f', 2));
-    }
 
     QApplication app(argc, argv);
     app.setApplicationName("Pengy");
@@ -58,7 +54,7 @@ int main(int argc, char* argv[]) {
     app.setWindowIcon(QIcon(":/pengy.png"));
 
     QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
-    font.setPointSize(10);
+    font = scaledSystemFont(cfg.value("ui_scale").toInt(100));
     app.setFont(font);
 
     MainWindow window;

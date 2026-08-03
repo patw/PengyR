@@ -57,8 +57,7 @@ fn legacy_chat(id: &str, title: &str, msgs: Vec<ChatMessage>) -> Chat {
 
 #[test]
 fn split_store_behaves() {
-    let dir: PathBuf =
-        std::env::temp_dir().join(format!("pengyr_store_{}", std::process::id()));
+    let dir: PathBuf = std::env::temp_dir().join(format!("pengyr_store_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     set_config_dir(dir.to_str().unwrap());
@@ -68,8 +67,14 @@ fn split_store_behaves() {
     reset(&dir);
     let mut a = mk("A", vec![]);
     let b = mk("B", vec![]);
-    assert!(chats_dir.join(format!("{}.json", a.id)).exists(), "A has its own file");
-    assert!(chats_dir.join(format!("{}.json", b.id)).exists(), "B has its own file");
+    assert!(
+        chats_dir.join(format!("{}.json", a.id)).exists(),
+        "A has its own file"
+    );
+    assert!(
+        chats_dir.join(format!("{}.json", b.id)).exists(),
+        "B has its own file"
+    );
 
     let b_file = chats_dir.join(format!("{}.json", b.id));
     let before = std::fs::read(&b_file).unwrap();
@@ -87,7 +92,10 @@ fn split_store_behaves() {
         "A",
         vec![
             user_msg("first question"),
-            ChatMessage::new("assistant", Some(serde_json::Value::String("answer".into()))),
+            ChatMessage::new(
+                "assistant",
+                Some(serde_json::Value::String("answer".into())),
+            ),
         ],
     );
     let entry = load_index().remove(0);
@@ -107,7 +115,8 @@ fn split_store_behaves() {
         )],
     );
     assert_eq!(
-        load_index()[0].preview, "describe this",
+        load_index()[0].preview,
+        "describe this",
         "multipart preview uses the text part"
     );
 
@@ -150,10 +159,19 @@ fn split_store_behaves() {
         serde_json::to_string_pretty(&ghost).unwrap(),
     )
     .unwrap();
-    assert!(titles().contains(&"GHOST".to_string()), "added file is picked up");
+    assert!(
+        titles().contains(&"GHOST".to_string()),
+        "added file is picked up"
+    );
     std::fs::remove_file(chats_dir.join("ghost.json")).unwrap();
-    assert!(!titles().contains(&"GHOST".to_string()), "removed file is dropped");
-    assert!(titles().contains(&"A".to_string()), "unrelated chat survives");
+    assert!(
+        !titles().contains(&"GHOST".to_string()),
+        "removed file is dropped"
+    );
+    assert!(
+        titles().contains(&"A".to_string()),
+        "unrelated chat survives"
+    );
 
     // ── delete removes the file ─────────────────────────────────────────
     reset(&dir);
@@ -169,7 +187,11 @@ fn split_store_behaves() {
     let mut upd = mk("ALSO-KEEP", vec![]);
     upd.title = "UPDATED".into();
     save_chats(std::slice::from_ref(&upd)).unwrap();
-    assert_eq!(titles(), vec!["KEEP", "UPDATED"], "save_chats must not delete");
+    assert_eq!(
+        titles(),
+        vec!["KEEP", "UPDATED"],
+        "save_chats must not delete"
+    );
     assert!(get_chat(&keep.id).is_some());
 
     // ── legacy chats.json is migrated ───────────────────────────────────
@@ -177,7 +199,10 @@ fn split_store_behaves() {
     write_legacy(&dir, &[legacy_chat("old-1", "OLD", vec![user_msg("q")])]);
     assert_eq!(titles(), vec!["OLD"], "legacy chat is visible");
     assert_eq!(get_chat("old-1").unwrap().messages.len(), 1);
-    assert!(chats_dir.join("old-1.json").exists(), "legacy chat is split out");
+    assert!(
+        chats_dir.join("old-1.json").exists(),
+        "legacy chat is split out"
+    );
     assert_eq!(load_chats().len(), 1);
 
     // ── legacy chats.json is never modified ─────────────────────────────
@@ -199,10 +224,19 @@ fn split_store_behaves() {
     // ── another edition rewrote chats.json ──────────────────────────────
     reset(&dir);
     mk("MINE", vec![]);
-    write_legacy(&dir, &[legacy_chat("other-1", "FROM-OTHER-EDITION", vec![])]);
+    write_legacy(
+        &dir,
+        &[legacy_chat("other-1", "FROM-OTHER-EDITION", vec![])],
+    );
     let t = titles();
-    assert!(t.contains(&"FROM-OTHER-EDITION".to_string()), "other edition's chat imported");
-    assert!(t.contains(&"MINE".to_string()), "local chats survive the import");
+    assert!(
+        t.contains(&"FROM-OTHER-EDITION".to_string()),
+        "other edition's chat imported"
+    );
+    assert!(
+        t.contains(&"MINE".to_string()),
+        "local chats survive the import"
+    );
 
     // ── per-chat file wins over a stale legacy copy ─────────────────────
     let mut mine = get_chat("other-1").unwrap();

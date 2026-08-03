@@ -62,6 +62,7 @@ private:
     // ── Tab management ────────────────────────────────────────────
     TabSession* addTab(const QJsonObject& chat, bool switchTo = true);
     void closeTab(int index);
+    void installTabCloseButton(int index);
     void onTabChanged(int index);
     TabSession* tabForChat(const QString& chatId);
     void saveOpenTabs();
@@ -78,6 +79,8 @@ private:
     // ── Worker lifecycle ──────────────────────────────────────────
     void abandonWorkerFor(TabSession* session);
     void reapAbandonedWorkers();
+
+    int m_runtimeUiScale = 100;
 
     QJsonObject m_config;
     QJsonArray  m_chats;

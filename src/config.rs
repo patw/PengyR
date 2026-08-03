@@ -364,7 +364,7 @@ mod tests {
         assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 300);
-        assert_eq!(c.tool_output_max_chars, 50000);
+        assert_eq!(c.tool_output_max_chars, 250_000);
         assert_eq!(c.llm_timeout, 300);
         assert_eq!(c.image_max_dimension, 4096);
         assert!((c.image_max_mb - 4.5).abs() < 0.001);
@@ -429,7 +429,7 @@ mod tests {
         assert!(!c.preserve_reasoning);
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 300);
-        assert_eq!(c.tool_output_max_chars, 50000);
+        assert_eq!(c.tool_output_max_chars, 250_000);
         assert_eq!(c.llm_timeout, 300);
         assert_eq!(c.image_max_dimension, 4096);
     }

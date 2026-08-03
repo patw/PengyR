@@ -126,12 +126,16 @@ pub extern "C" fn pengy_tasks_load() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn pengy_tasks_save(json: *const c_char) -> bool {
-    let tasks: Vec<task_manager::Task> = serde_json::from_str(&unsafe { cstr(json) }).unwrap_or_default();
+    let tasks: Vec<task_manager::Task> =
+        serde_json::from_str(&unsafe { cstr(json) }).unwrap_or_default();
     task_manager::save_tasks(&tasks).is_ok()
 }
 
 #[no_mangle]
-pub extern "C" fn pengy_task_create(title: *const c_char, template_str: *const c_char) -> *mut c_char {
+pub extern "C" fn pengy_task_create(
+    title: *const c_char,
+    template_str: *const c_char,
+) -> *mut c_char {
     match task_manager::create_task(&unsafe { cstr(title) }, &unsafe { cstr(template_str) }) {
         Ok(t) => to_c(&serde_json::to_string(&t).unwrap_or_default()),
         Err(_) => std::ptr::null_mut(),
@@ -139,8 +143,14 @@ pub extern "C" fn pengy_task_create(title: *const c_char, template_str: *const c
 }
 
 #[no_mangle]
-pub extern "C" fn pengy_task_update(id: *const c_char, title: *const c_char, template_str: *const c_char) -> *mut c_char {
-    match task_manager::update_task(&unsafe { cstr(id) }, &unsafe { cstr(title) }, &unsafe { cstr(template_str) }) {
+pub extern "C" fn pengy_task_update(
+    id: *const c_char,
+    title: *const c_char,
+    template_str: *const c_char,
+) -> *mut c_char {
+    match task_manager::update_task(&unsafe { cstr(id) }, &unsafe { cstr(title) }, &unsafe {
+        cstr(template_str)
+    }) {
         Ok(Some(t)) => to_c(&serde_json::to_string(&t).unwrap_or_default()),
         _ => std::ptr::null_mut(),
     }
@@ -153,13 +163,25 @@ pub extern "C" fn pengy_task_delete(id: *const c_char) -> bool {
 
 #[no_mangle]
 pub extern "C" fn pengy_task_placeholders(template_str: *const c_char) -> *mut c_char {
-    to_c(&serde_json::to_string(&task_manager::extract_placeholders(&unsafe { cstr(template_str) })).unwrap_or_default())
+    to_c(
+        &serde_json::to_string(&task_manager::extract_placeholders(&unsafe {
+            cstr(template_str)
+        }))
+        .unwrap_or_default(),
+    )
 }
 
 #[no_mangle]
-pub extern "C" fn pengy_task_render(template_str: *const c_char, values_json: *const c_char) -> *mut c_char {
-    let values: std::collections::HashMap<String, String> = serde_json::from_str(&unsafe { cstr(values_json) }).unwrap_or_default();
-    to_c(&task_manager::render_template(&unsafe { cstr(template_str) }, &values))
+pub extern "C" fn pengy_task_render(
+    template_str: *const c_char,
+    values_json: *const c_char,
+) -> *mut c_char {
+    let values: std::collections::HashMap<String, String> =
+        serde_json::from_str(&unsafe { cstr(values_json) }).unwrap_or_default();
+    to_c(&task_manager::render_template(
+        &unsafe { cstr(template_str) },
+        &values,
+    ))
 }
 
 // ── Tools ─────────────────────────────────────────────────────────
@@ -286,7 +308,17 @@ pub extern "C" fn pengy_llm_chat_run(
     let ctx_for_task = tool_ctx.clone();
     let mut task_handle = Some(rt().spawn(async move {
         llm_client::chat(
-            &bu, &ak, &md, messages, tc_mode, &re_str, preserve_reasoning, 300, event_tx, confirm_rx, cancel2,
+            &bu,
+            &ak,
+            &md,
+            messages,
+            tc_mode,
+            &re_str,
+            preserve_reasoning,
+            300,
+            event_tx,
+            confirm_rx,
+            cancel2,
             ctx_for_task,
         )
         .await;
@@ -412,7 +444,8 @@ pub extern "C" fn pengy_llm_cancel(run: *mut Arc<tools::ToolContext>) {
     if !run.is_null() {
         unsafe {
             let ctx = &*run;
-            ctx.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            ctx.cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             ctx.kill_all();
         }
     }
@@ -470,7 +503,6 @@ pub extern "C" fn pengy_image_preprocess(
         Err(_) => std::ptr::null_mut(),
     }
 }
-
 
 // ── Memory ────────────────────────────────────────────────────────
 
