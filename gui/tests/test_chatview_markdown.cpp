@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QString>
 #include <QJsonObject>
+#include <QScrollBar>
 #include <iostream>
 #include "../chatview.h"
 
@@ -124,6 +125,58 @@ int main(int argc, char** argv) {
 
         v.clear();
         requireEqual(QString::number(v.testCacheSize()), "0", "clear resets cache");
+    }
+
+    // ── auto-scroll pin (regression: "snaps back up to old history") ────
+    // setHtml() replaces the whole document and resets the scrollbar to 0.
+    // The old render() decided "am I at the bottom?" by reading sb->value()
+    // *after* that reset — so any render landing while a previous render's
+    // deferred scroll-to-bottom was still pending read value()==0, concluded
+    // the user had scrolled up, and pinned the view to the top of the history.
+    // These guard the explicit m_autoScroll flag that replaced that check.
+    {
+        ChatView v;
+        v.resize(400, 600);
+        v.show();
+        app.processEvents();
+
+        // Fill with enough content to make the document taller than the viewport.
+        for (int i = 0; i < 60; ++i)
+            v.appendMessageText("assistant", QString("line %1 ").arg(i).repeated(20), false);
+        v.renderNow();
+        app.processEvents();
+
+        requireEqual(v.testAutoScroll() ? "true" : "false", "true", "pin starts true");
+        v.renderNow();
+        app.processEvents();
+        requireEqual(v.testAutoScroll() ? "true" : "false", "true", "pin survives a render");
+
+        // Two renders back-to-back before the event loop flushes the deferred
+        // scroll — the exact sequence that used to read value()==0 and snap
+        // the view to the top.
+        v.renderNow();
+        v.renderNow();
+        app.processEvents();
+        requireEqual(v.testAutoScroll() ? "true" : "false", "true", "interleaved render keeps the pin");
+
+        // Genuine scroll up clears the pin
+        v.verticalScrollBar()->setValue(0);
+        app.processEvents();
+        requireEqual(v.testAutoScroll() ? "true" : "false", "false", "genuine scroll up clears the pin");
+
+        // A render while cleared must NOT yank to the bottom
+        v.renderNow();
+        app.processEvents();
+        auto* sb = v.verticalScrollBar();
+        if (sb->value() >= sb->maximum() / 2) {
+            std::cerr << "FAIL: cleared pin yanked to bottom\n"
+                      << "value=" << sb->value() << " max=" << sb->maximum() << std::endl;
+            std::exit(1);
+        }
+
+        // clear() resets the pin
+        v.clear();
+        requireEqual(v.testAutoScroll() ? "true" : "false", "true", "clear resets the pin");
     }
 
     return 0;
