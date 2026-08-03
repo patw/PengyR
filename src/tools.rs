@@ -3146,11 +3146,7 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
     }
 
     let result = lines.join("\n");
-    if result.len() > 40_000 {
-        format!("{}...", &result[..40_000])
-    } else {
-        result
-    }
+    snip_tool_output(result)
 }
 
 
