@@ -125,7 +125,7 @@ fn default_tool_timeout() -> u64 {
     300
 }
 fn default_tool_output_max_chars() -> usize {
-    50000
+    250000
 }
 fn default_image_max_dimension() -> u32 {
     4096

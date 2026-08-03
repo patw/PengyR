@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 // ── Global state ────────────────────────────────────────────────────
 
 pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
-pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(50000);
+pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(250000);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
 
 /// A blocking callback that prompts the user for a sudo password.
@@ -1515,10 +1515,10 @@ async fn fetch_url(url_str: String) -> String {
         text
     };
 
-    if text.len() > 50_000 {
+    if text.len() > 250_000 {
         format!(
-            "{}\n\n[... truncated at 50,000 characters ...]",
-            truncate_on_char_boundary(&text, 50_000)
+            "{}\n\n[... truncated at 250,000 characters ...]",
+            truncate_on_char_boundary(&text, 250_000)
         )
     } else {
         text
@@ -1780,7 +1780,7 @@ fn format_size(size: u64) -> String {
 
 async fn read_multiple_files(paths: Vec<String>) -> String {
     const MAX_FILES: usize = 20;
-    const MAX_PER_FILE: usize = 50_000;
+    const MAX_PER_FILE: usize = 250_000;
     const MAX_TOTAL: usize = 120_000;
 
     if paths.is_empty() {
