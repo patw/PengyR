@@ -327,6 +327,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                         tool_call_id: String::new(),
                                         confirmed: false,
                                         yolo_turn: false,
+                                        answers: None,
                                     });
                                     break 'outer false;
                                 }
@@ -343,6 +344,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                 tool_call_id: String::new(),
                                 confirmed,
                                 yolo_turn: yolo,
+                                answers: None,
                             });
                         }
                         // else: auto-confirmed or safe — the generator handles it

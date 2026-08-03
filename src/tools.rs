@@ -1,6 +1,6 @@
 //! Tool definitions and execution for Pengy.
 //!
-//! Defines 11 OpenAI function-calling tools and their implementations.
+//! Defines 14 OpenAI function-calling tools and their implementations.
 
 use futures_util::StreamExt;
 use regex::Regex;
@@ -174,6 +174,16 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("context_lines", "integer", "Number of lines of context (default: 0)"),
               ("max_results", "integer", "Maximum number of matches to return (default: 50)")],
             &["pattern", "path"]),
+        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search. Prefer this over run_bash('find ...') or run_bash('ls ...').",
+            &[("pattern", "string", "The glob pattern to match against file paths"),
+              ("path", "string", "The directory to search in (default: current working directory)")],
+            &["pattern"]),
+        td("todowrite", "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time.",
+            &[("todos", "array", "The complete list of tasks with content and status (pending/in_progress/completed)")],
+            &["todos"]),
+        td("ask_user_question", "Ask the user one or more multiple-choice questions to clarify requirements or resolve ambiguity.",
+            &[("questions", "array", "One or more questions with header, question text, and options")],
+            &["questions"]),
     ]
 }
 
@@ -210,6 +220,8 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "search_content"
             | "web_search"
             | "fetch_url"
+            | "glob"
+            | "todowrite"
     )
 }
 
@@ -290,6 +302,16 @@ async fn execute_tool_inner(
             )
             .await
         }
+        "glob" => glob_tool(a(arguments, "pattern", ""), aopt(arguments, "path")).await,
+        "todowrite" => {
+            let todos: Vec<serde_json::Value> = arguments
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.clone())
+                .unwrap_or_default();
+            todowrite(todos).await
+        }
+        "ask_user_question" => "ask_user_question must be handled by the harness — it should never reach execute_tool directly.".to_string(),
         _ => format!("Unknown tool: {name}"),
     }
 }
@@ -2256,15 +2278,15 @@ mod tests {
     // ── tool_definitions ───────────────────────────────────────────
 
     #[test]
-    fn tool_definitions_has_eleven_tools() {
-        assert_eq!(tool_definitions().len(), 11);
+    fn tool_definitions_has_fourteen_tools() {
+        assert_eq!(tool_definitions().len(), 14);
     }
 
     #[test]
-    fn tool_definitions_json_has_eleven_tools() {
+    fn tool_definitions_json_has_fourteen_tools() {
         let json = tool_definitions_json();
         assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 11);
+        assert_eq!(json.as_array().unwrap().len(), 14);
     }
 
     #[test]
@@ -2288,7 +2310,7 @@ mod tests {
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 14);
     }
 
     #[test]
@@ -2307,7 +2329,7 @@ mod tests {
         let json = serde_json::to_string(&defs).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_array());
-        assert_eq!(parsed.as_array().unwrap().len(), 11);
+        assert_eq!(parsed.as_array().unwrap().len(), 14);
     }
 
     #[test]
@@ -2413,6 +2435,16 @@ mod tests {
         let call = |c: &ToolContext| c.sudo_provider.lock().unwrap().as_ref().unwrap()();
         assert_eq!(call(&ctx_a), Some("pw-a".to_string()));
         assert_eq!(call(&ctx_b), Some("pw-b".to_string()));
+    }
+
+    #[test]
+    fn cached_sudo_password_not_shared() {
+        let ctx_a = ToolContext::new();
+        let ctx_b = ToolContext::new();
+        *ctx_a.cached_sudo_password.lock().unwrap() = Some("secret".into());
+        assert!(ctx_b.cached_sudo_password.lock().unwrap().is_none());
+        ctx_a.clear_sudo();
+        assert!(ctx_a.cached_sudo_password.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2902,4 +2934,290 @@ mod tests {
         assert!(result.contains("[... truncated"));
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
+
+    // ── glob_tool ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn glob_tool_finds_py_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "y").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/c.py"), "z").unwrap();
+
+        let result = glob_tool("**/*.py".into(), Some(dir.path().to_str().unwrap().into())).await;
+        assert!(result.contains("a.py"));
+        assert!(result.contains("sub/c.py"));
+        assert!(!result.contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = glob_tool("*.xyz".into(), Some(dir.path().to_str().unwrap().into())).await;
+        assert!(result.contains("No files matching"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_skips_hidden_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".hidden.py"), "x").unwrap();
+        std::fs::write(dir.path().join("visible.py"), "y").unwrap();
+
+        let result = glob_tool("*.py".into(), Some(dir.path().to_str().unwrap().into())).await;
+        assert!(result.contains("visible.py"));
+        assert!(!result.contains(".hidden.py"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_skips_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("node_modules/foo.js"), "x").unwrap();
+        std::fs::write(dir.path().join("src.js"), "y").unwrap();
+
+        let result = glob_tool("**/*.js".into(), Some(dir.path().to_str().unwrap().into())).await;
+        assert!(result.contains("src.js"));
+        assert!(!result.contains("node_modules"));
+    }
+
+    // ── todowrite ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn todowrite_echoes_back_valid_todos() {
+        let todos = vec![
+            serde_json::json!({"content": "Find auth code", "status": "in_progress"}),
+            serde_json::json!({"content": "Add JWT", "status": "pending"}),
+            serde_json::json!({"content": "Write tests", "status": "pending"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(result.contains("[→] Find auth code"));
+        assert!(result.contains("[ ] Add JWT"));
+        assert!(result.contains("[ ] Write tests"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_rejects_multiple_in_progress() {
+        let todos = vec![
+            serde_json::json!({"content": "Task A", "status": "in_progress"}),
+            serde_json::json!({"content": "Task B", "status": "in_progress"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(result.contains("Error"));
+        assert!(result.contains("in_progress"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_rejects_invalid_status() {
+        let todos = vec![
+            serde_json::json!({"content": "Task A", "status": "done"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(result.contains("invalid status"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_rejects_empty_content() {
+        let todos = vec![
+            serde_json::json!({"content": "", "status": "pending"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(result.contains("content is empty"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_rejects_empty_list() {
+        let result = todowrite(vec![]).await;
+        assert!(result.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_all_pending_is_valid() {
+        let todos = vec![
+            serde_json::json!({"content": "Task A", "status": "pending"}),
+            serde_json::json!({"content": "Task B", "status": "pending"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(!result.contains("Error"));
+    }
+
+    #[tokio::test]
+    async fn todowrite_allows_all_completed() {
+        let todos = vec![
+            serde_json::json!({"content": "Task A", "status": "completed"}),
+            serde_json::json!({"content": "Task B", "status": "completed"}),
+        ];
+        let result = todowrite(todos).await;
+        assert!(result.contains("[✓]"));
+    }
+
+    // ── ask_user_question ─────────────────────────────────────────
+
+    #[test]
+    fn ask_user_question_definition_exists() {
+        let defs = tool_definitions();
+        assert!(defs.iter().any(|t| t.function.name == "ask_user_question"));
+    }
+
+    #[test]
+    fn ask_user_question_is_not_readonly() {
+        assert!(!is_readonly_tool("ask_user_question"));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_execute_returns_harness_message() {
+        let args = serde_json::json!({"questions": []});
+        let ctx = Arc::new(ToolContext::new());
+        let result = execute_tool("ask_user_question", &args, &ctx).await;
+        assert!(result.contains("harness"));
+    }
 }
+// ---------------------------------------------------------------------------
+// glob — file pattern matching
+// ---------------------------------------------------------------------------
+
+async fn glob_tool(pattern: String, path: Option<String>) -> String {
+    let root = if let Some(p) = &path {
+        let expanded = expand_home(p);
+        match expanded.canonicalize() {
+            Ok(r) => r,
+            Err(e) => return format!("Error resolving path: {e}"),
+        }
+    } else {
+        match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => return format!("Error getting current directory: {e}"),
+        }
+    };
+
+    let search_dir = if root.is_dir() { root.clone() } else {
+        root.parent().map(|p: &std::path::Path| p.to_path_buf()).unwrap_or(root.clone())
+    };
+
+    let skip_dirs: std::collections::HashSet<&str> = [
+        ".git", ".svn", ".hg", "__pycache__", "node_modules",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".eggs",
+        ".venv", "venv", "build", "dist", "target",
+    ].iter().cloned().collect();
+
+    // Split pattern into prefix and glob parts for simple matching
+    let has_recursive = pattern.contains("**");
+    let glob_suffix = if has_recursive {
+        pattern.rsplit("**").next().unwrap_or(&pattern).trim_start_matches('/')
+    } else {
+        &pattern
+    };
+
+    let mut matches: Vec<(String, bool, u64)> = Vec::new();
+    let max_depth = if has_recursive { usize::MAX } else { 1 };
+
+    let walker = walkdir::WalkDir::new(&search_dir)
+        .max_depth(max_depth)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 { return true; } // never skip the root
+            if let Some(name) = e.file_name().to_str() {
+                if name.starts_with('.') && !pattern.starts_with('.') { return false; }
+                if skip_dirs.contains(name) { return false; }
+            }
+            true
+        });
+
+    for entry in walker.flatten() {
+        if entry.file_type().is_dir() { continue; }
+        let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+        let rel_str = rel.to_string_lossy();
+
+        // Simple glob matching: check suffix pattern against the path
+        if !simple_glob_match(&rel_str, glob_suffix) { continue; }
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        matches.push((rel_str.to_string(), false, size));
+    }
+
+    if matches.is_empty() {
+        return format!("No files matching '{}' in {}", pattern, search_dir.display());
+    }
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let max_results = 200;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, (path_str, _is_dir, size)) in matches.iter().enumerate() {
+        if i >= max_results {
+            lines.push(format!("... and {} more (truncated at {max_results})", matches.len() - max_results));
+            break;
+        }
+        lines.push(format!("{path_str}  ({} B)", size));
+    }
+
+    let result = lines.join("\n");
+    if result.len() > 40_000 {
+        format!("{}...", &result[..40_000])
+    } else {
+        result
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// todowrite — task list management
+// ---------------------------------------------------------------------------
+
+async fn todowrite(todos: Vec<serde_json::Value>) -> String {
+    if todos.is_empty() {
+        return "Error: todos list is empty. Provide at least one task.".to_string();
+    }
+
+    let mut in_progress_count = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, t) in todos.iter().enumerate() {
+        let obj = match t.as_object() {
+            Some(o) => o,
+            None => { errors.push(format!("Item {i}: not an object")); continue; }
+        };
+        let content_text = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+        if content_text.is_empty() {
+            errors.push(format!("Item {i}: content is empty"));
+        }
+        match status {
+            "pending" | "in_progress" | "completed" => {},
+            _ => errors.push(format!("Item {i}: invalid status '{status}' — must be pending, in_progress, or completed")),
+        }
+        if status == "in_progress" {
+            in_progress_count += 1;
+        }
+    }
+
+    if !errors.is_empty() {
+        return format!("Error validating todos:\n{}", errors.iter().map(|e| format!("  - {e}")).collect::<Vec<_>>().join("\n"));
+    }
+
+    if in_progress_count > 1 {
+        return format!(
+            "Error: {in_progress_count} tasks marked in_progress. Exactly one task must be in_progress at a time."
+        );
+    }
+
+    let icons: std::collections::HashMap<&str, &str> = [
+        ("pending", "[ ]"),
+        ("in_progress", "[→]"),
+        ("completed", "[✓]"),
+    ].iter().cloned().collect();
+
+    let lines: Vec<String> = todos.iter().map(|t| {
+        let obj = t.as_object().unwrap();
+        let content_text = obj.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let icon = icons.get(status).unwrap_or(&"[?]");
+        format!("{icon} {content_text}")
+    }).collect();
+
+    lines.join("\n")
+}
+
+

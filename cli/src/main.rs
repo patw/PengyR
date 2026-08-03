@@ -468,6 +468,7 @@ impl PengyCli {
                                     tool_call_id,
                                     confirmed: true,
                                     yolo_turn: false,
+            answers: None,
                                 });
                             }
                             2 => {
@@ -476,6 +477,7 @@ impl PengyCli {
                                     tool_call_id,
                                     confirmed: true,
                                     yolo_turn: true,
+            answers: None,
                                 });
                             }
                             3 => {
@@ -483,6 +485,7 @@ impl PengyCli {
                                     tool_call_id,
                                     confirmed: false,
                                     yolo_turn: false,
+            answers: None,
                                 });
                             }
                             _ => {
@@ -492,12 +495,53 @@ impl PengyCli {
                                     tool_call_id,
                                     confirmed: false,
                                     yolo_turn: false,
+            answers: None,
                                 });
                                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                 break;
                             }
                         }
                     }
+                }
+                Some(LlmEvent::QuestionRequest { name: _, args: _, tool_call_id, questions }) => {
+                    // Present questions to user and collect answers
+                    eprintln!();
+                    for (qi, q) in questions.as_array().iter().flat_map(|a| a.iter()).enumerate() {
+                        let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("Question");
+                        let question = q.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                        eprintln!("\x1b[1;36m{header}\x1b[0m");
+                        eprintln!("\x1b[2m{question}\x1b[0m");
+                        if let Some(opts) = q.get("options").and_then(|v| v.as_array()) {
+                            for (oi, opt) in opts.iter().enumerate() {
+                                let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("?");
+                                let desc = opt.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                eprintln!("  [{oi}] {label}  \x1b[2m— {desc}\x1b[0m");
+                            }
+                        }
+                        eprintln!();
+                        // Read answer from stdin
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).ok();
+                        let choice: usize = input.trim().parse().unwrap_or(1);
+                        let answer = questions.as_array()
+                            .and_then(|a| a.get(qi))
+                            .and_then(|q| q.get("options"))
+                            .and_then(|o| o.as_array())
+                            .and_then(|opts| opts.get(choice.saturating_sub(1)))
+                            .and_then(|opt| opt.get("label"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = confirm_tx.send(Confirmation {
+                            tool_call_id: tool_call_id.clone(),
+                            confirmed: true,
+                            yolo_turn: false,
+                            answers: Some(vec![answer]),
+                        });
+                    }
+                }
+                Some(LlmEvent::QuestionResult { .. }) => {
+                    // Pass through — the result is recorded in chat history
                 }
                 Some(LlmEvent::ToolResult {
                     tool_call_id,

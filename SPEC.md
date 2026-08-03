@@ -61,7 +61,7 @@ PengyR/
 │   ├── config.rs               # Settings load/save + system message rendering
 │   ├── chat_manager.rs         # Chat session CRUD + message cleaning
 │   ├── task_manager.rs         # Prompt-template Tasks CRUD (~/.config/pengy/tasks.json)
-│   ├── tools.rs                # 11 OpenAI function-calling tools
+│   ├── tools.rs                # 14 OpenAI function-calling tools
 │   └── llm_client.rs           # Async LLM chat generator (tokio channels)
 ├── cli/                        # CLI binary (pengy-cli)
 │   ├── Cargo.toml
@@ -498,7 +498,7 @@ Array of chat session objects with `user`, `assistant` (including `tool_calls`),
 
 ## Tools
 
-All 11 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
+All 14 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 
 | Tool | Read-only | Description |
 |------|:---:|-------------|
@@ -513,6 +513,9 @@ All 11 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | `fetch_url` | ✅ | Fetch URL text content (strips HTML, 50K char limit). |
 | `directory_tree` | ✅ | Visual directory tree (Unicode box-drawing, 500 entry cap). |
 | `search_content` | ✅ | Regex search in files with context lines and region grouping. |
+| `glob` | ✅ | Find files by glob pattern (`**/*.py`); respects skip dirs (`.git`, `node_modules`, etc.). |
+| `todowrite` | ✅ | Structured task list (`[ ]`/`[→]`/`[✓]`) for tracking complex multi-step operations. |
+| `ask_user_question` | — | Ask the user clarifying multiple-choice questions. Handled by the harness, never reaches `execute_tool`. |
 
 Tool execution runs on the tokio runtime via `tokio::task::spawn_blocking` for CPU/IO-heavy operations. Sudo password is cached in memory for the duration of the LLM run and cleared when the run completes.
 
@@ -614,7 +617,7 @@ build_windows.bat
 | Feature | Status | Notes |
 |---------|:---:|-------|
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
-| 11 tools | ✅ | All tools ported |
+| 14 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
 | CLI (interactive REPL + single-shot) | ✅ | 25 slash commands, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |

@@ -67,6 +67,19 @@ pub enum LlmEvent {
         content: String,
         declined: bool,
     },
+    #[serde(rename = "question_request")]
+    QuestionRequest {
+        name: String,
+        args: serde_json::Value,
+        tool_call_id: String,
+        questions: serde_json::Value,
+    },
+    #[serde(rename = "question_result")]
+    QuestionResult {
+        tool_call_id: String,
+        name: String,
+        content: String,
+    },
     #[serde(rename = "final_response")]
     FinalResponse {
         content: String,
@@ -98,6 +111,8 @@ pub struct Confirmation {
     pub confirmed: bool,
     /// If true, auto-approve all remaining tools this turn.
     pub yolo_turn: bool,
+    /// User's answers for ask_user_question (if this is a question confirmation).
+    pub answers: Option<Vec<String>>,
 }
 
 /// Tool confirmation mode.
@@ -129,6 +144,30 @@ impl ToolConfirmation {
 /// - Emits events via `event_tx`
 /// - Receives tool confirmations via `confirm_rx`
 /// - Checks `cancel` flag before each API call
+fn format_question_answers(questions: &serde_json::Value, answers: &[String]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(qs) = questions.as_array() {
+        for (i, q) in qs.iter().enumerate() {
+            let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("Q");
+            let answer = answers.get(i).map(|s| s.as_str()).unwrap_or("(no answer)");
+            let mut detail = String::new();
+            if let Some(opts) = q.get("options").and_then(|v| v.as_array()) {
+                for opt in opts {
+                    if opt.get("label").and_then(|v| v.as_str()) == Some(answer) {
+                        if let Some(desc) = opt.get("description").and_then(|v| v.as_str()) {
+                            detail = format!(" — {desc}");
+                        }
+                        break;
+                    }
+                }
+            }
+            lines.push(format!("**{header}**: {answer}{detail}"));
+        }
+    }
+    lines.join("\n")
+}
+
+
 pub async fn chat(
     base_url: &str,
     api_key: &str,
@@ -357,6 +396,58 @@ pub async fn chat(
                     let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
                     let args: serde_json::Value =
                         serde_json::from_str(args_str).unwrap_or_default();
+
+                    // ask_user_question is a special harness-level tool
+                    if name == "ask_user_question" {
+                        let questions = args.get("questions").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                        let _ = event_tx.send(LlmEvent::QuestionRequest {
+                            name: name.clone(),
+                            args: args.clone(),
+                            tool_call_id: tc_id.clone(),
+                            questions: questions.clone(),
+                        });
+
+                        match confirm_rx.recv().await {
+                            Some(conf) if conf.confirmed => {
+                                let answers = conf.answers.unwrap_or_default();
+                                let result_text = format_question_answers(&questions, &answers);
+                                current_messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: Some(serde_json::Value::String(result_text.clone())),
+                                    tool_calls: vec![],
+                                    tool_call_id: Some(tc_id.clone()),
+                                    reasoning_content: None,
+                                    reasoning: None,
+                                    reasoning_details: None,
+                                });
+                                let _ = event_tx.send(LlmEvent::QuestionResult {
+                                    tool_call_id: tc_id.clone(),
+                                    name: name.clone(),
+                                    content: result_text,
+                                });
+                            }
+                            _ => {
+                                let declined_msg = "User cancelled the question.".to_string();
+                                current_messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: Some(serde_json::Value::String(declined_msg.clone())),
+                                    tool_calls: vec![],
+                                    tool_call_id: Some(tc_id.clone()),
+                                    reasoning_content: None,
+                                    reasoning: None,
+                                    reasoning_details: None,
+                                });
+                                let _ = event_tx.send(LlmEvent::ToolResult {
+                                    tool_call_id: tc_id.clone(),
+                                    name: name.clone(),
+                                    args: args.clone(),
+                                    content: declined_msg,
+                                    declined: true,
+                                });
+                            }
+                        }
+                        continue;
+                    }
 
                     // Decide if we need user confirmation
                     let skip_confirm = tool_confirmation == ToolConfirmation::All
@@ -745,7 +836,7 @@ mod loop_tests {
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs[0]["model"], "stub-model");
-        assert!(reqs[0]["tools"].as_array().unwrap().len() == 11);
+        assert!(reqs[0]["tools"].as_array().unwrap().len() == 14);
         assert!(reqs[0].get("reasoning_effort").is_none());
     }
 
@@ -813,7 +904,7 @@ mod loop_tests {
         assert!(!target.exists(), "tool must not run before confirmation");
 
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: false })
+            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: false, answers: None })
             .unwrap();
 
         match d.rx.recv().await.unwrap() {
@@ -840,7 +931,8 @@ mod loop_tests {
         d.rx.recv().await.unwrap(); // AssistantToolCalls
         d.rx.recv().await.unwrap(); // ToolRequest
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: false, yolo_turn: false })
+            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: false, yolo_turn: false,
+            answers: None })
             .unwrap();
 
         match d.rx.recv().await.unwrap() {
@@ -882,7 +974,8 @@ mod loop_tests {
         d.rx.recv().await.unwrap(); // AssistantToolCalls
         d.rx.recv().await.unwrap(); // ToolRequest tc1
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true })
+            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true,
+            answers: None })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
 
@@ -915,7 +1008,8 @@ mod loop_tests {
         d.rx.recv().await.unwrap(); // AssistantToolCalls round 1
         d.rx.recv().await.unwrap(); // ToolRequest tc1
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true })
+            .send(Confirmation { tool_call_id: "tc1".into(), confirmed: true, yolo_turn: true,
+            answers: None })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
 
@@ -923,7 +1017,8 @@ mod loop_tests {
         d.rx.recv().await.unwrap(); // AssistantToolCalls round 2
         d.rx.recv().await.unwrap(); // ToolRequest tc2
         d.confirm_tx
-            .send(Confirmation { tool_call_id: "tc2".into(), confirmed: false, yolo_turn: false })
+            .send(Confirmation { tool_call_id: "tc2".into(), confirmed: false, yolo_turn: false,
+            answers: None })
             .unwrap();
         match d.rx.recv().await.unwrap() {
             LlmEvent::ToolResult { declined, .. } => {
