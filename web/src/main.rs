@@ -17,6 +17,29 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Report a command-line usage error and exit 2, matching the other frontends.
+fn arg_error(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    eprintln!("Try 'pengy-web --help' for more information.");
+    std::process::exit(2);
+}
+
+/// Consume the value following a flag, or fail if it is missing.
+fn require_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => v.clone(),
+        None => arg_error(&format!("option '{}' requires a value", flag)),
+    }
+}
+
+fn parse_port(value: &str) -> u16 {
+    match value.parse::<u16>() {
+        Ok(p) if p > 0 => p,
+        _ => arg_error(&format!("invalid port '{}' (expected 1-65535)", value)),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -30,44 +53,48 @@ async fn main() {
     let mut host = String::from("127.0.0.1");
     let mut port: u16 = 5000;
     let mut config_dir: Option<String> = None;
+    let mut trusted_hosts: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!("Pengy Web — chat with LLMs from your browser");
                 println!();
-                println!("Usage: pengy-web [PORT] [OPTIONS]");
-                println!();
-                println!("Arguments:");
-                println!("  PORT               Bind port (default: 5000)");
+                println!("Usage: pengy-web [OPTIONS]");
                 println!();
                 println!("Options:");
+                println!("  --port PORT        Bind port (default: 5000)");
                 println!("  --host HOST        Bind host (default: 127.0.0.1). Pass");
                 println!("                     --host 0.0.0.0 to expose beyond localhost —");
                 println!("                     this app has no authentication and exposes");
                 println!("                     run_bash/run_python tools, so only do this");
                 println!("                     on a trusted network.");
+                println!("  --trusted-host HOST  Public hostname this server is reached");
+                println!("                     as when behind a reverse proxy (e.g.");
+                println!("                     pengy.example). Repeatable. Needed only");
+                println!("                     for a proxy in front of a loopback bind.");
                 println!("  --config-dir PATH  Use a custom config directory.");
                 println!("  -v, --version      Show version information and exit.");
                 println!("  -h, --help         Show this help message and exit.");
                 return;
             }
-            "--host" => {
-                i += 1;
-                if let Some(h) = args.get(i) {
-                    host = h.clone();
-                }
+            "--host" => host = require_value(&args, &mut i, "--host"),
+            "--port" => {
+                let v = require_value(&args, &mut i, "--port");
+                port = parse_port(&v);
             }
-            "--config-dir" => {
-                i += 1;
-                if let Some(d) = args.get(i) {
-                    config_dir = Some(d.clone());
-                }
+            "--trusted-host" => {
+                trusted_hosts.push(require_value(&args, &mut i, "--trusted-host"))
             }
+            "--config-dir" => config_dir = Some(require_value(&args, &mut i, "--config-dir")),
             other => {
-                if let Ok(p) = other.parse() {
-                    port = p;
+                // Unrecognised flags used to be discarded silently, so a typo
+                // like --prot 8080 started the server on defaults.
+                if other.starts_with('-') {
+                    arg_error(&format!("unknown option '{}'", other));
                 }
+                // Bare number: the legacy positional PORT, still accepted.
+                port = parse_port(other);
             }
         }
         i += 1;
@@ -95,13 +122,145 @@ async fn main() {
         .route("/settings", get(settings_get).post(settings_post))
         .route("/models", get(models_api))
         .route("/files", get(serve_file))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            OriginGuard {
+                bound_host: host.clone(),
+                trusted_hosts: trusted_hosts
+                    .iter()
+                    .filter(|h| !h.trim().is_empty())
+                    .map(|h| host_only(h))
+                    .collect(),
+            },
+            origin_guard,
+        ));
 
+    // Bind before announcing, so a failure reports the failure rather than
+    // printing a success banner and then panicking.
     let addr = format!("{}:{}", host, port);
-    println!("Pengy Web UI running at http://{}", addr);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind on {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    println!("Pengy Web UI running at http://{}", addr);
+    if !is_loopback_host(&host_only(&host)) {
+        println!(
+            "  note: bound beyond loopback — Pengy Web has no auth of its own, \
+             so put it behind a proxy or a VM boundary."
+        );
+    }
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+// ── Request origin guard ─────────────────────────────────────────
+//
+// Pengy Web has no authentication: anything that can reach it runs tools as
+// the current user. Two browser-driven attacks defeat a loopback bind, since
+// both are issued by the user's own browser:
+//
+//   CSRF          — a page on any origin auto-submits a form to 127.0.0.1 and
+//                   rewrites settings (base_url, system_message, YOLO mode).
+//   DNS rebinding — an attacker domain re-resolves to 127.0.0.1, so the
+//                   browser treats it as same-origin and can *read* replies.
+//
+// Two cheap checks close both, with no tokens or sessions to thread through
+// the templates.
+
+#[derive(Clone)]
+struct OriginGuard {
+    bound_host: String,
+    /// Extra hostnames accepted in Host *and* Origin, from --trusted-host.
+    /// Required when running behind a reverse proxy on a loopback bind: nginx
+    /// either forwards the public domain as Host (proxy_set_header Host $host)
+    /// or forwards its own upstream address and leaves the browser's public
+    /// Origin unmatched (nginx's default, Host $proxy_host). Naming the public
+    /// hostname covers both.
+    trusted_hosts: std::collections::HashSet<String>,
+}
+
+/// Strip any `:port` from a Host/Origin authority, keeping `[::1]` intact.
+fn host_only(value: &str) -> String {
+    let v = value.trim();
+    if let Some(stripped) = v.strip_prefix('[') {
+        // Bracketed IPv6 literal
+        if let Some(end) = stripped.find(']') {
+            return v[..end + 2].to_lowercase();
+        }
+    }
+    // Only strip a trailing :port when it is unambiguous. A bare IPv6 literal
+    // such as "::1" (from --host ::1) has many colons and no port.
+    if v.matches(':').count() == 1 {
+        return v[..v.find(':').unwrap()].to_lowercase();
+    }
+    v.to_lowercase()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Authority portion of an Origin header (`http://evil.com:5000` → `evil.com:5000`).
+fn origin_authority(origin: &str) -> &str {
+    match origin.find("://") {
+        Some(i) => &origin[i + 3..],
+        None => origin,
+    }
+}
+
+async fn origin_guard(
+    State(guard): State<OriginGuard>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // 1. DNS rebinding: when bound to loopback the browser should only ever
+    //    address us as localhost (or a --trusted-host name, for a proxy). An
+    //    attacker-controlled name resolving to 127.0.0.1 arrives with that
+    //    name in Host, so it fails here. Skipped
+    //    when the operator explicitly bound a non-loopback address — they are
+    //    fronting this with a proxy or VM boundary, and Host is then some
+    //    arbitrary domain of their choosing.
+    let host = host_only(host);
+    if is_loopback_host(&host_only(&guard.bound_host))
+        && !is_loopback_host(&host)
+        && !guard.trusted_hosts.contains(&host)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    // 2. CSRF: accept an Origin matching the Host the request was actually
+    //    sent to, or any --trusted-host (a proxy may forward its own upstream
+    //    Host while the browser reports the public origin). An attacker page's
+    //    Origin is its own, and never either of those. Origin is absent on
+    //    non-browser clients (curl) and on same-origin GETs, so only enforce
+    //    it when present.
+    if !matches!(req.method().as_str(), "GET" | "HEAD" | "OPTIONS") {
+        if let Some(origin) = req
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        {
+            let origin_host = host_only(origin_authority(origin));
+            if origin_host != host && !guard.trusted_hosts.contains(&origin_host) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
+    }
+
+    Ok(next.run(req).await)
 }
 
 // ── App State ────────────────────────────────────────────────────

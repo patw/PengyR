@@ -126,6 +126,24 @@ impl Validator for PengyHelper {
     }
 }
 
+const OUTPUT_MODES: [&str; 4] = ["pretty", "raw", "json", "silent"];
+
+/// Report a command-line usage error and exit 2, matching the other frontends.
+fn arg_error(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    eprintln!("Try 'pengy-cli --help' for more information.");
+    std::process::exit(2);
+}
+
+/// Consume the value following a flag, or fail if it is missing.
+fn require_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => v.clone(),
+        None => arg_error(&format!("option '{}' requires a value", flag)),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -149,39 +167,53 @@ fn main() {
         println!("  --system MSG    Set the system message (overrides config).");
         println!("  --output FORMAT Output format: pretty, raw, json, silent (default: pretty).");
         println!("  --config-dir PATH  Use a custom config directory.");
+        println!("  --              Treat all remaining arguments as prompt text.");
         println!("  -v, --version   Show version information and exit.");
         println!("  -h, --help      Show this help message and exit.");
         return;
     }
 
-    let no_save = args.iter().any(|a| a == "--no-save");
+    let mut no_save = false;
     let mut model_override: Option<String> = None;
     let mut system_override: Option<String> = None;
     let mut output_mode: String = "pretty".to_string();
     let mut config_dir: Option<String> = None;
+    let mut prompt_args: Vec<String> = Vec::new();
 
-    let mut skip_next = false;
-    let prompt_args: Vec<&str> = args[1..]
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| {
-            if skip_next { skip_next = false; return false; }
-            let a_str: &str = *a;
-            if a_str == "--no-save" || a_str == "--help" || a_str == "-h" || a_str == "--version" || a_str == "-v" {
-                return false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-save" => no_save = true,
+            "--model" => model_override = Some(require_value(&args, &mut i, "--model")),
+            "--system" => system_override = Some(require_value(&args, &mut i, "--system")),
+            "--output" => {
+                output_mode = require_value(&args, &mut i, "--output");
+                if !OUTPUT_MODES.contains(&output_mode.as_str()) {
+                    arg_error(&format!(
+                        "invalid --output value '{}' (expected: {})",
+                        output_mode,
+                        OUTPUT_MODES.join(", ")
+                    ));
+                }
             }
-            if a_str == "--model" || a_str == "--system" || a_str == "--output" || a_str == "--config-dir" {
-                skip_next = true;
-                if a_str == "--model" { model_override = args.get(*i + 2).map(|s| s.clone()); }
-                else if a_str == "--system" { system_override = args.get(*i + 2).map(|s| s.clone()); }
-                else if a_str == "--output" { if let Some(v) = args.get(*i + 2) { output_mode = v.clone(); } }
-                else if a_str == "--config-dir" { config_dir = args.get(*i + 2).map(|s| s.clone()); }
-                return false;
+            "--config-dir" => config_dir = Some(require_value(&args, &mut i, "--config-dir")),
+            "--" => {
+                // Everything after -- is prompt text, even if it looks like a flag.
+                prompt_args.extend(args[i + 1..].iter().cloned());
+                break;
             }
-            true
-        })
-        .map(|(_, s)| s.as_str())
-        .collect();
+            other => {
+                // Unrecognised flags used to be appended to the prompt, so a
+                // typo was silently sent to the model as part of the question.
+                if other.starts_with('-') {
+                    arg_error(&format!("unknown option '{}'", other));
+                }
+                prompt_args.push(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let prompt_args: Vec<&str> = prompt_args.iter().map(|s| s.as_str()).collect();
 
     if let Some(ref dir) = config_dir {
         pengy_core::config::set_config_dir(dir);
