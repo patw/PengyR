@@ -149,6 +149,14 @@ enum SseEvent {
         usage: llm_client::Usage,
     },
     SudoRequest,
+    QuestionRequest {
+        questions: serde_json::Value,
+        tool_call_id: String,
+    },
+    QuestionResult {
+        tool_call_id: String,
+        content: String,
+    },
     Retrying {
         attempt: u32,
         max_attempts: u32,
@@ -166,6 +174,7 @@ enum WorkerCommand {
         confirmed: bool,
         tool_call_id: String,
         yolo_turn: bool,
+        answers: Option<Vec<String>>,
     },
 }
 
@@ -222,6 +231,18 @@ fn sse_event_to_json(event: &SseEvent) -> String {
         })
         .to_string(),
         SseEvent::SudoRequest => r#"{"type":"sudo_request"}"#.to_string(),
+        SseEvent::QuestionRequest { questions, tool_call_id } => serde_json::json!({
+            "type": "question_request",
+            "questions": questions,
+            "tool_call_id": tool_call_id,
+        })
+        .to_string(),
+        SseEvent::QuestionResult { tool_call_id, content } => serde_json::json!({
+            "type": "question_result",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        })
+        .to_string(),
         SseEvent::Retrying { attempt, max_attempts, delay_secs, status_code, message } => {
             serde_json::json!({
                 "type": "retrying",
@@ -364,6 +385,7 @@ impl WebWorker {
                                         tool_call_id,
                                         confirmed,
                                         yolo_turn,
+                                        answers: None,
                                     });
                                 }
                                 None => break,
@@ -400,6 +422,43 @@ impl WebWorker {
                             name,
                             content: display,
                             declined,
+                        });
+                    }
+                    Some(LlmEvent::QuestionRequest {
+                        name: _name,
+                        args: _args,
+                        tool_call_id,
+                        questions,
+                    }) => {
+                        let _ = sse_tx2.send(SseEvent::QuestionRequest {
+                            questions: questions.clone(),
+                            tool_call_id: tool_call_id.clone(),
+                        });
+
+                        // Always wait for user answers (ask_user_question is always interactive)
+                        match cmd_rx.recv().await {
+                            Some(WorkerCommand::Confirm {
+                                confirmed,
+                                answers,
+                                ..
+                            }) => {
+                                let _ = confirm_tx.send(Confirmation {
+                                    tool_call_id,
+                                    confirmed,
+                                    yolo_turn: false,
+                                    answers,
+                                });
+                            }
+                            None => break,
+                        }
+                    }
+                    Some(LlmEvent::QuestionResult {
+                        tool_call_id,
+                        name: _name,
+                        content,
+                    }) => {                        let _ = sse_tx2.send(SseEvent::QuestionResult {
+                            tool_call_id,
+                            content,
                         });
                     }
                     Some(LlmEvent::FinalResponse { content, message, usage }) => {
@@ -701,6 +760,7 @@ struct ConfirmRequest {
     confirmed: Option<bool>,
     tool_call_id: Option<String>,
     yolo_turn: Option<bool>,
+    answers: Option<Vec<String>>,
 }
 
 async fn chat_confirm(
@@ -719,6 +779,7 @@ async fn chat_confirm(
                 confirmed: data.confirmed.unwrap_or(false),
                 tool_call_id: data.tool_call_id.unwrap_or_default(),
                 yolo_turn: data.yolo_turn.unwrap_or(false),
+                answers: data.answers,
             });
             Json(serde_json::json!({"status": "ok"}))
         }
@@ -2150,6 +2211,27 @@ mod templates {
       </div>
     </div>
   </div>
+</div>
+<div class="modal fade" id="questionModal" tabindex="-1" data-bs-backdrop="static">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title">
+          <i class="bi bi-question-circle text-info me-2"></i>
+          Question
+        </h6>
+      </div>
+      <div class="modal-body" id="questionModalBody"></div>
+      <div class="modal-footer">
+        <button class="btn btn-sm btn-outline-danger" onclick="submitQuestion(null)">
+          <i class="bi bi-x-circle me-1"></i>Cancel
+        </button>
+        <button class="btn btn-sm btn-success" onclick="submitQuestion()">
+          <i class="bi bi-check-circle me-1"></i>Submit Answers
+        </button>
+      </div>
+    </div>
+  </div>
 </div>"##
         );
 
@@ -2162,7 +2244,7 @@ let isProcessing = false;
 let eventSource = null;
 let pendingToolCallId = null;
 let thinkingEl = null;
-let confirmModal, sudoModal, renameModal;
+let confirmModal, sudoModal, renameModal, questionModal;
 let pendingFiles = [];
 let wakeLock = null;
 
@@ -2171,6 +2253,7 @@ document.addEventListener('DOMContentLoaded', () => {{
   confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
   sudoModal    = new bootstrap.Modal(document.getElementById('sudoModal'));
   renameModal  = new bootstrap.Modal(document.getElementById('renameModal'));
+  questionModal = new bootstrap.Modal(document.getElementById('questionModal'));
   document.title = CHAT_TITLE + ' — Pengy';
   document.getElementById('navTitle').textContent = 'Pengy';
   document.getElementById('sudoPasswordInput').addEventListener('keydown', e => {{
@@ -2522,6 +2605,14 @@ function handleEvent(data) {{
       eventSource.close(); eventSource = null;
       setProcessing(false);
       break;
+    case 'question_request':
+      hideThinking();
+      showQuestionModal(data);
+      break;
+    case 'question_result':
+      hideThinking();
+      // Question was answered — result is injected back into context
+      break;
     case 'sudo_request':
       hideThinking();
       document.getElementById('sudoPasswordInput').value = '';
@@ -2661,6 +2752,61 @@ function submitSudo(override) {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{password}}),
+  }});
+  showThinking();
+}}
+
+function showQuestionModal(data) {{
+  const body = document.getElementById('questionModalBody');
+  body.innerHTML = '';
+  const questions = data.questions || [];
+  for (let i = 0; i < questions.length; i++) {{
+    const q = questions[i];
+    const header = q.header || ('Question ' + (i + 1));
+    const questionText = q.question || '';
+    const options = q.options || [];
+
+    let optionsHtml = '';
+    for (const opt of options) {{
+      optionsHtml += `
+        <div class="form-check mb-1">
+          <input class="form-check-input question-option" type="radio"
+                 name="q_${{i}}" value="${{escHtml(opt.label)}}"
+                 id="q_${{i}}_${{escHtml(opt.label)}}">
+          <label class="form-check-label" for="q_${{i}}_${{escHtml(opt.label)}}">
+            <strong>${{escHtml(opt.label)}}</strong>
+            ${{opt.description ? '<span class="text-muted"> — ' + escHtml(opt.description) + '</span>' : ''}}
+          </label>
+        </div>`;
+    }}
+
+    body.innerHTML += `
+      <div class="mb-3">
+        <h6 class="fw-semibold">${{escHtml(header)}}</h6>
+        <p class="mb-2">${{escHtml(questionText)}}</p>
+        ${{optionsHtml}}
+      </div>`;
+  }}
+  questionModal.show();
+}}
+
+function submitQuestion(override) {{
+  questionModal.hide();
+  if (override === null) {{
+    fetch(`/chat/${{CHAT_ID}}/confirm`, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{confirmed: false, tool_call_id: CHAT_ID, yolo_turn: false}}),
+    }});
+    return;
+  }}
+  const body = document.getElementById('questionModalBody');
+  const radios = body.querySelectorAll('.question-option:checked');
+  const answers = Array.from(radios).map(r => r.value);
+  fetch(`/chat/${{CHAT_ID}}/confirm`, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{confirmed: true, tool_call_id: CHAT_ID, yolo_turn: false, answers: answers}}),
   }});
   showThinking();
 }}
