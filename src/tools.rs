@@ -1661,14 +1661,7 @@ async fn directory_tree(path: String, max_depth: usize, show_hidden: bool) -> St
         lines.push("(empty directory)".into());
     }
     let result = lines.join("\n");
-    if result.len() > 40_000 {
-        format!(
-            "{}...\n\n[... truncated at 40,000 characters ...]",
-            truncate_on_char_boundary(&result, 40_000)
-        )
-    } else {
-        result
-    }
+    snip_tool_output(result)
 }
 
 fn build_tree(
@@ -1781,7 +1774,7 @@ fn format_size(size: u64) -> String {
 async fn read_multiple_files(paths: Vec<String>) -> String {
     const MAX_FILES: usize = 20;
     const MAX_PER_FILE: usize = 250_000;
-    const MAX_TOTAL: usize = 120_000;
+    const MAX_TOTAL: usize = 1_250_000;  // 5× the global tool output limit
 
     if paths.is_empty() {
         return "Error: no paths provided.".into();
