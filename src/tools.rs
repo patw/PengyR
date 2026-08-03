@@ -179,9 +179,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("pattern", "string", "The glob pattern to match against file paths"),
               ("path", "string", "The directory to search in (default: current working directory)")],
             &["pattern"]),
-        td("todowrite", "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time.",
-            &[("todos", "array", "The complete list of tasks with content and status (pending/in_progress/completed)")],
-            &["todos"]),
+        todowrite_definition(),
         td("ask_user_question", "Ask the user one or more multiple-choice questions to clarify requirements or resolve ambiguity.",
             &[("questions", "array", "One or more questions with header, question text, and options")],
             &["questions"]),
@@ -195,13 +193,73 @@ fn apply_changes_definition() -> ToolDef {
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
-                "changes": {"type":"array", "description":"Files and operations to apply", "items": {"type":"object", "properties": {
-                    "path":{"type":"string"}, "operations":{"type":"array", "items":{"type":"object"}}
-                }, "required":["path","operations"]}},
-                "dry_run":{"type":"boolean"},
-                "postconditions":{"type":"array", "items":{"type":"object"}}
+                "changes": {
+                    "type": "array",
+                    "description": "Files and exact-text operations to apply",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "File path to edit"},
+                            "operations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {"type": "string", "enum": ["replace", "insert_after", "delete"]},
+                                        "old": {"type": "string", "description": "Exact text to match for replace/delete"},
+                                        "anchor": {"type": "string", "description": "Exact text after which to insert"},
+                                        "new": {"type": "string", "description": "Replacement text"},
+                                        "text": {"type": "string", "description": "Text to insert"},
+                                        "expected_matches": {"type": "integer", "description": "Expected exact match count; defaults to 1"}
+                                    },
+                                    "required": ["kind"]
+                                }
+                            }
+                        },
+                        "required": ["path", "operations"]
+                    }
+                },
+                "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing files (default: false)"},
+                "postconditions": {
+                    "type": "array",
+                    "description": "Optional content checks evaluated before writing",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "contains": {"type": "string"},
+                            "does_not_contain": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    }
+                }
             }),
             required: vec!["changes".into()],
+        }
+    }}
+}
+
+fn todowrite_definition() -> ToolDef {
+    ToolDef { tool_type: "function".into(), function: FunctionDef {
+        name: "todowrite".into(),
+        description: "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time — do not send incremental updates. Exactly one task must be in_progress at any time. Mark tasks completed immediately after finishing them. Use imperative forms for content (e.g. 'Run tests', 'Add JWT middleware').".into(),
+        parameters: ParametersDef {
+            param_type: "object".into(),
+            properties: serde_json::json!({
+                "todos": {
+                    "type": "array",
+                    "description": "The complete list of tasks with their current statuses",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "Imperative task description, e.g. 'Run the tests'"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current task status — exactly one task must be in_progress"}
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            }),
+            required: vec!["todos".into()],
         }
     }}
 }
@@ -3296,6 +3354,88 @@ mod tests {
         let ctx = Arc::new(ToolContext::new());
         let result = execute_tool("ask_user_question", &args, &ctx).await;
         assert!(result.contains("harness"));
+    }
+
+    // ── Schema content: todowrite ─────────────────────────────────
+
+    #[test]
+    fn todowrite_schema_items_are_objects_not_strings() {
+        let defs = tool_definitions();
+        let td = defs.iter().find(|t| t.function.name == "todowrite").unwrap();
+        let todos = &td.function.parameters.properties["todos"];
+        assert_eq!(todos["type"], "array");
+        let items = &todos["items"];
+        assert_eq!(items["type"], "object");
+        let required: Vec<String> = items["required"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(required, vec!["content", "status"]);
+        let props = &items["properties"];
+        assert_eq!(props["content"]["type"], "string");
+        assert_eq!(props["status"]["type"], "string");
+        let status_enum: Vec<String> = props["status"]["enum"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(status_enum, vec!["pending", "in_progress", "completed"]);
+    }
+
+    // ── Schema content: apply_changes ─────────────────────────────
+
+    #[test]
+    fn apply_changes_schema_has_full_operation_properties() {
+        let defs = tool_definitions();
+        let ac = defs.iter().find(|t| t.function.name == "apply_changes").unwrap();
+        let params = &ac.function.parameters.properties;
+
+        // changes array
+        let changes = &params["changes"];
+        assert_eq!(changes["type"], "array");
+        let change_items = &changes["items"];
+        assert_eq!(change_items["type"], "object");
+        let change_required: Vec<String> = change_items["required"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(change_required, vec!["path", "operations"]);
+
+        // operations within each change
+        let operations = &change_items["properties"]["operations"];
+        assert_eq!(operations["type"], "array");
+        let op_items = &operations["items"];
+        assert_eq!(op_items["type"], "object");
+        let op_required: Vec<String> = op_items["required"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(op_required.contains(&"kind".to_string()));
+        let op_props = &op_items["properties"];
+        let kind_enum: Vec<String> = op_props["kind"]["enum"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kind_enum, vec!["replace", "insert_after", "delete"]);
+        assert_eq!(op_props["old"]["type"], "string");
+        assert_eq!(op_props["new"]["type"], "string");
+        assert_eq!(op_props["anchor"]["type"], "string");
+        assert_eq!(op_props["text"]["type"], "string");
+        assert_eq!(op_props["expected_matches"]["type"], "integer");
+
+        // dry_run
+        assert_eq!(params["dry_run"]["type"], "boolean");
+        assert!(!params["dry_run"]["description"].as_str().unwrap_or("").is_empty());
+
+        // postconditions
+        let post = &params["postconditions"];
+        assert_eq!(post["type"], "array");
+        let post_items = &post["items"];
+        assert_eq!(post_items["type"], "object");
+        let post_props = &post_items["properties"];
+        assert!(post_props.get("contains").is_some());
+        assert!(post_props.get("does_not_contain").is_some());
+        assert_eq!(post_props["contains"]["type"], "string");
+        assert_eq!(post_props["does_not_contain"]["type"], "string");
     }
 }
 // ---------------------------------------------------------------------------
