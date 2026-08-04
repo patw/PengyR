@@ -29,6 +29,15 @@ public:
     void sendSudoPassword(const QString& password);
     void cancelSudo();
 
+    bool isQuestionPending() const { return m_questionState.status == 1; }
+    QByteArray questionJson() const {
+        return QByteArray(m_questionState.questions_json,
+                          qstrnlen(m_questionState.questions_json,
+                                   sizeof(m_questionState.questions_json)));
+    }
+    void sendQuestionAnswers(const QStringList& answers);
+    void cancelQuestion();
+
 signals:
     void eventReceived(const QString& eventJson);
     void finished();
@@ -40,6 +49,7 @@ private:
     // Shared state with Qt main thread for tool confirmation
     ConfirmState m_confirmState;
     SudoState m_sudoState;
+    QuestionState m_questionState;
     QMutex m_mutex;
     QWaitCondition m_cond;
     std::atomic<bool> m_cancelled = false;

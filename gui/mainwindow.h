@@ -74,6 +74,7 @@ private:
     void processResponse(TabSession* session, const QJsonArray& apiMessages);
     void handleToolConfirm(TabSession* session, const QJsonObject& toolRequest);
     void handleFinalResponse(TabSession* session, const QJsonObject& response);
+    void handleQuestionRequest(TabSession* session);
     void updateQuickSettingsFor(TabSession* session);
 
     // ── Worker lifecycle ──────────────────────────────────────────

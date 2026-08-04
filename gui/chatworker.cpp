@@ -8,6 +8,9 @@ ChatWorker::ChatWorker(QObject* parent) : QObject(parent) {
     m_confirmState.yolo_turn = false;
     m_sudoState.status = 0;
     memset(m_sudoState.password, 0, sizeof(m_sudoState.password));
+    m_questionState.status = 0;
+    memset(m_questionState.questions_json, 0, sizeof(m_questionState.questions_json));
+    memset(m_questionState.answers_json, 0, sizeof(m_questionState.answers_json));
     // Per-run tool context so concurrent tabs don't share a sudo provider or
     // kill each other's subprocesses.  The Rust side clones the Arc internally,
     // so freeing this handle while a run is still in flight is refcount-safe.
@@ -33,6 +36,9 @@ void ChatWorker::start(const QString& baseUrl, const QString& apiKey,
     m_preserveReasoning = preserveReasoning;
     m_cancelled = false;
     m_confirmState.status = 0;
+    m_questionState.status = 0;
+    memset(m_questionState.questions_json, 0, sizeof(m_questionState.questions_json));
+    memset(m_questionState.answers_json, 0, sizeof(m_questionState.answers_json));
 
     // Run on a QThread (auto-deleted on finish)
     auto* thread = QThread::create([this] { run(); });
@@ -48,6 +54,7 @@ void ChatWorker::cancel() {
     QMutexLocker lock(&m_mutex);
     m_confirmState.status = 3; // declined
     m_sudoState.status = 3;    // cancelled
+    m_questionState.status = 3; // cancelled
     m_cond.wakeAll();
 }
 
@@ -61,6 +68,20 @@ void ChatWorker::sendSudoPassword(const QString& password) {
 
 void ChatWorker::cancelSudo() {
     m_sudoState.status = 3; // cancelled
+}
+
+void ChatWorker::sendQuestionAnswers(const QStringList& answers) {
+    QJsonArray arr;
+    for (const QString& a : answers) arr.append(a);
+    QByteArray json = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+    int len = qMin(json.size(), (int)sizeof(m_questionState.answers_json) - 1);
+    memcpy(m_questionState.answers_json, json.constData(), len);
+    m_questionState.answers_json[len] = '\0';
+    m_questionState.status = 2; // answered
+}
+
+void ChatWorker::cancelQuestion() {
+    m_questionState.status = 3; // cancelled
 }
 
 void ChatWorker::sendConfirmation(bool confirmed, bool yoloTurn) {
@@ -88,7 +109,7 @@ void ChatWorker::run() {
     bool ok = pengy_llm_chat_run(
         baseUrl.constData(), apiKey.constData(), model.constData(),
         msgs.constData(), tc.constData(), re.constData(), m_preserveReasoning,
-        &m_confirmState, &m_sudoState,
+        &m_confirmState, &m_sudoState, &m_questionState,
         callback, this, m_run
     );
 

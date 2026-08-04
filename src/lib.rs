@@ -232,6 +232,21 @@ pub struct SudoState {
     pub password: [u8; 256],
 }
 
+/// Shared question state between QThread and Qt main thread.
+///
+/// When the LLM asks a question, the worker sets status=1 and writes the
+/// questions JSON.  The Qt main thread polls, shows a dialog, writes the
+/// answers JSON and sets status=2 (answered) or 3 (cancelled).
+#[repr(C)]
+pub struct QuestionState {
+    /// 0 = idle, 1 = pending, 2 = answered, 3 = cancelled
+    pub status: i32,
+    /// JSON-serialised questions array, NUL-terminated.
+    pub questions_json: [u8; 16384],
+    /// JSON-serialised answers array (list of strings), NUL-terminated.
+    pub answers_json: [u8; 4096],
+}
+
 #[no_mangle]
 pub extern "C" fn pengy_llm_chat_run(
     base_url: *const c_char,
@@ -243,6 +258,7 @@ pub extern "C" fn pengy_llm_chat_run(
     preserve_reasoning: bool,
     confirm_state: *mut ConfirmState,
     sudo_state: *mut SudoState,
+    question_state: *mut QuestionState,
     on_event: Option<EventFn>,
     userdata: *mut c_void,
     run: *mut Arc<tools::ToolContext>,
@@ -380,6 +396,75 @@ pub extern "C" fn pengy_llm_chat_run(
                             });
                         }
                         // else: auto-confirmed or safe — the generator handles it
+                    }
+                    llm_client::LlmEvent::QuestionRequest {
+                        questions,
+                        tool_call_id,
+                        ..
+                    } => {
+                        if !question_state.is_null() {
+                            // Serialise questions into the shared buffer
+                            let q_json =
+                                serde_json::to_string(questions).unwrap_or_default();
+                            let q_bytes = q_json.as_bytes();
+                            let q_len = q_bytes.len().min(16383);
+                            unsafe {
+                                let qs = &mut *question_state;
+                                qs.questions_json[..q_len]
+                                    .copy_from_slice(&q_bytes[..q_len]);
+                                qs.questions_json[q_len] = 0;
+                                std::ptr::write_volatile(&mut qs.status, 1);
+                            }
+                            // Busy-wait for Qt main thread to respond
+                            loop {
+                                let status = unsafe {
+                                    std::ptr::read_volatile(&(*question_state).status)
+                                };
+                                if status == 2 || status == 3 {
+                                    break;
+                                }
+                                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let _ = confirm_tx.send(llm_client::Confirmation {
+                                        tool_call_id: tool_call_id.clone(),
+                                        confirmed: false,
+                                        yolo_turn: false,
+                                        answers: None,
+                                    });
+                                    break 'outer false;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            let (answered, answers_buf) = unsafe {
+                                let qs = &*question_state;
+                                let s = std::ptr::read_volatile(&qs.status);
+                                (s == 2, qs.answers_json)
+                            };
+                            unsafe {
+                                std::ptr::write_volatile(
+                                    &mut (*question_state).status,
+                                    0,
+                                );
+                            }
+                            let answers: Vec<String> = if answered {
+                                let ans_str =
+                                    String::from_utf8_lossy(&answers_buf)
+                                        .trim_end_matches('\0')
+                                        .to_string();
+                                serde_json::from_str(&ans_str).unwrap_or_default()
+                            } else {
+                                vec![]
+                            };
+                            let _ = confirm_tx.send(llm_client::Confirmation {
+                                tool_call_id: tool_call_id.clone(),
+                                confirmed: answered,
+                                yolo_turn: false,
+                                answers: if answered {
+                                    Some(answers)
+                                } else {
+                                    None
+                                },
+                            });
+                        }
                     }
                     llm_client::LlmEvent::FinalResponse { .. } => {
                         break true;

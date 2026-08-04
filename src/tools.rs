@@ -180,9 +180,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("path", "string", "The directory to search in (default: current working directory)")],
             &["pattern"]),
         todowrite_definition(),
-        td("ask_user_question", "Ask the user one or more multiple-choice questions to clarify requirements or resolve ambiguity.",
-            &[("questions", "array", "One or more questions with header, question text, and options")],
-            &["questions"]),
+        ask_user_question_definition(),
     ]
 }
 
@@ -260,6 +258,43 @@ fn todowrite_definition() -> ToolDef {
                 }
             }),
             required: vec!["todos".into()],
+        }
+    }}
+}
+
+fn ask_user_question_definition() -> ToolDef {
+    ToolDef { tool_type: "function".into(), function: FunctionDef {
+        name: "ask_user_question".into(),
+        description: "Ask the user one or more multiple-choice questions to clarify requirements or resolve ambiguity.".into(),
+        parameters: ParametersDef {
+            param_type: "object".into(),
+            properties: serde_json::json!({
+                "questions": {
+                    "type": "array",
+                    "description": "One or more questions, each with a header, question text, and list of options",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "header": {"type": "string", "description": "Short label for the question group (e.g. 'Theme', 'Output Format')"},
+                            "question": {"type": "string", "description": "The question text to display to the user"},
+                            "options": {
+                                "type": "array",
+                                "description": "List of answer choices for this question",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Short answer label (e.g. 'Dark', 'JSON')"},
+                                        "description": {"type": "string", "description": "Brief explanation of what this option means"}
+                                    },
+                                    "required": ["label", "description"]
+                                }
+                            }
+                        },
+                        "required": ["header", "question", "options"]
+                    }
+                }
+            }),
+            required: vec!["questions".into()],
         }
     }}
 }
@@ -3269,6 +3304,56 @@ mod tests {
         assert!(!result.contains("node_modules"));
     }
 
+    #[tokio::test]
+    async fn glob_tool_dir_prefix_in_pattern() {
+        // When pattern includes a directory path, extract it as the search dir
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "y").unwrap();
+
+        let pattern = format!("{}/*.py", dir.path().to_str().unwrap());
+        let result = glob_tool(pattern, None).await;
+        assert!(result.contains("a.py"));
+        assert!(!result.contains("b.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_exact_file_in_pattern() {
+        // Pattern is a path to a specific file — should find it via dir extraction
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.rs"), "content").unwrap();
+
+        let pattern = format!("{}/target.rs", dir.path().to_str().unwrap());
+        let result = glob_tool(pattern, None).await;
+        assert!(result.contains("target.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_dir_prefix_with_recursive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.py"), "x").unwrap();
+        std::fs::write(dir.path().join("sub/b.py"), "y").unwrap();
+
+        let pattern = format!("{}/**/*.py", dir.path().to_str().unwrap());
+        let result = glob_tool(pattern, None).await;
+        assert!(result.contains("a.py"));
+        assert!(result.contains("sub/b.py"));
+    }
+
+    #[tokio::test]
+    async fn glob_tool_explicit_path_takes_precedence() {
+        // When path is explicitly provided, use it (don't extract from pattern)
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "x").unwrap();
+
+        let result = glob_tool(
+            "*.py".into(),
+            Some(dir.path().to_str().unwrap().into()),
+        ).await;
+        assert!(result.contains("a.py"));
+    }
+
     // ── todowrite ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -3354,6 +3439,37 @@ mod tests {
         let ctx = Arc::new(ToolContext::new());
         let result = execute_tool("ask_user_question", &args, &ctx).await;
         assert!(result.contains("harness"));
+    }
+
+    #[test]
+    fn ask_user_question_schema_items_are_objects_not_strings() {
+        let defs = tool_definitions();
+        let td = defs.iter().find(|t| t.function.name == "ask_user_question").unwrap();
+        let questions = &td.function.parameters.properties["questions"];
+        assert_eq!(questions["type"], "array");
+        let items = &questions["items"];
+        assert_eq!(items["type"], "object", "questions items must be objects, not strings!");
+        let required: Vec<String> = items["required"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(required, vec!["header", "question", "options"]);
+        let props = &items["properties"];
+        assert_eq!(props["header"]["type"], "string");
+        assert_eq!(props["question"]["type"], "string");
+        // options array
+        let options = &props["options"];
+        assert_eq!(options["type"], "array");
+        let opt_items = &options["items"];
+        assert_eq!(opt_items["type"], "object");
+        let opt_required: Vec<String> = opt_items["required"]
+            .as_array().unwrap().iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(opt_required, vec!["label", "description"]);
+        let opt_props = &opt_items["properties"];
+        assert_eq!(opt_props["label"]["type"], "string");
+        assert_eq!(opt_props["description"]["type"], "string");
     }
 
     // ── Schema content: todowrite ─────────────────────────────────
@@ -3442,8 +3558,58 @@ mod tests {
 // glob — file pattern matching
 // ---------------------------------------------------------------------------
 
+/// When a user passes a pattern like `~/src/*.rs` without an explicit `path`,
+/// walk up from the full pattern until we find an existing directory, then use
+/// that as the search path and the last component as the filename pattern.
+fn extract_dir_from_glob_pattern(pattern: &str) -> Option<(String, String)> {
+    let expanded = expand_home(pattern);
+    let path = std::path::Path::new(&expanded);
+
+    // Walk up from the full path until we find an existing part
+    let mut current = path.to_path_buf();
+    while let Some(parent) = current.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        if parent.exists() && parent.is_dir() {
+            let dir_str = parent.to_string_lossy().to_string();
+            let file_pattern = current
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            // Use the original last component from the pattern (preserves wildcards)
+            let original_file_part = pattern
+                .rsplit('/')
+                .next()
+                .unwrap_or(file_pattern);
+            // Preserve `**/` prefix if the original pattern had it before the
+            // last component — the caller needs it for recursive matching.
+            let has_recursive = pattern.contains("**/");
+            let final_pattern = if has_recursive {
+                format!("**/{}", original_file_part)
+            } else {
+                original_file_part.to_string()
+            };
+            return Some((dir_str, final_pattern));
+        }
+        current = parent.to_path_buf();
+    }
+    None
+}
+
 async fn glob_tool(pattern: String, path: Option<String>) -> String {
-    let root = if let Some(p) = &path {
+    // If no explicit path was given and the pattern contains '/', extract the
+    // longest existing directory prefix from the pattern so that users can
+    // pass e.g. "~/src/*.rs" as the pattern without a separate path argument.
+    let (pattern, path) = if path.is_none() && pattern.contains('/') {
+        extract_dir_from_glob_pattern(&pattern)
+            .map(|(d, p)| (p, Some(d)))
+            .unwrap_or((pattern, None))
+    } else {
+        (pattern, path)
+    };
+
+    let root = if let Some(ref p) = path {
         let expanded = expand_home(p);
         match expanded.canonicalize() {
             Ok(r) => r,

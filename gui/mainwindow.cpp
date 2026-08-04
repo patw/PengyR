@@ -25,6 +25,10 @@
 #include <QMimeDatabase>
 #include <QMimeType>
 #include <QCloseEvent>
+#include <QScrollArea>
+#include <QGroupBox>
+#include <QButtonGroup>
+#include <QRadioButton>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // Load config
@@ -942,9 +946,130 @@ void MainWindow::stopWorker() {
     }
 }
 
+void MainWindow::handleQuestionRequest(TabSession* session) {
+    ChatWorker* worker = session->worker;
+    if (!worker) return;
+
+    // Parse questions from the shared buffer
+    QByteArray qJson = worker->questionJson();
+    QJsonDocument qDoc = QJsonDocument::fromJson(qJson);
+    QJsonArray questions = qDoc.array();
+    if (questions.isEmpty()) {
+        worker->sendQuestionAnswers(QStringList());
+        return;
+    }
+
+    int themeScale = m_runtimeUiScale;
+    Theme theme = makeTheme(m_config["theme_mode"].toString("system"),
+                            m_config["theme_accent"].toString("default"));
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Pengy — Questions");
+    dlg.setModal(true);
+    dlg.setMinimumWidth(450);
+    dlg.setMaximumWidth(750);
+    dlg.setStyleSheet(appStyleSheet(theme, themeScale));
+
+    QVBoxLayout* layout = new QVBoxLayout(&dlg);
+    QLabel* header = new QLabel("The assistant needs your input:");
+    header->setStyleSheet(QString("color:%1; font-weight:bold; padding:4px;").arg(theme["fg"]));
+    layout->addWidget(header);
+
+    QVector<QButtonGroup*> groups;
+    QScrollArea* scrollArea = new QScrollArea;
+    scrollArea->setWidgetResizable(true);
+    QWidget* scrollW = new QWidget;
+    QVBoxLayout* scrollL = new QVBoxLayout(scrollW);
+    scrollL->setSizeConstraint(QLayout::SetMinAndMaxSize);
+
+    for (int qi = 0; qi < questions.size(); ++qi) {
+        QJsonObject q = questions[qi].toObject();
+        QString headerText = q["header"].toString();
+        QString questionText = q["question"].toString();
+        QJsonArray opts = q["options"].toArray();
+
+        QGroupBox* gb = new QGroupBox(headerText);
+        gb->setStyleSheet(QString(
+            "QGroupBox { color:%1; font-weight:bold; border:1px solid %2; "
+            "border-radius:6px; margin-top:8px; padding:12px 8px 8px 8px; } "
+            "QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; }")
+            .arg(theme["primary"], theme["border_soft"]));
+        QVBoxLayout* gl = new QVBoxLayout(gb);
+        QLabel* qLabel = new QLabel(questionText);
+        qLabel->setWordWrap(true);
+        gl->addWidget(qLabel);
+        QButtonGroup* bg = new QButtonGroup(&dlg);
+        groups.append(bg);
+
+        for (int oi = 0; oi < opts.size(); ++oi) {
+            QJsonObject opt = opts[oi].toObject();
+            QRadioButton* rb = new QRadioButton(
+                QString("%1  —  %2")
+                    .arg(opt["label"].toString(), opt["description"].toString()));
+            bg->addButton(rb, oi);
+            gl->addWidget(rb);
+            if (oi == 0) rb->setChecked(true);
+        }
+        scrollL->addWidget(gb);
+    }
+    scrollL->addStretch();
+    scrollArea->setWidget(scrollW);
+    layout->addWidget(scrollArea, 1);
+
+    QHBoxLayout* btnL = new QHBoxLayout;
+    QPushButton* submit = new QPushButton("Submit Answers");
+    submit->setStyleSheet(QString(
+        "QPushButton{background-color:%1;color:%2;border:none;border-radius:6px;"
+        "padding:8px 24px;font-weight:bold;}")
+        .arg(theme["primary"], theme["primary_fg"]));
+    QPushButton* cancel = new QPushButton("Cancel");
+    cancel->setStyleSheet(QString(
+        "QPushButton{background-color:%1;color:white;border:none;border-radius:6px;"
+        "padding:8px 24px;font-weight:bold;}")
+        .arg(theme["danger"]));
+    btnL->addWidget(submit);
+    btnL->addWidget(cancel);
+    layout->addLayout(btnL);
+
+    // Size dialog to fit content, with reasonable limits
+    scrollW->adjustSize();
+    int idealW = qMin(scrollW->sizeHint().width() + 40, 750);
+    int idealH = qMin(scrollW->sizeHint().height() + 140, 650);
+    dlg.resize(qMax(idealW, 480), qMax(idealH, 280));
+
+    connect(submit, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        QStringList answers;
+        for (auto* bg : groups) {
+            QAbstractButton* checked = bg->checkedButton();
+            if (checked) {
+                QString text = checked->text();
+                int dash = text.indexOf("  —  ");
+                answers.append(dash > 0 ? text.left(dash) : text);
+            } else {
+                answers.append("");
+            }
+        }
+        worker->sendQuestionAnswers(answers);
+    } else {
+        worker->cancelQuestion();
+    }
+}
+
 void MainWindow::pollToolConfirmation() {
     TabSession* session = tabForChat(m_activeChatId);
     if (!session || !session->worker || m_sudoDialogOpen) return;
+
+    // Check for question request first
+    if (session->worker->isQuestionPending()) {
+        m_sudoDialogOpen = true;
+        handleQuestionRequest(session);
+        m_sudoDialogOpen = false;
+        return;
+    }
+
     if (!session->worker->isSudoPending()) return;
 
     m_sudoDialogOpen = true;

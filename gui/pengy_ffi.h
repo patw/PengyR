@@ -43,6 +43,12 @@ extern "C" {
         char password[256];
     };
 
+    struct QuestionState {
+        int status;                // 0=idle, 1=pending, 2=answered, 3=cancelled
+        char questions_json[16384];
+        char answers_json[4096];
+    };
+
     typedef void (*EventFn)(const char* event_json, void* userdata);
 
     // Opaque per-run tool context handle (Rust Arc<ToolContext>).  Create one
@@ -62,6 +68,7 @@ extern "C" {
         bool preserve_reasoning,
         ConfirmState* confirm_state,
         SudoState* sudo_state,
+        QuestionState* question_state,
         EventFn on_event,
         void* userdata,
         PengyRun* run
