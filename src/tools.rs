@@ -2294,7 +2294,7 @@ async fn search_content(
     if truncated {
         summary.push_str(" (results truncated)");
     }
-    format!("{summary}\n{}\n{out}", "─".repeat(60))
+    snip_tool_output(format!("{summary}\n{}\n{out}", "─".repeat(60)))
 }
 
 fn search_one_file(
