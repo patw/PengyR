@@ -6,6 +6,12 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 
 > PengyR shares `~/.config/pengy/` with the Python Pengy and PengyCPP. Settings and chat history are fully interoperable between all three applications.
 
+> **Canonical contracts live in the Python Pengy spec.** This document describes how *this*
+> edition is built. The cross-edition rules every Pengy must satisfy — on-disk formats, tool
+> contracts, and especially the **LLM Loop Contract** (message-ordering invariants, dangling
+> tool-call repair, context elision, retry/backoff) — are specified once in `Pengy/spec.md` and
+> are not repeated here. Read that first if you are porting Pengy to a new language.
+
 ---
 
 ## Technology Stack
@@ -61,7 +67,7 @@ PengyR/
 │   ├── config.rs               # Settings load/save + system message rendering
 │   ├── chat_manager.rs         # Chat session CRUD + message cleaning
 │   ├── task_manager.rs         # Prompt-template Tasks CRUD (~/.config/pengy/tasks.json)
-│   ├── tools.rs                # 14 OpenAI function-calling tools
+│   ├── tools.rs                # 15 OpenAI function-calling tools
 │   └── llm_client.rs           # Async LLM chat generator (tokio channels)
 ├── cli/                        # CLI binary (pengy-cli)
 │   ├── Cargo.toml
@@ -459,7 +465,12 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
   "theme_mode": "system",
   "theme_accent": "default",
   "user_agent": "PengyAgent/1.0",
-  "tool_timeout": 60
+  "llm_timeout": 300,
+  "tool_timeout": 300,
+  "tool_output_max_chars": 250000,
+  "image_max_dimension": 4096,
+  "image_max_mb": 4.5,
+  "image_quality": 85
 }
 ```
 
@@ -477,7 +488,12 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `theme_mode` | string | `"system"` | Desktop theme: `"system"`, `"light"`, or `"dark"` |
 | `theme_accent` | string | `"default"` | Desktop accent color (`default`/`blue`/`teal`/`green`/`orange`/`red`/`pink`/`purple`) |
 | `user_agent` | string | `PengyAgent/1.0` | User-Agent header for HTTP requests |
-| `tool_timeout` | int | `60` | Timeout in seconds for tool execution (-1 = no timeout) |
+| `llm_timeout` | int | `300` | HTTP timeout in seconds for each LLM API request |
+| `tool_timeout` | int | `300` | Timeout in seconds for tool execution (-1 = no timeout) |
+| `tool_output_max_chars` | int | `250000` | Tool output longer than this is snipped head+tail. 0 = no limit |
+| `image_max_dimension` | int | `4096` | Attached images are downscaled so neither side exceeds this (px) |
+| `image_max_mb` | float | `4.5` | Attached images are re-encoded until under this size (MB) |
+| `image_quality` | int | `85` | JPEG quality (0–100) used when re-encoding attached images |
 
 ### System Message Templating
 
@@ -498,7 +514,7 @@ Array of chat session objects with `user`, `assistant` (including `tool_calls`),
 
 ## Tools
 
-All 14 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
+All 15 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 
 | Tool | Read-only | Description |
 |------|:---:|-------------|
@@ -506,7 +522,8 @@ All 14 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | `read_multiple_files` | ✅ | Read up to 20 files at once, each under a clear header. |
 | `write_file` | ❌ | Write content to a file (creates parent dirs). |
 | `replace_in_file` | ❌ | Exact string replacement; must match exactly once. |
-| `run_bash` | ❌ | Execute a bash command (sudo via `-S` with cached password). |
+| `apply_changes` | ❌ | Transactional multi-file exact-text edits; all-or-nothing, `dry_run` diff preview. |
+| `run_bash` | ❌ | Execute a bash command (sudo via `SUDO_ASKPASS` with cached password). |
 | `run_python` | ❌ | Write code to temp file and execute with `python3`. |
 | `web_search` | ✅ | DuckDuckGo search via `primp` (browser-impersonating HTTP, 5s timeout). |
 | `download_file` | ❌ | Download file to `~/Downloads/`. |
@@ -600,7 +617,7 @@ build_windows.bat
 
 **Non-streaming API calls:** The LLM client uses non-streaming completions (no `stream: true`). Full responses render at once. This simplifies the architecture and is acceptable because tool call round-trips dominate latency for agentic workflows.
 
-**Sudo via `-S`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, pass it to `sudo -S`. Password cached in memory for the duration of the LLM run. No PTY complexity.
+**Sudo via `SUDO_ASKPASS`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, then rewrite every `sudo` to `sudo -A` and supply the password through a temp `SUDO_ASKPASS` script that echoes an environment variable. Password cached in memory for the duration of the LLM run. No PTY complexity. See Python Pengy's spec for why this replaced piping the password to stdin with a single `sudo -S` rewrite: that broke on pipelines, redirects, earlier stdin readers, and any second `sudo`.
 
 **System message templating at send time:** Templates are resolved fresh on every send so `{date}` is always accurate regardless of when the config was saved.
 
@@ -617,7 +634,7 @@ build_windows.bat
 | Feature | Status | Notes |
 |---------|:---:|-------|
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
-| 14 tools | ✅ | All tools ported |
+| 15 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
 | CLI (interactive REPL + single-shot) | ✅ | 25 slash commands, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |

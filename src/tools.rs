@@ -843,21 +843,80 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
     )
 }
 
-/// Rewrite the first word-boundary `sudo` that isn't already followed by
-/// `-S` into `sudo -S`. Mirrors the reference's
-/// `re.sub(r'\bsudo\b(?!\s+-S)', 'sudo -S', command, count=1)`.
 static SUDO_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bsudo\b").unwrap());
-static SUDO_DASH_S_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-S").unwrap());
+static SUDO_DASH_S_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-S\b").unwrap());
+static SUDO_DASH_A_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-A\b").unwrap());
 static SUDO_PROMPT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[sudo[^]]*\].*\n?").unwrap());
 
-fn rewrite_first_sudo(command: &str) -> String {
+/// Rewrite *every* word-boundary `sudo` to `sudo -A` so it authenticates via
+/// `SUDO_ASKPASS` instead of stdin.
+///
+/// Feeding the password to the shell's stdin (the old `sudo -S` approach) broke
+/// whenever something else in the command touched stdin: a pipeline
+/// (`echo x | sudo tee f`), a redirect (`sudo cmd < /dev/null`), an earlier
+/// command that reads stdin, or a second `sudo` after the single piped password
+/// was consumed. Askpass has none of those constraints, so all occurrences can
+/// be rewritten. Any existing `-S` is dropped since stdin no longer carries the
+/// password. Word-boundary matching leaves `sudoku`/`pseudo-tty` untouched.
+fn rewrite_sudo_for_askpass(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 16);
+    let mut last = 0;
     for m in SUDO_WORD_RE.find_iter(command) {
-        if !SUDO_DASH_S_RE.is_match(&command[m.end()..]) {
-            return format!("{}sudo -S{}", &command[..m.start()], &command[m.end()..]);
+        out.push_str(&command[last..m.start()]);
+        out.push_str("sudo");
+        last = m.end();
+        let rest = &command[last..];
+        if let Some(dash_s) = SUDO_DASH_S_RE.find(rest) {
+            // Drop the now-meaningless `-S` and take its place with `-A`.
+            out.push_str(" -A");
+            last += dash_s.end();
+        } else if SUDO_DASH_A_RE.is_match(rest) {
+            // Already an askpass invocation; leave it alone.
+        } else {
+            out.push_str(" -A");
         }
     }
-    command.to_string()
+    out.push_str(&command[last..]);
+    out
+}
+
+/// Temporary `SUDO_ASKPASS` helper script.
+///
+/// The password itself never touches the disk — the script just echoes the
+/// `PENGY_SUDO_PASSWORD` environment variable handed to the child process.
+/// The containing directory and the script are both mode 0700.
+struct AskpassHelper {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl AskpassHelper {
+    fn new() -> Result<Self, std::io::Error> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("pengy-askpass-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("askpass.sh");
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$PENGY_SUDO_PASSWORD\"\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Self { dir, path })
+    }
+}
+
+impl Drop for AskpassHelper {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
 }
 
 async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
@@ -887,14 +946,20 @@ async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
         }
     }
 
-    // Ensure privileged commands read password from stdin. Rewrite only the
-    // first `sudo` that isn't already followed by `-S` (word-boundary match,
-    // not a substring match, so `sudoku`/`pseudo-tty` are left untouched;
-    // and only one occurrence, since the piped password is consumed once —
-    // rewriting every `sudo` would leave later invocations blocked on an
-    // interactive prompt). The `regex` crate has no lookahead support, so
-    // this is done as a manual scan instead of a single regex substitution.
-    let command = rewrite_first_sudo(&command);
+    // Route privileged commands through SUDO_ASKPASS. The `regex` crate has no
+    // lookahead support, so the rewrite is a manual scan.
+    let mut askpass = None;
+    let command = if password_needed {
+        match AskpassHelper::new() {
+            Ok(helper) => {
+                askpass = Some(helper);
+                rewrite_sudo_for_askpass(&command)
+            }
+            Err(e) => return format!("Error preparing sudo askpass helper: {e}"),
+        }
+    } else {
+        command
+    };
 
     let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("bash") {
         Ok(files) => files,
@@ -905,7 +970,15 @@ async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
     cmd.arg("-c").arg(&command);
     cmd.stdout(Stdio::from(stdout_file));
     cmd.stderr(Stdio::from(stderr_file));
-    cmd.stdin(Stdio::piped());
+    // The command never inherits our stdin: the password goes via askpass, and
+    // a child reading the terminal would hang the GUI/CLI.
+    cmd.stdin(Stdio::null());
+    if let Some(ref helper) = askpass {
+        cmd.env("SUDO_ASKPASS", &helper.path);
+        if let Some(ref pw) = *ctx.cached_sudo_password.lock().unwrap() {
+            cmd.env("PENGY_SUDO_PASSWORD", pw);
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -922,15 +995,6 @@ async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
 
     let pid = child.id();
     ctx.register_process(pid);
-
-    if password_needed {
-        let pw_guard = ctx.cached_sudo_password.lock().unwrap();
-        if let Some(ref pw) = *pw_guard {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = writeln!(stdin, "{pw}");
-            }
-        }
-    }
 
     // Use tokio::task::spawn_blocking to avoid blocking the async runtime.
     // Output is redirected to files instead of piped: a child that writes more
@@ -2535,39 +2599,60 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    // ── rewrite_first_sudo ──────────────────────────────────────────
+    // ── rewrite_sudo_for_askpass ────────────────────────────────────
 
     #[test]
     fn sudo_rewrite_plain_command() {
-        assert_eq!(rewrite_first_sudo("sudo apt update"), "sudo -S apt update");
+        assert_eq!(
+            rewrite_sudo_for_askpass("sudo apt update"),
+            "sudo -A apt update"
+        );
     }
 
     #[test]
-    fn sudo_rewrite_already_dash_s_unchanged() {
+    fn sudo_rewrite_dash_s_becomes_askpass() {
+        // stdin no longer carries the password, so -S must be replaced.
         assert_eq!(
-            rewrite_first_sudo("sudo -S apt update"),
-            "sudo -S apt update"
+            rewrite_sudo_for_askpass("sudo -S apt update"),
+            "sudo -A apt update"
+        );
+    }
+
+    #[test]
+    fn sudo_rewrite_already_dash_a_unchanged() {
+        assert_eq!(
+            rewrite_sudo_for_askpass("sudo -A apt update"),
+            "sudo -A apt update"
         );
     }
 
     #[test]
     fn sudo_rewrite_sudoku_unchanged() {
-        assert_eq!(rewrite_first_sudo("echo sudoku"), "echo sudoku");
+        assert_eq!(rewrite_sudo_for_askpass("echo sudoku"), "echo sudoku");
     }
 
     #[test]
     fn sudo_rewrite_pseudo_tty_unchanged() {
         assert_eq!(
-            rewrite_first_sudo("ls /dev/pseudo-tty"),
+            rewrite_sudo_for_askpass("ls /dev/pseudo-tty"),
             "ls /dev/pseudo-tty"
         );
     }
 
     #[test]
-    fn sudo_rewrite_only_first_of_two() {
+    fn sudo_rewrite_every_occurrence() {
+        // askpass works for each invocation, unlike a single piped password.
         assert_eq!(
-            rewrite_first_sudo("sudo apt update && sudo apt upgrade"),
-            "sudo -S apt update && sudo apt upgrade"
+            rewrite_sudo_for_askpass("sudo apt update && sudo apt upgrade"),
+            "sudo -A apt update && sudo -A apt upgrade"
+        );
+    }
+
+    #[test]
+    fn sudo_rewrite_in_pipeline() {
+        assert_eq!(
+            rewrite_sudo_for_askpass("echo hi | sudo tee /etc/f"),
+            "echo hi | sudo -A tee /etc/f"
         );
     }
 
@@ -2775,6 +2860,51 @@ mod tests {
         let ctx = Arc::new(ToolContext::new());
         let result = run_bash("sudo true".into(), ctx).await;
         assert!(result.contains("no password provider"));
+    }
+
+    #[tokio::test]
+    async fn run_bash_sudo_authenticates_via_askpass() {
+        let _guard = test_tool_timeout_guard();
+        // Stub sudo that only succeeds when given -A plus a working askpass.
+        let dir = tempfile::Builder::new()
+            .prefix("pengy-sudo-test-")
+            .tempdir()
+            .unwrap();
+        let sudo = dir.path().join("sudo");
+        std::fs::write(
+            &sudo,
+            "#!/bin/bash\n\
+             if [ \"$1\" != \"-A\" ]; then echo \"sudo: no tty present\" >&2; exit 1; fi\n\
+             shift\n\
+             pw=\"$(\"$SUDO_ASKPASS\")\"\n\
+             echo \"pw=$pw\"\n\
+             exec \"$@\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
+
+        let ctx = Arc::new(ToolContext::new());
+        ctx.set_sudo_provider(Some(Box::new(|| Some("s3cret".to_string()))));
+
+        // Shapes the old stdin-piped `sudo -S` broke on.
+        for command in [
+            "sudo echo hi",
+            "echo a; cat > /dev/null; sudo echo hi",
+            "sudo echo one; sudo echo two",
+            "sudo echo hi < /dev/null",
+            "sudo -S echo hi",
+        ] {
+            let result = run_bash(command.into(), ctx.clone()).await;
+            assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
+            assert!(!result.contains("no tty present"), "{command:?} -> {result:?}");
+        }
+
+        std::env::set_var("PATH", old_path);
     }
 
     #[test]
