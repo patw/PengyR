@@ -3530,4 +3530,59 @@ mod tests {
         let items: Vec<_> = stream.collect().await;
         assert_eq!(items.len(), 2); // retry + SudoRequest
     }
+
+    fn event_log(events: Vec<SseEvent>) -> (Arc<Mutex<Vec<SseEvent>>>, tokio::sync::watch::Receiver<usize>, Arc<AtomicBool>) {
+        let count = events.len();
+        let events = Arc::new(Mutex::new(events));
+        let (_tx, rx) = tokio::sync::watch::channel(count);
+        (events, rx, Arc::new(AtomicBool::new(true)))
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_only_events_after_cursor() {
+        let (events, rx, done) = event_log(vec![
+            SseEvent::ToolRequest { name: "read_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), auto_approved: false },
+            SseEvent::ToolResult { tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "read_file".into(), content: "ok".into(), declined: false },
+            SseEvent::FinalResponse { html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
+        ]);
+        let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
+        // retry directive plus result and final; event 0/tool request is not replayed.
+        assert_eq!(items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn disconnected_stream_can_resume_final_response_exactly_once() {
+        let events = Arc::new(Mutex::new(vec![SseEvent::ToolRequest {
+            name: "write_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), auto_approved: false,
+        }]));
+        let (tx, rx) = tokio::sync::watch::channel(1usize);
+        let done = Arc::new(AtomicBool::new(false));
+
+        // The first client has seen event 0 and disconnects. The worker makes
+        // progress while no stream is consuming it.
+        events.lock().unwrap().push(SseEvent::ToolResult {
+            tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "write_file".into(), content: "written".into(), declined: false,
+        });
+        events.lock().unwrap().push(SseEvent::FinalResponse {
+            html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+        done.store(true, Ordering::Relaxed);
+        let _ = tx.send(3);
+
+        let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
+        // retry + exactly the missed result and final response.
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn chat_template_has_cursor_safe_mobile_reconnect_logic() {
+        let chat = Chat::new("Template test");
+        let html = templates::chat_page(&chat, &[], &Config::default(), &[], true);
+        assert!(html.contains("sessionStorage.getItem('pengy_sse_cursor_'"));
+        assert!(html.contains("?after=${encodeURIComponent(sseCursor)}"));
+        assert!(html.contains("readyState === EventSource.CLOSED"));
+        assert!(html.contains("behavior: 'auto'"));
+        assert!(!html.contains("readyState !== EventSource.OPEN"));
+        assert!(!html.contains("behavior: 'instant'"));
+    }
 }
