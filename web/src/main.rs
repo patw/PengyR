@@ -305,6 +305,7 @@ enum SseEvent {
         args: serde_json::Value,
         tool_call_id: String,
         safe_id: String,
+        summary: String,
         auto_approved: bool,
     },
     ToolResult {
@@ -357,6 +358,29 @@ fn safe_id(tool_call_id: &str) -> String {
             .collect::<String>()
     )
 }
+fn tool_summary(name: &str, args: &serde_json::Value) -> String {
+    let Some(obj) = args.as_object() else { return String::new() };
+    let secret = |key: &str| matches!(key, "password" | "passwd" | "api_key" | "apikey" | "token" | "access_token" | "refresh_token" | "authorization" | "secret" | "private_key");
+    let val = |key: &str| -> String {
+        if secret(key) { return "[redacted]".into(); }
+        obj.get(key).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()).replace('\n', " ").trim().to_owned()).unwrap_or_default()
+    };
+    let mut s = match name {
+        "read_file" | "write_file" | "replace_in_file" | "directory_tree" => val("path"),
+        "read_multiple_files" => obj.get("paths").and_then(|v| v.as_array()).map(|v| format!("{} files", v.len())).unwrap_or_default(),
+        "web_search" => val("query"),
+        "fetch_url" => val("url"),
+        "download_file" => { let f = val("filename"); if f.is_empty() { val("url") } else { f } },
+        "run_bash" => val("command"),
+        "run_python" => val("code"),
+        "search_content" | "glob" => { let p = val("pattern"); let path = val("path"); if p.is_empty() { path } else if path.is_empty() { p } else { format!("{} in {}", p, path) } },
+        "apply_changes" => obj.get("changes").and_then(|v| v.as_array()).map(|v| format!("{} files", v.len())).unwrap_or_default(),
+        "ask_user_question" => obj.get("questions").and_then(|v| v.as_array()).map(|v| format!("{} questions", v.len())).unwrap_or_default(),
+        _ => obj.iter().find_map(|(k, v)| if secret(k) { None } else { Some(v.as_str().unwrap_or("").replace('\n', " ")) }).unwrap_or_default(),
+    };
+    if s.chars().count() > 100 { s = format!("{}…", s.chars().take(97).collect::<String>().trim_end()); }
+    s
+}
 
 fn sse_event_to_json(event: &SseEvent) -> String {
     match event {
@@ -365,6 +389,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             args,
             tool_call_id,
             safe_id,
+            summary,
             auto_approved,
         } => serde_json::json!({
             "type": "tool_request",
@@ -372,6 +397,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "args": args,
             "tool_call_id": tool_call_id,
             "safe_id": safe_id,
+            "summary": summary,
             "auto_approved": auto_approved,
         })
         .to_string(),
@@ -579,6 +605,7 @@ impl WebWorker {
                             args: args.clone(),
                             tool_call_id: tool_call_id.clone(),
                             safe_id: sid,
+                            summary: tool_summary(&name, &args),
                             auto_approved: !needs_confirm,
                         });
 
@@ -1633,6 +1660,7 @@ struct ToolEvent {
     args: serde_json::Value,
     tool_call_id: String,
     safe_id: String,
+    summary: String,
     result: Option<String>,
     declined: bool,
 }
@@ -1681,9 +1709,10 @@ fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
                             serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                         ToolEvent {
                             name: tc.function.name.clone(),
-                            args,
+                            args: args.clone(),
                             tool_call_id: tc.id.clone(),
                             safe_id: safe_id(&tc.id),
+                            summary: tool_summary(&tc.function.name, &args),
                             result: None,
                             declined: false,
                         }
@@ -2188,6 +2217,7 @@ mod templates {
     .tool-card.declined {{ border-left-color: var(--bs-danger); }}
     .tool-card.done {{ border-left-color: var(--bs-success); }}
     .tool-header {{ cursor: pointer; user-select: none; display: flex; align-items: center; gap: 0.4rem; }}
+    .tool-summary {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 0.78rem; }}
     .tool-args, .tool-output {{ background: #f6f8fa; border-radius: 4px; padding: 0.5rem 0.6rem; margin-top: 0.4rem; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.78rem; color: #24292e; }}
     .msg-thinking {{ display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.85rem; color: var(--bs-secondary-color); font-size: 0.85rem; }}
     /* ── Jump to bottom ──────────────────────────────────────── */
@@ -2423,6 +2453,7 @@ mod templates {
   <div class="tool-header" data-bs-toggle="collapse" data-bs-target="#body-{safe_id}">
     <i class="bi bi-gear-fill text-warning" style="font-size:0.8rem"></i>
     <code class="fw-semibold text-warning">{name}</code>
+    {summary}
     {badge}
     <i class="bi bi-chevron-down ms-auto" style="font-size:0.7rem"></i>
   </div>
@@ -2433,6 +2464,7 @@ mod templates {
 </div>"##,
                             safe_id = ev.safe_id,
                             name = escape_html(&ev.name),
+                            summary = if ev.summary.is_empty() { String::new() } else { format!(r#"<span class="tool-summary text-muted" title="{}">{}</span>"#, escape_html(&ev.summary), escape_html(&ev.summary)) },
                             args = escape_html(&args_str),
                         ));
                     }
@@ -2653,6 +2685,21 @@ function escHtml(text) {{
 
 function safeId(toolCallId) {{
   return 'tc_' + toolCallId.replace(/[^a-zA-Z0-9]/g, '');
+}}
+
+const SUMMARY_SECRET_KEYS = new Set(['password','passwd','api_key','apikey','token','access_token','refresh_token','authorization','secret','private_key']);
+function toolSummary(name, args) {{
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+  const val = key => SUMMARY_SECRET_KEYS.has(key.toLowerCase()) ? '[redacted]' : (typeof args[key] === 'string' ? args[key].replace(/\n/g, ' ').trim() : args[key] == null ? '' : String(args[key]));
+  let s = '';
+  if (['read_file','write_file','replace_in_file','directory_tree'].includes(name)) s = val('path');
+  else if (name === 'read_multiple_files') s = Array.isArray(args.paths) ? `${{args.paths.length}} files` : '';
+  else if (name === 'web_search') s = val('query'); else if (name === 'fetch_url') s = val('url');
+  else if (name === 'download_file') s = val('filename') || val('url'); else if (name === 'run_bash') s = val('command'); else if (name === 'run_python') s = val('code');
+  else if (['search_content','glob'].includes(name)) s = val('pattern') + (val('path') ? ` in ${{val('path')}}` : '');
+  else if (name === 'apply_changes') s = Array.isArray(args.changes) ? `${{args.changes.length}} files` : '';
+  else if (name === 'ask_user_question') s = Array.isArray(args.questions) ? `${{args.questions.length}} questions` : '';
+  return s.length <= 100 ? s : s.slice(0, 97).trimEnd() + '…';
 }}
 
 function setProcessing(val) {{
@@ -2998,6 +3045,7 @@ function appendUserMessage(content) {{
 
 function appendToolRequest(data) {{
   const sid = safeId(data.tool_call_id);
+  data.summary = data.summary || toolSummary(data.name, data.args);
   const el = document.createElement('div');
   el.className = 'msg-tool';
   el.innerHTML = `
@@ -3005,6 +3053,7 @@ function appendToolRequest(data) {{
       <div class="tool-header" data-bs-toggle="collapse" data-bs-target="#body-${{sid}}">
         <i class="bi bi-gear-fill text-warning" style="font-size:.8rem"></i>
         <code class="fw-semibold text-warning">${{escHtml(data.name)}}</code>
+        ${{data.summary ? `<span class="tool-summary text-muted" title="${{escHtml(data.summary)}}">${{escHtml(data.summary)}}</span>` : ''}}
         <span class="badge bg-secondary ms-1" id="badge-${{sid}}">
           ${{data.auto_approved ? 'running...' : 'pending'}}
         </span>
@@ -3541,7 +3590,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_only_events_after_cursor() {
         let (events, rx, done) = event_log(vec![
-            SseEvent::ToolRequest { name: "read_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), auto_approved: false },
+            SseEvent::ToolRequest { name: "read_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), summary: String::new(), auto_approved: false },
             SseEvent::ToolResult { tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "read_file".into(), content: "ok".into(), declined: false },
             SseEvent::FinalResponse { html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
         ]);
@@ -3553,7 +3602,7 @@ mod tests {
     #[tokio::test]
     async fn disconnected_stream_can_resume_final_response_exactly_once() {
         let events = Arc::new(Mutex::new(vec![SseEvent::ToolRequest {
-            name: "write_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), auto_approved: false,
+            name: "write_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), summary: String::new(), auto_approved: false,
         }]));
         let (tx, rx) = tokio::sync::watch::channel(1usize);
         let done = Arc::new(AtomicBool::new(false));
@@ -3584,5 +3633,12 @@ mod tests {
         assert!(html.contains("behavior: 'auto'"));
         assert!(!html.contains("readyState !== EventSource.OPEN"));
         assert!(!html.contains("behavior: 'instant'"));
+    }
+
+    #[test]
+    fn tool_summary_redacts_and_bounds_arguments() {
+        assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/tmp/x"})), "/tmp/x");
+        assert_eq!(tool_summary("custom", &serde_json::json!({"api_key": "secret"})), "");
+        assert!(tool_summary("run_bash", &serde_json::json!({"command": "x".repeat(200)})).chars().count() <= 100);
     }
 }

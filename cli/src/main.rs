@@ -336,7 +336,7 @@ impl PengyCli {
                 .find(|m| m.role == "user")
                 .and_then(|m| m.content.as_ref())
                 .and_then(|v| v.as_str())
-                .map(|s| truncate(s, 80))
+                .map(|s| last_message_lines(s))
                 .unwrap_or_default();
 
             println!(
@@ -344,7 +344,8 @@ impl PengyCli {
                 DIM, RESET, BOLD, chat.title, RESET, DIM, msg_count, RESET
             );
             if !last_user.is_empty() {
-                println!("{}Last:{} {}", DIM, RESET, last_user);
+                println!("{}Last:{}", DIM, RESET);
+                for line in last_user { println!("  {}", line); }
             }
         } else {
             self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
@@ -1708,6 +1709,24 @@ fn terminal_width() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|w| *w >= MIN_PANEL_WIDTH)
         .unwrap_or(120)
+}
+
+fn last_message_lines(text: &str) -> Vec<String> {
+    let width = terminal_width().saturating_sub(2).max(20);
+    let mut lines = Vec::new();
+    for source in text.trim().lines() {
+        let mut rest = source.to_string();
+        while rest.chars().count() > width {
+            lines.push(rest.chars().take(width).collect());
+            rest = rest.chars().skip(width).collect();
+            if lines.len() == 10 { break; }
+        }
+        if lines.len() == 10 { break; }
+        lines.push(rest);
+    }
+    if lines.len() > 10 { lines.truncate(10); }
+    if lines.len() == 10 && text.lines().count() > 10 { lines[9].push('…'); }
+    lines
 }
 
 fn panel_width(requested: Option<usize>) -> usize {
