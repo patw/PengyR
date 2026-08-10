@@ -1,6 +1,18 @@
 # Changelog
 
-## v1.5.7 (current)
+## v1.5.9 (current)
+
+- Fix web SSE reconnect race: replaced the single-use mpsc receiver with an
+  append-only event log + `tokio::sync::watch` channel. SSE events now carry
+  monotonic IDs and reconnects resume via `Last-Event-ID`, so a phone sleep /
+  tab switch can no longer drop the `final_response` and leave the UI stuck on
+  "Thinking…".
+- Mobile web layout fixes: remove the double-counted safe-area padding that
+  created a gap below the input bar, allow Firefox Android to scroll a focused
+  prompt above its software keyboard, and explicitly bring that prompt into
+  view on focus.
+
+## v1.5.7
 
 - `run_bash` now authenticates sudo via `SUDO_ASKPASS` instead of piping the password to stdin — fixes sudo in pipelines (`echo x | sudo tee f`), with redirected stdin, after a command that reads stdin, and for the second and later `sudo` in one command
 - Fixed `search_content` tool output limits — wasn't respecting the global snip setting

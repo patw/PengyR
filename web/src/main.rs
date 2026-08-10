@@ -4,7 +4,7 @@ use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::tools;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
@@ -16,6 +16,11 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+use std::pin::Pin;
+use std::time::Duration;
+
+const EVENT_LOG_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// Report a command-line usage error and exit 2, matching the other frontends.
 fn arg_error(msg: &str) -> ! {
@@ -279,7 +284,15 @@ impl AppState {
 // ── WebWorker ────────────────────────────────────────────────────
 
 struct WebWorker {
-    sse_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<SseEvent>>>,
+    /// Append-only log of every SSE event produced by this worker.  Multiple
+    /// concurrent SSE streams can read from it, and reconnecting clients can
+    /// resume from where they left off using ``Last-Event-ID``.
+    events: Arc<Mutex<Vec<SseEvent>>>,
+    /// Watch channel that ticks the current length of ``events`` so streams
+    /// know when new events are available without polling.
+    event_count_tx: tokio::sync::watch::Sender<usize>,
+    /// Set when the worker emits a terminal event (final_response/error).
+    done: Arc<AtomicBool>,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     cancel: Arc<AtomicBool>,
     sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)>,
@@ -428,34 +441,31 @@ fn sse_event_to_json(event: &SseEvent) -> String {
 }
 
 impl WebWorker {
-    fn start(
-        chat: Chat,
-        config: Config,
-        sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>,
-    ) -> Arc<Self> {
-        let messages = build_messages(&chat, &config);
-        Self::start_with_messages(chat, config, messages, sse_tx)
-    }
-
     fn start_with_messages(
         chat: Chat,
         config: Config,
         messages: Vec<ChatMessage>,
-        sse_tx: tokio::sync::mpsc::UnboundedSender<SseEvent>,
     ) -> Arc<Self> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
             Arc::new((Mutex::new(None), Condvar::new()));
 
+        // Append-only event log shared by all SSE streams, with a watch channel
+        // that notifies streams when new events are appended.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (event_count_tx, _) = tokio::sync::watch::channel(0usize);
+        let done = Arc::new(AtomicBool::new(false));
+
         let worker = Arc::new(Self {
-            sse_rx: Mutex::new(None),
+            events: events.clone(),
+            event_count_tx: event_count_tx.clone(),
+            done: done.clone(),
             cmd_tx,
             cancel: cancel.clone(),
             sudo_state: sudo_state.clone(),
         });
 
-        let sse_tx2 = sse_tx.clone();
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
         *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
@@ -464,10 +474,17 @@ impl WebWorker {
         // provider or kill each other's subprocesses.
         let tool_ctx = std::sync::Arc::new(tools::ToolContext::new());
         {
-            let sse_tx_sudo = sse_tx.clone();
+            let events_sudo = events.clone();
+            let event_count_tx_sudo = event_count_tx.clone();
             let sudo_state_provider = sudo_state.clone();
             tool_ctx.set_sudo_provider(Some(Box::new(move || {
-                let _ = sse_tx_sudo.send(SseEvent::SudoRequest);
+                let count;
+                {
+                    let mut ev = events_sudo.lock().unwrap();
+                    ev.push(SseEvent::SudoRequest);
+                    count = ev.len();
+                }
+                let _ = event_count_tx_sudo.send(count);
                 let (lock, cvar) = &*sudo_state_provider;
                 let mut guard = lock.lock().unwrap();
                 while guard.is_none() {
@@ -514,6 +531,16 @@ impl WebWorker {
 
             let mut yolo_this_turn = false;
 
+            let push_event = |event: SseEvent| {
+                let count;
+                {
+                    let mut ev = events.lock().unwrap();
+                    ev.push(event);
+                    count = ev.len();
+                }
+                let _ = event_count_tx.send(count);
+            };
+
             loop {
                 match event_rx.recv().await {
                     Some(LlmEvent::AssistantToolCalls { message }) => {
@@ -527,7 +554,7 @@ impl WebWorker {
                         status_code,
                         message,
                     }) => {
-                        let _ = sse_tx2.send(SseEvent::Retrying {
+                        push_event(SseEvent::Retrying {
                             attempt,
                             max_attempts,
                             delay_secs,
@@ -547,7 +574,7 @@ impl WebWorker {
 
                         let sid = safe_id(&tool_call_id);
 
-                        let _ = sse_tx2.send(SseEvent::ToolRequest {
+                        push_event(SseEvent::ToolRequest {
                             name: name.clone(),
                             args: args.clone(),
                             tool_call_id: tool_call_id.clone(),
@@ -600,7 +627,7 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         });
-                        let _ = sse_tx2.send(SseEvent::ToolResult {
+                        push_event(SseEvent::ToolResult {
                             tool_call_id: tool_call_id.clone(),
                             safe_id: safe_id(&tool_call_id),
                             name,
@@ -614,7 +641,7 @@ impl WebWorker {
                         tool_call_id,
                         questions,
                     }) => {
-                        let _ = sse_tx2.send(SseEvent::QuestionRequest {
+                        push_event(SseEvent::QuestionRequest {
                             questions: questions.clone(),
                             tool_call_id: tool_call_id.clone(),
                         });
@@ -639,7 +666,7 @@ impl WebWorker {
                         name: _name,
                         content,
                     }) => {
-                        let _ = sse_tx2.send(SseEvent::QuestionResult {
+                        push_event(SseEvent::QuestionResult {
                             tool_call_id,
                             content,
                         });
@@ -658,18 +685,20 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         }));
-                        let _ = sse_tx2.send(SseEvent::FinalResponse {
+                        push_event(SseEvent::FinalResponse {
                             html: render_markdown(&content),
                             usage,
                         });
                         chat_manager::save_chat(&chat).ok();
+                        done.store(true, Ordering::Relaxed);
                         break;
                     }
                     None => {
-                        let _ = sse_tx2.send(SseEvent::Error {
+                        push_event(SseEvent::Error {
                             message: "Chat ended unexpectedly".into(),
                         });
                         chat_manager::save_chat(&chat).ok();
+                        done.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -717,7 +746,13 @@ async fn chat_view(
     let chats = chat_manager::load_index();
     let config = config::load_config();
     let turns = group_messages(&chat.messages);
-    let has_active_worker = state.workers.lock().unwrap().contains_key(&chat_id);
+    let has_active_worker = state
+        .workers
+        .lock()
+        .unwrap()
+        .get(&chat_id)
+        .map(|w| !w.done.load(Ordering::Relaxed))
+        .unwrap_or(false);
 
     Html(templates::chat_page(
         &chat,
@@ -877,16 +912,33 @@ async fn chat_send(
     }
 
     let config = config::load_config();
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let worker = WebWorker::start_with_messages(chat.clone(), config, api_messages, sse_tx);
-    *worker.sse_rx.lock().unwrap() = Some(sse_rx);
+    let worker = WebWorker::start_with_messages(chat.clone(), config, api_messages);
 
     state
         .workers
         .lock()
         .unwrap()
-        .insert(chat_id.clone(), worker);
+        .insert(chat_id.clone(), worker.clone());
+
+    // A completed worker remains replayable for a bounded grace period, then
+    // persisted chat history is authoritative. This cleanup is independent of
+    // whether an SSE client reconnects.
+    let workers = state.workers.clone();
+    let cleanup_chat_id = chat_id.clone();
+    let cleanup_worker = worker.clone();
+    tokio::spawn(async move {
+        while !cleanup_worker.done.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        tokio::time::sleep(EVENT_LOG_GRACE).await;
+        let mut workers = workers.lock().unwrap();
+        if workers
+            .get(&cleanup_chat_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &cleanup_worker))
+        {
+            workers.remove(&cleanup_chat_id);
+        }
+    });
 
     Json(serde_json::json!({"status": "ok", "title": chat.title})).into_response()
 }
@@ -894,63 +946,119 @@ async fn chat_send(
 async fn chat_stream(
     State(state): State<AppState>,
     Path(chat_id): Path<String>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let worker = {
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+    // Browser sends Last-Event-ID on auto-reconnect. Resume right after it
+    // so no messages are replayed twice.
+    let (events, event_count_rx, done, start_index) = {
         let workers = state.workers.lock().unwrap();
-        workers.get(&chat_id).cloned()
+        match workers.get(&chat_id) {
+            Some(w) => {
+                // Script-constructed EventSources cannot attach headers, so
+                // accept its persisted cursor as `?after=`. Native automatic
+                // reconnects continue to use Last-Event-ID.
+                let last_id = query
+                    .get("after")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .or_else(|| {
+                        headers
+                            .get("Last-Event-ID")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<usize>().ok())
+                    });
+                let start_index = match last_id {
+                    Some(id) => id.saturating_add(1),
+                    None => {
+                        if w.done.load(Ordering::Relaxed) {
+                            // Fresh connection to a finished worker: the chat
+                            // page already rendered history server-side, so
+                            // only replay the terminal event.
+                            w.events.lock().unwrap().len().saturating_sub(1)
+                        } else {
+                            0
+                        }
+                    }
+                };
+                (
+                    w.events.clone(),
+                    w.event_count_tx.subscribe(),
+                    w.done.clone(),
+                    start_index,
+                )
+            }
+            None => {
+                let error_stream = futures_util::stream::once(async move {
+                    Ok::<_, Infallible>(Event::default().data(
+                        r#"{"type":"error","message":"No active task"}"#,
+                    ))
+                });
+                return Sse::new(Box::pin(error_stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+                    .keep_alive(KeepAlive::default());
+            }
+        }
     };
 
-    let sse_rx = worker.and_then(|w| w.sse_rx.lock().unwrap().take());
-
-    let workers_ref = state.workers.clone();
-    let chat_id_clone = chat_id.clone();
-
-    let stream = async_stream(sse_rx, workers_ref, chat_id_clone);
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    let stream = async_stream(start_index, events, event_count_rx, done);
+    Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(KeepAlive::default())
 }
 
 fn async_stream(
-    sse_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SseEvent>>,
-    workers: Arc<Mutex<HashMap<String, Arc<WebWorker>>>>,
-    chat_id: String,
+    start_index: usize,
+    events: Arc<Mutex<Vec<SseEvent>>>,
+    event_count_rx: tokio::sync::watch::Receiver<usize>,
+    done: Arc<AtomicBool>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     // Send retry:1000 first so browsers reconnect in 1s instead of default 3s
     let retry_event = Ok(Event::default().retry(std::time::Duration::from_millis(1000)));
     let retry_stream = futures_util::stream::once(async move { retry_event });
-    let main_stream = futures_util::stream::unfold((sse_rx, false), move |(mut rx, done)| {
-        let workers = workers.clone();
-        let chat_id = chat_id.clone();
-        async move {
-            if done {
-                return None;
-            }
 
-            let rx_ref = rx.as_mut()?;
-
-            match rx_ref.recv().await {
-                Some(event) => {
-                    let json = sse_event_to_json(&event);
-                    let is_final = matches!(
-                        event,
-                        SseEvent::FinalResponse { .. } | SseEvent::Error { .. }
-                    );
-
-                    if is_final {
-                        workers.lock().unwrap().remove(&chat_id);
+    let main_stream = futures_util::stream::unfold(
+        (start_index, event_count_rx),
+        move |(mut index, mut rx)| {
+            let events = events.clone();
+            let done = done.clone();
+            async move {
+                loop {
+                    let current_count = *rx.borrow();
+                    {
+                        let events = events.lock().unwrap();
+                        if index < events.len() && index < current_count {
+                            let ev = &events[index];
+                            let json = sse_event_to_json(ev);
+                            let event_id = index;
+                            index += 1;
+                            return Some((
+                                Ok(Event::default().id(event_id.to_string()).data(json)),
+                                (index, rx),
+                            ));
+                        }
                     }
-
-                    Some((Ok(Event::default().data(json)), (rx, is_final)))
-                }
-                None => {
-                    workers.lock().unwrap().remove(&chat_id);
-                    let event = Event::default()
-                        .data(r#"{"type":"error","message":"Worker disconnected"}"#);
-                    Some((Ok(event), (rx, true)))
+                    if done.load(Ordering::Relaxed) && index >= current_count {
+                        return None;
+                    }
+                    // Wait for new events or emit a keepalive comment so
+                    // proxies / mobile browsers don't drop the long-running SSE.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(25),
+                        rx.changed(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(_)) => return None, // sender dropped
+                        Err(_) => {
+                            return Some((
+                                Ok(Event::default().comment("keepalive")),
+                                (index, rx),
+                            ));
+                        }
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     retry_stream.chain(main_stream)
 }
@@ -2041,9 +2149,9 @@ mod templates {
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
   <style>
-    html, body {{ height: 100%; overflow: hidden; }}
-    .app-shell {{ display: flex; flex-direction: column; height: 100vh; height: 100dvh; padding-bottom: env(safe-area-inset-bottom, 0px); }}
-    .app-body {{ display: flex; flex: 1; overflow: hidden; }}
+    html, body {{ height: 100%; }}
+    .app-shell {{ display: flex; flex-direction: column; height: 100vh; height: 100dvh; }}
+    .app-body {{ display: flex; flex: 1; min-height: 0; overflow: hidden; }}
     @media (min-width: 768px) {{
       body {{ display: flex; flex-direction: row; }}
       #sidebarOffcanvas {{
@@ -2069,7 +2177,7 @@ mod templates {
     @media (hover: none) and (pointer: coarse) {{ .chat-list-item .delete-btn {{ opacity: 0.5; }} }}
     .chat-list-item:hover .delete-btn {{ opacity: 1; }}
     .chat-list-item .delete-btn:hover {{ color: var(--bs-danger); }}
-    .messages-area {{ flex: 1; overflow-y: auto; padding: 1rem 0.75rem; }}
+    .messages-area {{ flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 1rem 0.75rem; }}
     @media (min-width: 576px) {{ .messages-area {{ padding: 1.25rem 1rem; }} }}
     .msg-user {{ display: flex; justify-content: flex-end; margin-bottom: 0.85rem; }}
     .bubble-user {{ max-width: 85%; background: var(--bs-secondary-bg); border-radius: 18px 18px 4px 18px; padding: 0.6rem 1rem; white-space: pre-wrap; word-break: break-word; font-size: 0.9rem; }}
@@ -2098,7 +2206,8 @@ mod templates {
     #jumpBottomBtn.show {{ display: block; }}
     .input-area {{
       position: relative;
-      padding: 0.6rem 0.75rem; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg); padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px)); }}
+      padding: 0.6rem 0.75rem; border-top: 1px solid var(--bs-border-color); background: var(--bs-body-bg);
+      padding-bottom: max(0.6rem, env(safe-area-inset-bottom, 0px)); }}
     @media (min-width: 576px) {{ .input-area {{ padding: 0.75rem 1rem; }} }}
     #messageInput {{ resize: none; max-height: 180px; overflow-y: auto; font-size: 16px; }}
     .markdown-body {{ line-height: 1.6; }}
@@ -2452,6 +2561,7 @@ const CHAT_TITLE = {chat_title_json};
 const HAS_ACTIVE_WORKER = {has_active_worker};
 let isProcessing = false;
 let eventSource = null;
+let sseCursor = sessionStorage.getItem('pengy_sse_cursor_' + CHAT_ID) || '';
 let pendingToolCallId = null;
 let thinkingEl = null;
 let confirmModal, sudoModal, renameModal, questionModal;
@@ -2481,7 +2591,8 @@ document.addEventListener('DOMContentLoaded', () => {{
   document.addEventListener('visibilitychange', () => {{
     if (document.visibilityState === 'visible' && isProcessing) {{
       acquireWakeLock();
-      if (!eventSource || eventSource.readyState !== EventSource.OPEN) {{
+      // CONNECTING is EventSource's normal automatic reconnect state.
+      if (!eventSource || eventSource.readyState === EventSource.CLOSED) {{
         openSSE();
       }}
     }}
@@ -2489,7 +2600,8 @@ document.addEventListener('DOMContentLoaded', () => {{
   window.addEventListener('pageshow', (event) => {{
     if (event.persisted && isProcessing) {{
       acquireWakeLock();
-      if (!eventSource || eventSource.readyState !== EventSource.OPEN) {{
+      // CONNECTING is EventSource's normal automatic reconnect state.
+      if (!eventSource || eventSource.readyState === EventSource.CLOSED) {{
         openSSE();
       }}
     }}
@@ -2667,6 +2779,8 @@ function doSend() {{
 
   input.value = '';
   input.style.height = 'auto';
+  sseCursor = '';
+  sessionStorage.removeItem('pengy_sse_cursor_' + CHAT_ID);
 
   const placeholder = document.querySelector('#messagesArea .text-center.text-muted');
   if (placeholder) placeholder.remove();
@@ -2769,10 +2883,36 @@ document.getElementById('messageInput').addEventListener('input', function() {{
   this.style.height = Math.min(this.scrollHeight, 180) + 'px';
 }});
 
+// Mobile Firefox (and some other browsers) can leave the input hidden behind
+// the on-screen keyboard when it first gains focus. Force it into view.
+document.getElementById('messageInput').addEventListener('focus', () => {{
+  setTimeout(() => {{
+    const input = document.getElementById('messageInput');
+    if (window.visualViewport) {{
+      const bottom = input.getBoundingClientRect().bottom;
+      const viewportBottom = window.visualViewport.height + window.visualViewport.offsetTop;
+      if (bottom > viewportBottom) {{
+        window.scrollBy({{ top: bottom - viewportBottom + 16, behavior: 'auto' }});
+      }}
+    }} else {{
+      input.scrollIntoView({{ block: 'nearest', behavior: 'auto' }});
+    }}
+  }}, 50);
+}});
+
 function openSSE() {{
+  // Preserve CONNECTING: it retains browser-managed Last-Event-ID.
+  if (eventSource && eventSource.readyState !== EventSource.CLOSED) return;
   if (eventSource) {{ eventSource.close(); eventSource = null; }}
-  eventSource = new EventSource(`/chat/${{CHAT_ID}}/stream`);
-  eventSource.onmessage = e => handleEvent(JSON.parse(e.data));
+  const url = `/chat/${{CHAT_ID}}/stream` + (sseCursor ? `?after=${{encodeURIComponent(sseCursor)}}` : '');
+  eventSource = new EventSource(url);
+  eventSource.onmessage = e => {{
+    if (e.lastEventId) {{
+      sseCursor = e.lastEventId;
+      sessionStorage.setItem('pengy_sse_cursor_' + CHAT_ID, sseCursor);
+    }}
+    handleEvent(JSON.parse(e.data));
+  }};
   eventSource.onerror = () => {{
     // Don't close immediately — EventSource auto-reconnects. Only act
     // if CLOSED (non-retryable HTTP status), then reload to sync.
@@ -2813,6 +2953,7 @@ function handleEvent(data) {{
       hideThinking();
       appendAssistantMessage(data.html, data.usage);
       eventSource.close(); eventSource = null;
+      sessionStorage.removeItem('pengy_sse_cursor_' + CHAT_ID);
       setProcessing(false);
       break;
     case 'question_request':
@@ -3348,5 +3489,45 @@ mod tests {
         let content = "🐧".repeat(20);
         let result = truncate_on_char_boundary(&content, 47);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn async_stream_replays_from_start_index_and_ends_when_done() {
+        let events = Arc::new(Mutex::new(vec![
+            SseEvent::SudoRequest,
+            SseEvent::FinalResponse {
+                html: "<p>hi</p>".into(),
+                usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            },
+        ]));
+        let (_tx, rx) = tokio::sync::watch::channel(2usize);
+        let done = Arc::new(AtomicBool::new(true));
+        let stream = async_stream(1, events, rx, done);
+        let items: Vec<_> = stream.collect().await;
+        // retry directive + the FinalResponse event starting at index 1
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_stream_waits_for_late_events_when_not_done() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = tokio::sync::watch::channel(0usize);
+        let done = Arc::new(AtomicBool::new(false));
+        let events2 = events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            {
+                let mut ev = events2.lock().unwrap();
+                ev.push(SseEvent::SudoRequest);
+            }
+            let _ = tx.send(1);
+        });
+        let stream = async_stream(0, events, rx, done);
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 2); // retry + SudoRequest
     }
 }
