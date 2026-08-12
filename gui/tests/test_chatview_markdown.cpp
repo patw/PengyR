@@ -2,6 +2,10 @@
 #include <QString>
 #include <QJsonObject>
 #include <QScrollBar>
+#include <QDir>
+#include <QFile>
+#include <QImage>
+#include <QUrl>
 #include <iostream>
 #include "../chatview.h"
 
@@ -78,6 +82,39 @@ int main(int argc, char** argv) {
     requireContains(table, "<td>1</td>", "table cell");
 
     // ── render cache ────────────────────────────────────────────────────
+    // ── Local file images ───────────────────────────────────────────────
+    // Verify the precise file:/// form emitted by the image skills reaches
+    // ChatView's resource loader and decodes the supplied PNG.
+    {
+        const QString imagePath = QDir::homePath()
+            + "/Pictures/even-weirder-elephants-zoom-background.png";
+        if (QFile::exists(imagePath)) {
+            ChatView v;
+            const QUrl fileUrl = QUrl::fromLocalFile(imagePath);
+            const QVariant imageValue = v.testLoadImage(fileUrl);
+            if (!imageValue.canConvert<QImage>() || imageValue.value<QImage>().isNull()) {
+                std::cerr << "FAIL: file:/// local image loads: "
+                          << fileUrl.toString().toStdString() << std::endl;
+                return 1;
+            }
+            const QString rawHtml = v.testMarkdownToHtml(
+                QString("<img src=\"%1\" alt=\"local image\">").arg(fileUrl.toString()));
+            requireContains(rawHtml, QString("src=\"%1\"").arg(fileUrl.toString()),
+                            "raw HTML image source has literal quotes");
+            requireContains(rawHtml, fileUrl.toString(), "raw HTML file URL survives markdown");
+            v.appendMessageText("assistant",
+                QString("<img src=\"%1\" alt=\"local image\">").arg(fileUrl.toString()));
+            app.processEvents();
+            const QVariant documentImage = v.document()->resource(
+                QTextDocument::ImageResource, fileUrl);
+            if (!documentImage.canConvert<QImage>() || documentImage.value<QImage>().isNull()) {
+                std::cerr << "FAIL: rendered document resolves file:/// image: "
+                          << fileUrl.toString().toStdString() << std::endl;
+                return 1;
+            }
+        }
+    }
+
     // buildHtml() memoises per-message HTML. Every path that changes a
     // message's rendering must invalidate its entry, so a cached render must
     // always equal a cold one.

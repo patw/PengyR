@@ -94,7 +94,8 @@ if(PENGY_RUST_STATIC)
     target_link_libraries(pengy PRIVATE
       Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
       ${PENGY_CORE_LIB}
-      OpenSSL::SSL OpenSSL::Crypto
+      "${OPENSSL_ROOT_DIR}/lib/libssl.dylib"
+      "${OPENSSL_ROOT_DIR}/lib/libcrypto.dylib"
       "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration"
       pthread dl
     )

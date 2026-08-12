@@ -10,9 +10,26 @@ MACOS_ARCH="${1:-$(uname -m)}"  # arm64 or x86_64 (macOS / clang naming)
 # Rust uses "aarch64" where macOS uses "arm64"
 [[ "$MACOS_ARCH" == "arm64" ]] && RUST_ARCH="aarch64" || RUST_ARCH="$MACOS_ARCH"
 
-# Ensure Qt6 from Homebrew is found
-export CMAKE_PREFIX_PATH="$(brew --prefix qt@6 2>/dev/null || echo '/opt/homebrew/opt/qt@6')"
-export PATH="$CMAKE_PREFIX_PATH/bin:$PATH"
+# Ensure Homebrew tools, Rust, and Qt6 are found. Do not assume the caller's
+# PATH contains Homebrew or rustup (for example, non-interactive shells and CI).
+if ! command -v brew >/dev/null 2>&1; then
+    if [[ -x /opt/homebrew/bin/brew ]]; then
+        export PATH="/opt/homebrew/bin:$PATH"
+    elif [[ -x /usr/local/bin/brew ]]; then
+        export PATH="/usr/local/bin:$PATH"
+    fi
+fi
+
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+QT_PREFIX="$(brew --prefix qt@6 2>/dev/null || brew --prefix qt 2>/dev/null || echo '/opt/homebrew/opt/qt@6')"
+OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || true)"
+export CMAKE_PREFIX_PATH="$QT_PREFIX${OPENSSL_PREFIX:+;$OPENSSL_PREFIX}"
+export PATH="$QT_PREFIX/bin:$HOME/.cargo/bin:${BREW_PREFIX:+$BREW_PREFIX/bin:}$PATH"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: cargo was not found. Install Rust with: brew install rust (or rustup)." >&2
+    exit 1
+fi
 
 echo "==> Building Rust workspace for $RUST_ARCH-apple-darwin..."
 cd "$ROOT"
@@ -26,7 +43,8 @@ cd gui/build_macos
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="$MACOS_ARCH" \
-    -DRUST_TARGET_DIR="$ROOT/target/$RUST_ARCH-apple-darwin/release"
+    -DRUST_TARGET_DIR="$ROOT/target/$RUST_ARCH-apple-darwin/release" \
+    ${OPENSSL_PREFIX:+-DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX"}
 
 make -j$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
