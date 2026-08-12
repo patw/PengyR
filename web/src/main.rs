@@ -495,6 +495,9 @@ impl WebWorker {
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
         *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
+        *tools::IMAGE_MAX_DIMENSION.lock().unwrap() = config.image_max_dimension;
+        *tools::IMAGE_MAX_MB.lock().unwrap() = config.image_max_mb;
+        *tools::IMAGE_QUALITY.lock().unwrap() = config.image_quality;
 
         // Per-request tool context so concurrent chats don't share a sudo
         // provider or kill each other's subprocesses.

@@ -206,6 +206,13 @@ pub extern "C" fn pengy_tool_set_output_max_chars(chars: usize) {
     *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = chars;
 }
 
+#[no_mangle]
+pub extern "C" fn pengy_tool_set_image_limits(max_dimension: u32, max_mb: f64, quality: u8) {
+    *tools::IMAGE_MAX_DIMENSION.lock().unwrap() = max_dimension;
+    *tools::IMAGE_MAX_MB.lock().unwrap() = max_mb;
+    *tools::IMAGE_QUALITY.lock().unwrap() = quality;
+}
+
 // ── LLM Chat ──────────────────────────────────────────────────────
 //
 // Called from a QThread. Blocks until the conversation ends.

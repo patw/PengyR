@@ -556,6 +556,38 @@ pub async fn chat(
                         }
                     }
                 }
+
+                // read_image parks its picture on the tool context because a
+                // role:"tool" message only accepts string content on
+                // OpenAI-compatible APIs.  Attach anything queued as a follow-up
+                // user message — after the loop, so every tool_call keeps its
+                // matching tool message immediately behind the assistant one.
+                let pending_images = tool_ctx.take_pending_images();
+                if !pending_images.is_empty() {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    for image in &pending_images {
+                        parts.push(serde_json::json!({
+                            "type": "text",
+                            "text": format!("Image loaded by read_image: {}", image.path),
+                        }));
+                        parts.push(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.mime, image.b64),
+                            },
+                        }));
+                    }
+                    current_messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: Some(serde_json::Value::Array(parts)),
+                        tool_calls: vec![],
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        reasoning: None,
+                        reasoning_details: None,
+                    });
+                }
+
                 // Loop back for the next API call (the LLM will respond to tool results)
                 continue;
             }
@@ -876,7 +908,7 @@ mod loop_tests {
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs[0]["model"], "stub-model");
-        assert!(reqs[0]["tools"].as_array().unwrap().len() == 15);
+        assert!(reqs[0]["tools"].as_array().unwrap().len() == 16);
         assert!(reqs[0].get("reasoning_effort").is_none());
     }
 
@@ -949,6 +981,104 @@ mod loop_tests {
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last["role"], "tool");
         assert_eq!(last["tool_call_id"], "tc1");
+    }
+
+    /// read_image can't return a picture through a role:"tool" message, so the
+    /// loop attaches it as a follow-up user message.  Mirrors Python's
+    /// TestReadImageAttachment — keep the two in sync.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_image_attaches_picture_as_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shot.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([10, 120, 200]))
+            .save(&file)
+            .unwrap();
+        let args = serde_json::json!({"path": file.to_str().unwrap()});
+
+        let (base, requests) = stub_server(vec![
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "read_image", &args)]),
+                (100, 20),
+            ),
+            completion("a blue rectangle", serde_json::Value::Null, (200, 30)),
+        ]);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("what is in it?")],
+            ToolConfirmation::All,
+            "",
+            false,
+        );
+        while let Some(ev) = d.rx.recv().await {
+            if let LlmEvent::ToolResult { content, .. } = &ev {
+                assert!(content.contains("Loaded shot.png"), "{content}");
+                assert!(content.contains("48×32"), "{content}");
+            }
+            if matches!(ev, LlmEvent::FinalResponse { .. }) {
+                break;
+            }
+        }
+        d.handle.await.unwrap();
+
+        let reqs = requests.lock().unwrap();
+        let msgs = reqs[1]["messages"].as_array().unwrap();
+
+        // The tool message must stay a plain string and stay adjacent to the
+        // assistant message that requested it.
+        let tool_idx = msgs
+            .iter()
+            .position(|m| m["role"] == "tool")
+            .expect("a tool message");
+        assert!(msgs[tool_idx]["content"].is_string());
+        assert_eq!(msgs[tool_idx - 1]["role"], "assistant");
+
+        // The picture rides in a trailing user message instead.
+        let last = &msgs[msgs.len() - 1];
+        assert_eq!(last["role"], "user");
+        let parts = last["content"].as_array().expect("array content");
+        let images: Vec<_> = parts
+            .iter()
+            .filter(|p| p["type"] == "image_url")
+            .collect();
+        assert_eq!(images.len(), 1);
+        let url = images[0]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/"), "{url}");
+        assert!(url.contains(";base64,"), "{url}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_image_error_attaches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({"path": dir.path().join("nope.png").to_str().unwrap()});
+        let (base, requests) = stub_server(vec![
+            completion(
+                "",
+                serde_json::json!([tool_call("tc1", "read_image", &args)]),
+                (10, 5),
+            ),
+            completion("ok", serde_json::Value::Null, (10, 5)),
+        ]);
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("look")],
+            ToolConfirmation::All,
+            "",
+            false,
+        );
+        while let Some(ev) = d.rx.recv().await {
+            if matches!(ev, LlmEvent::FinalResponse { .. }) {
+                break;
+            }
+        }
+        d.handle.await.unwrap();
+
+        let reqs = requests.lock().unwrap();
+        for m in reqs[1]["messages"].as_array().unwrap() {
+            if m["role"] == "user" {
+                assert!(m["content"].is_string(), "nothing should be attached");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

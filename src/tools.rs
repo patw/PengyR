@@ -19,6 +19,19 @@ pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
 pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(250000);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
 
+/// Preprocessing limits `read_image` applies before base64-encoding.
+pub static IMAGE_MAX_DIMENSION: Mutex<u32> = Mutex::new(4096);
+pub static IMAGE_MAX_MB: Mutex<f64> = Mutex::new(4.5);
+pub static IMAGE_QUALITY: Mutex<u8> = Mutex::new(85);
+
+/// An image queued by `read_image`, waiting to be attached to the conversation.
+#[derive(Debug, Clone)]
+pub struct PendingImage {
+    pub path: String,
+    pub mime: String,
+    pub b64: String,
+}
+
 /// A blocking callback that prompts the user for a sudo password.
 /// Returns the password, or `None` if the user cancels.
 pub type SudoProvider = Box<dyn Fn() -> Option<String> + Send + Sync>;
@@ -34,6 +47,7 @@ pub struct ToolContext {
     sudo_provider: Mutex<Option<SudoProvider>>,
     cached_sudo_password: Mutex<Option<String>>,
     active_process_groups: Mutex<HashSet<u32>>,
+    pending_images: Mutex<Vec<PendingImage>>,
     /// Set by `pengy_llm_cancel` so the LLM loop aborts at the next yield point.
     pub cancelled: Arc<AtomicBool>,
 }
@@ -44,6 +58,7 @@ impl ToolContext {
             sudo_provider: Mutex::new(None),
             cached_sudo_password: Mutex::new(None),
             active_process_groups: Mutex::new(HashSet::new()),
+            pending_images: Mutex::new(Vec::new()),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -56,6 +71,25 @@ impl ToolContext {
 
     pub fn clear_sudo(&self) {
         *self.cached_sudo_password.lock().unwrap() = None;
+    }
+
+    /// Queue an image for attachment to the conversation.
+    ///
+    /// `execute_tool` returns a `String` and OpenAI-compatible APIs only accept
+    /// string content in a `role: "tool"` message, so `read_image` can't hand
+    /// the picture back through its return value.  It parks the encoded image
+    /// here and the LLM loop drains the queue once every tool result for the
+    /// turn is in place.
+    pub fn add_pending_image(&self, path: String, mime: String, b64: String) {
+        self.pending_images
+            .lock()
+            .unwrap()
+            .push(PendingImage { path, mime, b64 });
+    }
+
+    /// Return queued images and clear the queue.
+    pub fn take_pending_images(&self) -> Vec<PendingImage> {
+        std::mem::take(&mut *self.pending_images.lock().unwrap())
     }
 
     fn register_process(&self, pid: u32) {
@@ -130,10 +164,15 @@ pub fn tool_definitions_json() -> serde_json::Value {
 
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
-        td("read_file", "Read the contents of a file",
-            &[("path", "string", "The file path to read")],
+        td("read_file", "Read the contents of a text file. Returns the whole file by default; pass offset and limit to read one line range instead, which is how to page through a file too large to return at once. Use read_image for images — this tool cannot decode binary data.",
+            &[("path", "string", "The file path to read"),
+              ("offset", "integer", "1-based line number to start reading from. Omit to start at the beginning."),
+              ("limit", "integer", "Maximum number of lines to return, counting from offset. Omit to read to the end of the file.")],
             &["path"]),
-        td("write_file", "Write content to a file",
+        td("read_image", "Look at an image file — a screenshot, photo, diagram, or a chart/render produced by an earlier command. The image is added to the conversation so you can see it directly and describe or judge what it shows; use this instead of read_file, which cannot decode image data. Supports PNG, JPEG, GIF, WebP, BMP and TIFF; large images are downscaled automatically.",
+            &[("path", "string", "The path of the image file to look at")],
+            &["path"]),
+        td("write_file", "Write content to a file, replacing it entirely if it already exists. Parent directories are created automatically, so there is no need to mkdir first. To change part of an existing file use replace_in_file instead of rewriting the whole thing.",
             &[("path", "string", "The file path to write to"),
               ("content", "string", "The content to write to the file")],
             &["path", "content"]),
@@ -143,7 +182,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a bash command in the terminal",
+        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. sudo is supported and prompts the user for their password separately. Commands are killed once the configured tool timeout elapses.",
             &[("command", "string", "The bash command to execute")],
             &["command"]),
         td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
@@ -154,10 +193,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("url", "string", "The URL of the file to download"),
               ("filename", "string", "Optional filename to save as")],
             &["url"]),
-        td("fetch_url", "Fetch the text content of a URL into the context window",
+        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers.",
             &[("url", "string", "The URL to fetch")],
             &["url"]),
-        td("run_python", "Execute Python code",
+        td("run_python", "Execute Python code in a fresh subprocess. Nothing persists between calls — variables, imports and state from an earlier call are gone, so each call must stand on its own. Only what you print() comes back; a bare expression returns nothing.",
             &[("code", "string", "The Python code to execute")],
             &["code"]),
         td("directory_tree", "Show a visual tree of the directory structure. Skips common noise directories like .git, node_modules, __pycache__ by default.",
@@ -175,7 +214,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("context_lines", "integer", "Number of lines of context (default: 0)"),
               ("max_results", "integer", "Maximum number of matches to return (default: 50)")],
             &["pattern", "path"]),
-        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search. Prefer this over run_bash('find ...') or run_bash('ls ...').",
+        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search. Noise directories are always skipped: .git, node_modules, __pycache__, .venv/venv, build, dist and target. Prefer this over run_bash('find ...') or run_bash('ls ...').",
             &[("pattern", "string", "The glob pattern to match against file paths"),
               ("path", "string", "The directory to search in (default: current working directory)")],
             &["pattern"]),
@@ -334,6 +373,7 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "fetch_url"
             | "glob"
             | "todowrite"
+            | "read_image"
     )
 }
 
@@ -365,7 +405,15 @@ async fn execute_tool_inner(
     ctx: &Arc<ToolContext>,
 ) -> String {
     match name {
-        "read_file" => read_file(a(arguments, "path", "")).await,
+        "read_file" => {
+            read_file(
+                a(arguments, "path", ""),
+                aopt_usize(arguments, "offset"),
+                aopt_usize(arguments, "limit"),
+            )
+            .await
+        }
+        "read_image" => read_image(a(arguments, "path", ""), ctx).await,
         "write_file" => write_file(a(arguments, "path", ""), a(arguments, "content", "")).await,
         "replace_in_file" => {
             replace_in_file(
@@ -723,6 +771,14 @@ fn aopt(args: &serde_json::Value, key: &str) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(String::from)
 }
 
+/// Optional integer argument — `None` when the model omitted the key, which
+/// `read_file` needs in order to tell "whole file" from an explicit range.
+fn aopt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+}
+
 fn aus(args: &serde_json::Value, key: &str, default: usize) -> usize {
     args.get(key)
         .and_then(|v| v.as_u64())
@@ -758,19 +814,126 @@ fn timeout_secs() -> u64 {
 
 // ── Tool implementations ────────────────────────────────────────────
 
-async fn read_file(path: String) -> String {
+/// Read file contents, optionally just the line range `offset..offset+limit`.
+///
+/// A ranged read is reported as `[Lines A-B of N]` so the model knows where it
+/// is in the file and can ask for the next page; a whole-file read that had to
+/// be snipped says how many lines exist so paging is discoverable.
+async fn read_file(path: String, offset: Option<usize>, limit: Option<usize>) -> String {
     let p = expand_home(&path);
-    match std::fs::read_to_string(&p) {
-        Ok(c) => snip_tool_output(c),
+    let text = match std::fs::read_to_string(&p) {
+        Ok(c) => c,
         Err(e) => {
-            if !p.exists() {
+            return if !p.exists() {
                 format!("Error: File not found: {path}")
             } else if !p.is_file() {
                 format!("Error: Not a file: {path}")
             } else {
                 format!("Error reading file: {e}")
-            }
+            };
         }
+    };
+
+    if offset.is_none() && limit.is_none() {
+        let snipped = snip_tool_output(text.clone());
+        if snipped != text {
+            let total = text.matches('\n').count() + 1;
+            return format!(
+                "{snipped}\n\n[{path} has {total} lines — pass offset and limit \
+                 to read a specific range instead.]"
+            );
+        }
+        return snipped;
+    }
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1);
+    if start > total {
+        return format!(
+            "Error: offset {start} is past the end of {path}, which has {total} lines."
+        );
+    }
+    let count = limit.map(|l| l.max(1)).unwrap_or(total - start + 1);
+    let end = total.min(start + count - 1);
+
+    let body = lines[start - 1..end].join("\n");
+    format!(
+        "[Lines {start}-{end} of {total} in {path}]\n{}",
+        snip_tool_output(body)
+    )
+}
+
+/// Extensions `read_image` will attempt, so a text file gets a useful error
+/// instead of a decoder trace.
+const IMAGE_SUFFIXES: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"];
+
+/// Queue an image for attachment to the conversation.
+///
+/// Returns a text summary for the tool result; the picture itself reaches the
+/// caller via `ToolContext::take_pending_images` — see `add_pending_image` for
+/// why it can't ride in the return value.
+async fn read_image(path: String, ctx: &Arc<ToolContext>) -> String {
+    let p = expand_home(&path);
+    if !p.exists() {
+        return format!("Error: File not found: {path}");
+    }
+    if !p.is_file() {
+        return format!("Error: Not a file: {path}");
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !IMAGE_SUFFIXES.contains(&ext.as_str()) {
+        return format!(
+            "Error: {path} is not a recognized image file. Supported extensions: {}. \
+             Use read_file for text.",
+            IMAGE_SUFFIXES.join(", ")
+        );
+    }
+
+    let original_size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    let (dim, mb, quality) = {
+        (
+            *IMAGE_MAX_DIMENSION.lock().unwrap(),
+            *IMAGE_MAX_MB.lock().unwrap(),
+            *IMAGE_QUALITY.lock().unwrap(),
+        )
+    };
+
+    let (width, height) = match image::image_dimensions(&p) {
+        Ok(d) => d,
+        Err(e) => return format!("Error: {path} could not be decoded as an image: {e}"),
+    };
+
+    match crate::image_utils::preprocess(&p, dim, mb, quality) {
+        Ok(result) => {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&result.bytes);
+            let encoded_len = result.bytes.len() as u64;
+            let mime = result.mime.clone();
+            ctx.add_pending_image(p.to_string_lossy().to_string(), result.mime, b64);
+
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let mut summary = format!(
+                "Loaded {name} — {width}×{height}, {}",
+                format_size(original_size)
+            );
+            if encoded_len != original_size {
+                summary.push_str(&format!(
+                    " → {mime}, {} after preprocessing",
+                    format_size(encoded_len)
+                ));
+            }
+            summary.push_str(". The image is attached below; look at it directly.");
+            summary
+        }
+        Err(e) => format!("Error reading image: {e}"),
     }
 }
 
@@ -1770,6 +1933,22 @@ fn urldecode(s: &str) -> String {
     result
 }
 
+/// Reduce `raw` to a bare filename inside ~/Downloads.
+///
+/// The model chooses this name and may be acting on instructions from a fetched
+/// page, so a path component here must never escape the download directory —
+/// `../../.bashrc` has to land as `.bashrc`.  `PathBuf::join` would otherwise
+/// let an absolute path replace the destination entirely.  Backslashes are
+/// folded too so a Windows-style path can't slip through on POSIX.
+fn safe_download_name(raw: &str) -> String {
+    let name = raw.replace('\\', "/");
+    let name = name.rsplit('/').next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return "download".to_string();
+    }
+    name.to_string()
+}
+
 async fn download_file(url: String, filename: Option<String>) -> String {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
@@ -1786,7 +1965,7 @@ async fn download_file(url: String, filename: Option<String>) -> String {
     downloads.push("Downloads");
     let _ = std::fs::create_dir_all(&downloads);
 
-    let fname = filename
+    let fname = safe_download_name(&filename
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| {
             parsed
@@ -1794,7 +1973,7 @@ async fn download_file(url: String, filename: Option<String>) -> String {
                 .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
                 .unwrap_or("download")
                 .to_string()
-        });
+        }));
     let dest = downloads.join(&fname);
 
     let mut builder = reqwest::Client::builder().user_agent(ua());
@@ -2656,11 +2835,55 @@ mod tests {
         );
     }
 
+    /// offset/limit page through a file; the header states where you are so the
+    /// model can request the next page.  Mirrors Python's
+    /// test_read_file_offset_and_limit — keep in sync.
+    #[tokio::test]
+    async fn read_file_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        let body: String = (1..=20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let p = path.to_str().unwrap().to_string();
+
+        let ranged = read_file(p.clone(), Some(5), Some(3)).await;
+        let mut it = ranged.lines();
+        assert_eq!(it.next().unwrap(), format!("[Lines 5-7 of 20 in {p}]"));
+        assert_eq!(it.collect::<Vec<_>>(), vec!["line 5", "line 6", "line 7"]);
+
+        // limit alone starts at line 1; offset alone runs to the end.
+        let head = read_file(p.clone(), None, Some(2)).await;
+        assert_eq!(head.lines().skip(1).collect::<Vec<_>>(), vec!["line 1", "line 2"]);
+        let tail = read_file(p.clone(), Some(19), None).await;
+        assert_eq!(tail.lines().skip(1).collect::<Vec<_>>(), vec!["line 19", "line 20"]);
+
+        // A limit past the end clamps instead of erroring.
+        let clamped = read_file(p.clone(), Some(19), Some(100)).await;
+        assert!(clamped.starts_with(&format!("[Lines 19-20 of 20 in {p}]")));
+
+        // No offset/limit keeps the plain whole-file behaviour (no header).
+        assert!(read_file(p, None, None).await.starts_with("line 1"));
+    }
+
+    #[tokio::test]
+    async fn read_file_offset_past_end_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.txt");
+        std::fs::write(&path, "a\nb\nc").unwrap();
+        let result = read_file(path.to_str().unwrap().to_string(), Some(99), None).await;
+        assert!(result.contains("Error"), "{result}");
+        assert!(result.contains("3 lines"), "{result}");
+    }
+
     // ── is_readonly_tool ───────────────────────────────────────────
 
     #[test]
     fn readonly_tools_classified_correctly() {
         assert!(is_readonly_tool("read_file"));
+        assert!(is_readonly_tool("read_image"));
         assert!(is_readonly_tool("read_multiple_files"));
         assert!(is_readonly_tool("directory_tree"));
         assert!(is_readonly_tool("search_content"));
@@ -2686,15 +2909,15 @@ mod tests {
     // ── tool_definitions ───────────────────────────────────────────
 
     #[test]
-    fn tool_definitions_has_fifteen_tools() {
-        assert_eq!(tool_definitions().len(), 15);
+    fn tool_definitions_has_sixteen_tools() {
+        assert_eq!(tool_definitions().len(), 16);
     }
 
     #[test]
-    fn tool_definitions_json_has_fifteen_tools() {
+    fn tool_definitions_json_has_sixteen_tools() {
         let json = tool_definitions_json();
         assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 15);
+        assert_eq!(json.as_array().unwrap().len(), 16);
     }
 
     #[test]
@@ -2717,7 +2940,7 @@ mod tests {
             .iter()
             .map(|t| t.function.name.clone())
             .collect();
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
     }
 
     #[test]
@@ -2736,7 +2959,7 @@ mod tests {
         let json = serde_json::to_string(&defs).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.is_array());
-        assert_eq!(parsed.as_array().unwrap().len(), 15);
+        assert_eq!(parsed.as_array().unwrap().len(), 16);
     }
 
     #[test]
@@ -3117,13 +3340,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "hello world").unwrap();
-        let result = read_file(path.to_str().unwrap().to_string()).await;
+        let result = read_file(path.to_str().unwrap().to_string(), None, None).await;
         assert_eq!(result, "hello world");
     }
 
     #[tokio::test]
     async fn read_file_not_found() {
-        let result = read_file("/tmp/pengy_nonexistent_file_12345.txt".into()).await;
+        let result = read_file("/tmp/pengy_nonexistent_file_12345.txt".into(), None, None).await;
         assert!(result.contains("not found"));
     }
 
@@ -3422,7 +3645,75 @@ mod tests {
         assert!(!result.contains(".hidden.py"));
     }
 
+    /// ".env" is in the skip set as a virtualenv *directory* name; matching it
+    /// against files made the common .env *file* unfindable.
     #[tokio::test]
+    async fn glob_tool_finds_dotenv_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+        let args = serde_json::json!({"pattern": ".env", "path": dir.path().to_str().unwrap()});
+        let ctx = std::sync::Arc::new(ToolContext::new());
+        let result = execute_tool("glob", &args, &ctx).await;
+        assert!(result.contains(".env"), "{result}");
+        assert!(!result.contains("No files matching"), "{result}");
+    }
+
+    /// The virtualenv case the skip entry exists for must keep working.
+    #[tokio::test]
+    async fn glob_tool_still_skips_dotenv_directory_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".env")).unwrap();
+        std::fs::write(dir.path().join(".env/pyvenv.py"), "x").unwrap();
+        std::fs::write(dir.path().join("real.py"), "y").unwrap();
+        let args = serde_json::json!({"pattern": "**/*.py", "path": dir.path().to_str().unwrap()});
+        let ctx = std::sync::Arc::new(ToolContext::new());
+        let result = execute_tool("glob", &args, &ctx).await;
+        assert!(result.contains("real.py"), "{result}");
+        assert!(!result.contains("pyvenv.py"), "{result}");
+    }
+
+    /// A pattern whose final component starts with "." wants hidden entries,
+    /// even when the pattern as a whole starts with "*".
+    #[tokio::test]
+    async fn glob_tool_finds_hidden_when_pattern_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/.config"), "x").unwrap();
+        let args = serde_json::json!({"pattern": "**/.config", "path": dir.path().to_str().unwrap()});
+        let ctx = std::sync::Arc::new(ToolContext::new());
+        let result = execute_tool("glob", &args, &ctx).await;
+        assert!(result.contains(".config"), "{result}");
+    }
+
+    /// A recursive pattern ending in a literal (no wildcard) must still match;
+    /// comparing the whole relative path made these unmatchable.
+    #[tokio::test]
+    async fn glob_tool_recursive_literal_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/Makefile"), "x").unwrap();
+        let args = serde_json::json!({"pattern": "**/Makefile", "path": dir.path().to_str().unwrap()});
+        let ctx = std::sync::Arc::new(ToolContext::new());
+        let result = execute_tool("glob", &args, &ctx).await;
+        assert!(result.contains("Makefile"), "{result}");
+    }
+
+    /// The model picks the download name and may be acting on a fetched page's
+    /// instructions, so a path component must never leave ~/Downloads.
+    #[test]
+    fn download_filename_cannot_escape_downloads() {
+        assert_eq!(safe_download_name("../../.bashrc"), ".bashrc");
+        assert_eq!(safe_download_name("/etc/passwd"), "passwd");
+        assert_eq!(safe_download_name("a/b/c.txt"), "c.txt");
+        assert_eq!(safe_download_name("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(safe_download_name(".."), "download");
+        assert_eq!(safe_download_name("."), "download");
+        assert_eq!(safe_download_name(""), "download");
+        assert_eq!(safe_download_name("subdir/"), "download");
+        assert_eq!(safe_download_name("report.pdf"), "report.pdf");
+    }
+
+#[tokio::test]
     async fn glob_tool_skips_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("node_modules")).unwrap();
@@ -3773,6 +4064,7 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         ".eggs",
         ".venv",
         "venv",
+        ".env",
         "build",
         "dist",
         "target",
@@ -3780,6 +4072,17 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
     .iter()
     .cloned()
     .collect();
+
+    // A pattern whose final component starts with "." is asking for hidden
+    // entries.  Testing the whole pattern would miss "**/.config" or "src/.env",
+    // since those start with "*" and "s".
+    let wants_hidden = pattern
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .starts_with('.');
 
     // Split pattern into prefix and glob parts for simple matching
     let has_recursive = pattern.contains("**");
@@ -3805,10 +4108,13 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
                 return true;
             } // never skip the root
             if let Some(name) = e.file_name().to_str() {
-                if name.starts_with('.') && !pattern.starts_with('.') {
+                if name.starts_with('.') && !wants_hidden {
                     return false;
                 }
-                if skip_dirs.contains(name) {
+                // Only directories are pruned by the skip set: ".env" and
+                // "target" are in there as *directory* names, and matching them
+                // against files made a plain ".env" file unfindable.
+                if e.file_type().is_dir() && skip_dirs.contains(name) {
                     return false;
                 }
             }
@@ -3822,8 +4128,13 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
         let rel_str = rel.to_string_lossy();
 
-        // Simple glob matching: check suffix pattern against the path
-        if !simple_glob_match(&rel_str, glob_suffix) {
+        // Simple glob matching.  A recursive pattern ("**/X") means "X at any
+        // depth", so it matches the file name — comparing the whole relative
+        // path only worked when the suffix began with a wildcard, which made
+        // literal suffixes like "**/.config" or "**/Makefile" unmatchable.
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let target = if has_recursive { &file_name } else { &rel_str.to_string() };
+        if !simple_glob_match(target, glob_suffix) {
             continue;
         }
 
