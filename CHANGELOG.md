@@ -1,6 +1,43 @@
 # Changelog
 
-## v1.5.9 (current)
+## v1.6.0 (current)
+
+- **New `read_image` tool** — the agent can inspect local images (screenshots,
+  photos, diagrams, charts, rendered plots) and attach them to the conversation
+  so vision-capable models can describe what they show.
+  - Images decoded, preprocessed (resize/compress to configurable limits), and
+    base64-encoded via Rust `image` crate
+  - Parked on `ToolContext` (not the tool return value) because the API only
+    accepts string content in `role: "tool"` messages
+  - Attached as a follow-up user message with `image_url` parts after the tool
+    loop completes
+  - Added to `is_readonly_tool()` safe-list for auto-approval in "safe" mode
+  - Limits backed by `IMAGE_MAX_DIMENSION`, `IMAGE_MAX_MB`, `IMAGE_QUALITY`
+    statics, shared across all frontends
+  - Tests: image attachment in LLM loop, error handling, chat storage
+    round-trips for multipart image content
+- **Graceful degradation for text-only models**: if the API returns HTTP 400
+  because the model doesn't support vision inputs, the `image_url` parts are
+  automatically stripped from all messages, a clarifying note is appended, and
+  the conversation retries without the image — instead of emitting a
+  `LlmEvent::FinalResponse` with "API error (HTTP 400)" and ending the chat.
+  Implemented in all three editions (Python, C++, Rust).
+- **Fix: tool output truncation now cuts on line boundaries and separates file
+  reads from command output**:
+  - `read_file` / `read_multiple_files`: truncate from the head only
+    (contiguous, no middle gap) — the head has imports/declarations, the rest
+    can be paged via `offset`
+  - `run_bash` / `run_python`: remain tail-biased (head + tail, middle snipped)
+    — command echo at the start, errors at the end, disposable middle
+  - Both seams cut on full line boundaries so the model never sees a broken
+    half-line fragment
+  - Whole-file reads that fit within the limit stay bare — no `[Lines X-Y]`
+    header to parse
+  - Truncated file headers show the exact continuation offset for easy paging
+  - Giant single-line files fall back to character-boundary cutting
+- **Updated README screenshots** — new settings, templates, and main UI images.
+
+## v1.5.9
 
 - Fix web SSE reconnect race: replaced the single-use mpsc receiver with an
   append-only event log + `tokio::sync::watch` channel. SSE events now carry
