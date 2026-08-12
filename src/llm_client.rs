@@ -11,6 +11,65 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+// ── Graceful image-stripping helpers ────────────────────────────
+
+const IMAGE_ERROR_KEYWORDS: &[&str] = &[
+    "image", "multimodal", "vision", "not support", "unsupported",
+];
+
+fn has_image_url_parts(messages: &[ChatMessage]) -> bool {
+    for msg in messages {
+        if let Some(content) = &msg.content {
+            if let Some(parts) = content.as_array() {
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn strip_image_url_parts(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        if let Some(content) = msg.content.take() {
+            if let Some(parts) = content.as_array() {
+                let kept: Vec<&serde_json::Value> = parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) != Some("image_url"))
+                    .collect();
+                if kept.len() == 1 {
+                    if let Some(text) = kept[0].get("text").and_then(|t| t.as_str()) {
+                        msg.content = Some(serde_json::Value::String(text.to_string()));
+                    } else {
+                        msg.content = Some(kept[0].clone());
+                    }
+                } else if kept.is_empty() {
+                    msg.content = Some(serde_json::Value::String(
+                        "[Empty — image content was removed]".into(),
+                    ));
+                } else {
+                    msg.content = Some(serde_json::Value::Array(
+                        kept.into_iter().cloned().collect(),
+                    ));
+                }
+            } else {
+                msg.content = Some(content);
+            }
+        }
+    }
+}
+
+fn is_image_input_error(status_code: u16, error_text: &str) -> bool {
+    if status_code != 400 {
+        return false;
+    }
+    let lower = error_text.to_lowercase();
+    IMAGE_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
 // ── 429 / 529 backoff ────────────────────────────────────────────
 const MAX_RETRIES: u32 = 5;
 const BASE_DELAY_SECS: f64 = 1.0;
@@ -197,7 +256,7 @@ pub async fn chat(
         total_tokens: 0,
     };
 
-    loop {
+    'outer: loop {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -245,6 +304,32 @@ pub async fn chat(
                             serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
                         last_status = Some(status);
                         last_body = Some(body.clone());
+                        // ── Graceful handling: model doesn't support images ──
+                        let detail = body["error"]["message"]
+                            .as_str()
+                            .or_else(|| body["error"].as_str())
+                            .or_else(|| body["message"].as_str())
+                            .unwrap_or(body_text.as_str());
+                        if is_image_input_error(code, detail)
+                            && has_image_url_parts(&current_messages)
+                        {
+                            strip_image_url_parts(&mut current_messages);
+                            current_messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: Some(serde_json::Value::String(
+                                    "[This AI model does not support image/vision inputs, \
+                                     so the image could not be attached. \
+                                     The file metadata was returned above.]".into(),
+                                )),
+                                tool_calls: vec![],
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                reasoning: None,
+                                reasoning_details: None,
+                            });
+                            continue 'outer;
+                        }
+
                         if RETRYABLE_STATUSES.contains(&code) && attempt < MAX_RETRIES {
                             let ra = extract_retry_after(&headers);
                             let delay = backoff_delay(attempt, ra);
