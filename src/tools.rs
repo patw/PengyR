@@ -730,8 +730,59 @@ fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-/// If `text` exceeds the configured `TOOL_OUTPUT_MAX_CHARS`, keep head+tail
-/// and snip the middle.  0 = no limit.
+/// First `max_bytes` of `s`, backed up to the last line break.
+///
+/// Cutting on a raw index leaves a broken half-line at the seam, which on
+/// source code is a fragment the model may try to reason about or "fix".
+/// Falls back to the char-boundary cut when one line is longer than the budget.
+fn cut_at_line_end(s: &str, max_bytes: usize) -> &str {
+    let head = truncate_on_char_boundary(s, max_bytes);
+    if head.len() == s.len() {
+        return head;
+    }
+    match head.rfind('\n') {
+        Some(pos) if pos > 0 => &head[..pos],
+        _ => head,
+    }
+}
+
+/// Last `max_bytes` of `s`, advanced to the start of the next whole line.
+fn cut_at_line_start(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    match s[start..].find('\n') {
+        Some(pos) => &s[start + pos + 1..],
+        None => &s[start..],
+    }
+}
+
+/// Head truncation for *file* content, cut on a line boundary.
+///
+/// Returns `(text, lines_kept, truncated)`.  Files truncate from the head
+/// rather than being snipped in the middle: the head is where imports and
+/// declarations live, and the caller can report which lines survived so the
+/// model can page through the rest with offset/limit.
+fn truncate_head_lines(text: &str, limit: Option<usize>) -> (&str, usize, bool) {
+    let budget = limit.unwrap_or_else(|| *TOOL_OUTPUT_MAX_CHARS.lock().unwrap());
+    if budget == 0 || text.len() <= budget {
+        return (text, text.matches('\n').count() + 1, false);
+    }
+    let kept = cut_at_line_end(text, budget);
+    (kept, kept.matches('\n').count() + 1, true)
+}
+
+/// Tail-biased truncation for *command* output (run_bash, run_python).
+///
+/// Keeps the head (~20%) and tail (~80%) and snips the middle: a command echo
+/// sits at the start and the error that matters usually sits at the end, so the
+/// middle of a build log is the disposable part.  File reads use
+/// `truncate_head_lines` instead — a gap in the middle of a source file is not
+/// disposable, and unlike a log it can be paged around.  0 = no limit.
 fn snip_tool_output(text: String) -> String {
     let limit = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
     if limit == 0 || text.len() <= limit {
@@ -740,18 +791,9 @@ fn snip_tool_output(text: String) -> String {
     let head_chars = (limit / 5).max(500);
     let tail_chars = limit - head_chars;
 
-    // Find char-boundary cut points
-    let head = truncate_on_char_boundary(&text, head_chars);
-    let tail_start = text.len().saturating_sub(tail_chars);
-    // Back up to nearest char boundary
-    let tail_start = {
-        let mut pos = tail_start;
-        while pos > 0 && !text.is_char_boundary(pos) {
-            pos -= 1;
-        }
-        pos
-    };
-    let tail = &text[tail_start..];
+    // Cut on line boundaries so neither seam leaves a broken half-line.
+    let head = cut_at_line_end(&text, head_chars);
+    let tail = cut_at_line_start(&text, tail_chars);
 
     let snipped = text.len() - head.len() - tail.len();
     format!(
@@ -834,18 +876,6 @@ async fn read_file(path: String, offset: Option<usize>, limit: Option<usize>) ->
         }
     };
 
-    if offset.is_none() && limit.is_none() {
-        let snipped = snip_tool_output(text.clone());
-        if snipped != text {
-            let total = text.matches('\n').count() + 1;
-            return format!(
-                "{snipped}\n\n[{path} has {total} lines — pass offset and limit \
-                 to read a specific range instead.]"
-            );
-        }
-        return snipped;
-    }
-
     let lines: Vec<&str> = text.split('\n').collect();
     let total = lines.len();
     let start = offset.unwrap_or(1).max(1);
@@ -858,10 +888,22 @@ async fn read_file(path: String, offset: Option<usize>, limit: Option<usize>) ->
     let end = total.min(start + count - 1);
 
     let body = lines[start - 1..end].join("\n");
-    format!(
-        "[Lines {start}-{end} of {total} in {path}]\n{}",
-        snip_tool_output(body)
-    )
+    let (body, kept, truncated) = truncate_head_lines(&body, None);
+    let shown_end = start + kept - 1;
+
+    // A plain whole-file read that fit stays bare — no header to parse.
+    if !truncated && offset.is_none() && limit.is_none() {
+        return body.to_string();
+    }
+
+    let mut header = format!("[Lines {start}-{shown_end} of {total} in {path}");
+    if truncated {
+        header.push_str(&format!(
+            " — output limit reached, pass offset={} to continue",
+            shown_end + 1
+        ));
+    }
+    format!("{header}]\n{body}")
 }
 
 /// Extensions `read_image` will attempt, so a text file gets a useful error
@@ -2391,12 +2433,15 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
             }
         };
 
-        let content = if content.len() > MAX_PER_FILE {
-            let truncated = truncate_on_char_boundary(&content, MAX_PER_FILE);
-            let fsize = p.metadata().map(|m| m.len()).unwrap_or(0);
+        // Same head-truncation and line-range reporting as read_file, so the
+        // model can follow up with read_file(offset=...) on whichever file was cut.
+        let total_lines = content.matches('\n').count() + 1;
+        let (kept_text, kept, truncated) = truncate_head_lines(&content, Some(MAX_PER_FILE));
+        let content = if truncated {
             format!(
-                "{truncated}\n\n[... truncated at {MAX_PER_FILE} characters \
-                 (full file is {fsize} bytes) ...]"
+                "{kept_text}\n\n[... showed lines 1-{kept} of {total_lines} — \
+                 read_file with offset={} to continue ...]",
+                kept + 1
             )
         } else {
             content
@@ -3603,12 +3648,121 @@ mod tests {
         // Write a file where a multibyte character straddles the current
         // 250_000-byte per-file limit. The reader must back up to a UTF-8
         // boundary before appending its truncation marker.
+        // The whole file is one line, so there is no line break to back up to —
+        // the char-boundary fallback must still keep the output valid UTF-8.
         let content = "a".repeat(249_999) + "🐧extra";
         std::fs::write(&path, &content).unwrap();
         let result = read_multiple_files(vec![path.to_str().unwrap().into()]).await;
-        assert!(result.contains("[... truncated at 250000 characters"));
+        assert!(result.contains("[... showed lines 1-"), "{result:.200}");
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("🐧extra"));
+    }
+
+    /// Files truncate from the head, not the middle: the head holds imports and
+    /// declarations, and unlike a log the rest can be paged to.  Mirrors
+    /// Python's test_read_file_truncates_from_head_with_continuation.
+    #[tokio::test]
+    async fn read_file_truncates_from_head_with_continuation() {
+        let _guard = test_tool_timeout_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let body: String = (1..=5000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let p = path.to_str().unwrap().to_string();
+
+        let prev = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 2000;
+        let result = read_file(p.clone(), None, None).await;
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = prev;
+
+        let mut lines = result.lines();
+        let header = lines.next().unwrap().to_string();
+        let body_lines: Vec<&str> = lines.collect();
+
+        // No middle gap — content runs contiguously from line 1.
+        assert!(!result.contains("snipped"), "{header}");
+        assert_eq!(body_lines[0], "line 1");
+        assert!(header.contains("of 5000 in"), "{header}");
+        assert!(header.contains("output limit reached"), "{header}");
+
+        // The stated continuation offset is the next unseen line.
+        let last_shown: usize = body_lines
+            .last()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let offset: usize = header
+            .split("offset=")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(offset, last_shown + 1);
+    }
+
+    /// run_bash output keeps head+tail: the command echo is at the start and
+    /// the error that matters is usually at the end.
+    #[test]
+    fn command_output_stays_tail_biased() {
+        let _guard = test_tool_timeout_guard();
+        let text: String = (1..=5000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prev = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 2000;
+        let out = snip_tool_output(text);
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = prev;
+
+        assert!(out.starts_with("line 1"));
+        assert!(out.trim_end().ends_with("line 5000"));
+        assert!(out.contains("snipped"));
+    }
+
+    /// Character-index cuts left a broken half-line at each seam, which on
+    /// source code is a fragment the model may try to "fix".
+    #[test]
+    fn truncation_never_splits_a_line() {
+        let _guard = test_tool_timeout_guard();
+        let text: String = (1..=5000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prev = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 2000;
+        let out = snip_tool_output(text.clone());
+        let (kept, _, _) = truncate_head_lines(&text, None);
+        let kept = kept.to_string();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = prev;
+
+        let (head, rest) = out.split_once("[... snipped").unwrap();
+        let tail = rest.split_once("]").unwrap().1;
+        let whole = |frag: &str| {
+            frag.split_whitespace().count() == 2 && frag.starts_with("line ")
+        };
+        for frag in head.trim().lines().chain(tail.trim().lines()) {
+            assert!(whole(frag), "broken fragment at seam: {frag:?}");
+        }
+        assert!(whole(kept.lines().last().unwrap()));
+    }
+
+    /// A single line longer than the budget has no line break to back up to —
+    /// it must still be cut rather than blowing the limit.
+    #[test]
+    fn truncation_handles_one_giant_line() {
+        let text = "x".repeat(5000);
+        let (kept, _, truncated) = truncate_head_lines(&text, Some(500));
+        assert!(truncated);
+        assert_eq!(kept.len(), 500);
     }
 
     // ── glob_tool ──────────────────────────────────────────────────
