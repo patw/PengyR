@@ -79,6 +79,10 @@ pub struct Config {
     #[serde(default = "default_tool_output_max_chars")]
     pub tool_output_max_chars: usize,
 
+    /// Default max download size in MB. 0 = no limit.
+    #[serde(default = "default_download_max_mb")]
+    pub download_max_mb: u64,
+
     /// Max image dimension in pixels. Images larger than this are downscaled.
     #[serde(default = "default_image_max_dimension")]
     pub image_max_dimension: u32,
@@ -127,6 +131,9 @@ fn default_tool_timeout() -> u64 {
 fn default_tool_output_max_chars() -> usize {
     250000
 }
+fn default_download_max_mb() -> u64 {
+    100
+}
 fn default_image_max_dimension() -> u32 {
     4096
 }
@@ -155,6 +162,7 @@ impl Default for Config {
             llm_timeout: default_llm_timeout(),
             tool_timeout: default_tool_timeout(),
             tool_output_max_chars: default_tool_output_max_chars(),
+            download_max_mb: default_download_max_mb(),
             image_max_dimension: default_image_max_dimension(),
             image_max_mb: default_image_max_mb(),
             image_quality: default_image_quality(),
@@ -268,6 +276,11 @@ pub fn load_config() -> Config {
                             config.tool_output_max_chars = n as usize;
                         }
                     }
+                    if let Some(v) = obj.get("download_max_mb") {
+                        if let Some(n) = v.as_u64() {
+                            config.download_max_mb = n;
+                        }
+                    }
                 }
                 config
             }
@@ -365,6 +378,7 @@ mod tests {
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 300);
         assert_eq!(c.tool_output_max_chars, 250_000);
+        assert_eq!(c.download_max_mb, 100);
         assert_eq!(c.llm_timeout, 300);
         assert_eq!(c.image_max_dimension, 4096);
         assert!((c.image_max_mb - 4.5).abs() < 0.001);
@@ -393,6 +407,7 @@ mod tests {
             llm_timeout: 120,
             tool_timeout: 120,
             tool_output_max_chars: 30000,
+            download_max_mb: 500,
             image_max_dimension: 2048,
             image_max_mb: 3.0,
             image_quality: 70,
@@ -412,6 +427,7 @@ mod tests {
         assert_eq!(c2.llm_timeout, c.llm_timeout);
         assert_eq!(c2.tool_timeout, c.tool_timeout);
         assert_eq!(c2.tool_output_max_chars, c.tool_output_max_chars);
+        assert_eq!(c2.download_max_mb, c.download_max_mb);
         assert_eq!(c2.image_max_dimension, c.image_max_dimension);
         assert!((c2.image_max_mb - c.image_max_mb).abs() < 0.001);
         assert_eq!(c2.image_quality, c.image_quality);
@@ -430,6 +446,7 @@ mod tests {
         assert_eq!(c.ui_scale, 100);
         assert_eq!(c.tool_timeout, 300);
         assert_eq!(c.tool_output_max_chars, 250_000);
+        assert_eq!(c.download_max_mb, 100);
         assert_eq!(c.llm_timeout, 300);
         assert_eq!(c.image_max_dimension, 4096);
     }

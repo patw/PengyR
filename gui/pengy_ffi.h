@@ -26,6 +26,7 @@ extern "C" {
     bool  pengy_tool_is_readonly(const char* name);
     void  pengy_tool_set_user_agent(const char* ua);
     void  pengy_tool_set_timeout(unsigned long long secs);
+    void  pengy_tool_set_download_max_mb(unsigned long long mb);
     void  pengy_tool_set_output_max_chars(unsigned long long chars);
 
     char* pengy_image_preprocess(const char* path,

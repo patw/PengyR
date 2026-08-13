@@ -202,6 +202,11 @@ pub extern "C" fn pengy_tool_set_timeout(secs: u64) {
 }
 
 #[no_mangle]
+pub extern "C" fn pengy_tool_set_download_max_mb(mb: u64) {
+    *tools::DOWNLOAD_MAX_MB.lock().unwrap() = mb;
+}
+
+#[no_mangle]
 pub extern "C" fn pengy_tool_set_output_max_chars(chars: usize) {
     *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = chars;
 }

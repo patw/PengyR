@@ -201,6 +201,14 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_toolOutputMax->setValue(config["tool_output_max_chars"].toInt(250000));
     toolsForm->addRow(labelWithTip("Max tool output:", "Tool output longer than this is snipped (head+tail) to avoid blowing up the context window. 0 = no limit."), m_toolOutputMax);
 
+    m_downloadMax = new QSpinBox;
+    m_downloadMax->setRange(0, 1000000);
+    m_downloadMax->setSpecialValueText("No limit");
+    m_downloadMax->setSuffix(" MB");
+    m_downloadMax->setToolTip("Default maximum download size for download_file. 0 = no limit.");
+    m_downloadMax->setValue(config["download_max_mb"].toInt(100));
+    toolsForm->addRow(labelWithTip("Max download:", "Default maximum download size for download_file. 0 = no limit."), m_downloadMax);
+
     m_userAgent = new QLineEdit(config["user_agent"].toString("PengyAgent/1.0"));
     m_userAgent->setToolTip("HTTP User-Agent header sent with LLM API requests and any HTTP-based tool calls.");
     toolsForm->addRow(labelWithTip("User Agent:", "HTTP User-Agent header sent with LLM API requests and any HTTP-based tool calls."), m_userAgent);
@@ -228,6 +236,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();
         m_config["tool_output_max_chars"] = m_toolOutputMax->value();
+        m_config["download_max_mb"] = m_downloadMax->value();
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

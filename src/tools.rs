@@ -17,7 +17,12 @@ use std::time::{Duration, Instant};
 
 pub static TOOL_TIMEOUT: Mutex<u64> = Mutex::new(300);
 pub static TOOL_OUTPUT_MAX_CHARS: Mutex<usize> = Mutex::new(250000);
+pub static DOWNLOAD_MAX_MB: Mutex<u64> = Mutex::new(100);
 pub static USER_AGENT: Mutex<String> = Mutex::new(String::new());
+
+/// download_file uses a stall timeout (no bytes for this long) instead of the
+/// tool timeout, so a large transfer isn't killed mid-stream.
+const DOWNLOAD_STALL_TIMEOUT: u64 = 120;
 
 /// Preprocessing limits `read_image` applies before base64-encoding.
 pub static IMAGE_MAX_DIMENSION: Mutex<u32> = Mutex::new(4096);
@@ -190,9 +195,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("query", "string", "The search query"),
               ("max_results", "integer", "Maximum number of results to return (default: 5)")],
             &["query"]),
-        td("download_file", "Download a file from a URL to the user's Downloads directory. Existing files of the same name are overwritten; downloads larger than 100 MB are rejected.",
+        td("download_file", "Download a file from a URL to disk, streaming to the target directory and returning the saved path and byte size. Existing files of the same name are overwritten. Set max_size_mb to opt into large downloads (0 = no limit). For auth headers, resume, mirrors, or non-HTTP sources, use run_bash with curl or wget.",
             &[("url", "string", "The URL of the file to download"),
-              ("filename", "string", "Optional filename to save as; defaults to the name from the URL")],
+              ("filename", "string", "Optional filename to save as; defaults to the name from the URL"),
+              ("dir", "string", "Directory to save into (default: ~/Downloads). Created if missing."),
+              ("max_size_mb", "integer", "Maximum download size in MB. Defaults to the configured download limit; 0 = no limit.")],
             &["url"]),
         td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers. Large responses are truncated to the configured tool output limit; pass max_chars to return more (0 = no limit).",
             &[("url", "string", "The URL to fetch"),
@@ -432,7 +439,13 @@ async fn execute_tool_inner(
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
         }
         "download_file" => {
-            download_file(a(arguments, "url", ""), aopt(arguments, "filename")).await
+            download_file(
+                a(arguments, "url", ""),
+                aopt(arguments, "filename"),
+                aopt(arguments, "dir"),
+                aopt_i64(arguments, "max_size_mb"),
+            )
+            .await
         }
         "fetch_url" => fetch_url(a(arguments, "url", ""), aopt_usize(arguments, "max_chars")).await,
         "run_python" => run_python(a(arguments, "code", ""), aopt(arguments, "cwd"), ctx.clone()).await,
@@ -824,6 +837,12 @@ fn aopt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
     args.get(key)
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
+}
+
+/// Optional signed integer argument — `None` when the model omitted the key.
+/// download_file's max_size_mb needs this to distinguish 0/negative (no limit).
+fn aopt_i64(args: &serde_json::Value, key: &str) -> Option<i64> {
+    args.get(key).and_then(|v| v.as_i64())
 }
 
 fn aus(args: &serde_json::Value, key: &str, default: usize) -> usize {
@@ -2017,7 +2036,12 @@ fn safe_download_name(raw: &str) -> String {
     name.to_string()
 }
 
-async fn download_file(url: String, filename: Option<String>) -> String {
+async fn download_file(
+    url: String,
+    filename: Option<String>,
+    dir: Option<String>,
+    max_size_mb: Option<i64>,
+) -> String {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
         Err(e) => return format!("Error: Invalid URL: {e}"),
@@ -2029,9 +2053,20 @@ async fn download_file(url: String, filename: Option<String>) -> String {
         );
     }
 
-    let mut downloads = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    downloads.push("Downloads");
-    let _ = std::fs::create_dir_all(&downloads);
+    let target_dir = match dir {
+        Some(d) => expand_home(&d),
+        None => {
+            let mut d = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            d.push("Downloads");
+            d
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        return format!("Error creating directory: {e}");
+    }
+    if !target_dir.is_dir() {
+        return format!("Error: dir is not a directory: {}", target_dir.display());
+    }
 
     let fname = safe_download_name(&filename
         .filter(|s| !s.trim().is_empty())
@@ -2042,14 +2077,15 @@ async fn download_file(url: String, filename: Option<String>) -> String {
                 .unwrap_or("download")
                 .to_string()
         }));
-    let dest = downloads.join(&fname);
+    let dest = target_dir.join(&fname);
 
-    let mut builder = reqwest::Client::builder().user_agent(ua());
-    let timeout = timeout_secs();
-    if timeout > 0 {
-        builder = builder.timeout(Duration::from_secs(timeout));
-    }
-    let client = builder.build().unwrap_or_default();
+    let limit_mb = max_size_mb.unwrap_or_else(|| *DOWNLOAD_MAX_MB.lock().unwrap() as i64);
+    let limit_bytes: usize = if limit_mb <= 0 { 0 } else { (limit_mb as usize) * 1024 * 1024 };
+
+    let client = reqwest::Client::builder()
+        .user_agent(ua())
+        .build()
+        .unwrap_or_default();
 
     let resp = match client.get(&url).send().await {
         Ok(r) => r,
@@ -2059,7 +2095,6 @@ async fn download_file(url: String, filename: Option<String>) -> String {
         return format!("Error downloading file: HTTP {}", resp.status());
     }
 
-    let max_size: usize = 100 * 1024 * 1024;
     let mut total: usize = 0;
     let mut out = match std::fs::File::create(&dest) {
         Ok(f) => f,
@@ -2067,18 +2102,30 @@ async fn download_file(url: String, filename: Option<String>) -> String {
     };
 
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
+    loop {
+        let chunk = match tokio::time::timeout(
+            Duration::from_secs(DOWNLOAD_STALL_TIMEOUT),
+            stream.next(),
+        )
+        .await
+        {
+            Err(_) => {
+                let _ = std::fs::remove_file(&dest);
+                return format!(
+                    "Error downloading: no data for {DOWNLOAD_STALL_TIMEOUT} seconds"
+                );
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
                 let _ = std::fs::remove_file(&dest);
                 return format!("Error downloading: {e}");
             }
+            Ok(Some(Ok(c))) => c,
         };
         total += chunk.len();
-        if total > max_size {
+        if limit_bytes > 0 && total > limit_bytes {
             let _ = std::fs::remove_file(&dest);
-            return format!("Error: Download exceeds maximum size of {max_size} bytes.");
+            return format!("Error: Download exceeds maximum size of {limit_bytes} bytes.");
         }
         if let Err(e) = out.write_all(&chunk) {
             let _ = std::fs::remove_file(&dest);
@@ -3789,6 +3836,57 @@ mod tests {
         handle.join().unwrap();
         assert!(!result.contains("truncated"));
         assert!(result.len() >= 5000);
+    }
+
+    #[tokio::test]
+    async fn download_file_dir_and_filename() {
+        let (url, handle) = spawn_http_server("hello download");
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_file(
+            url,
+            Some("report.txt".into()),
+            Some(dir.path().to_str().unwrap().to_string()),
+            None,
+        )
+        .await;
+        handle.join().unwrap();
+        assert!(result.contains("Downloaded to"));
+        let contents = std::fs::read_to_string(dir.path().join("report.txt")).unwrap();
+        assert_eq!(contents, "hello download");
+    }
+
+    #[tokio::test]
+    async fn download_file_max_size_exceeded() {
+        let body = "x".repeat(1024 * 1024 + 100);
+        let (url, handle) = spawn_http_server(&body);
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_file(
+            url,
+            Some("big.bin".into()),
+            Some(dir.path().to_str().unwrap().to_string()),
+            Some(1),
+        )
+        .await;
+        handle.join().unwrap();
+        assert!(result.contains("exceeds maximum size"));
+        assert!(!dir.path().join("big.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn download_file_max_size_unlimited() {
+        let body = "x".repeat(1024 * 1024 + 100);
+        let (url, handle) = spawn_http_server(&body);
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_file(
+            url,
+            Some("big.bin".into()),
+            Some(dir.path().to_str().unwrap().to_string()),
+            Some(0),
+        )
+        .await;
+        handle.join().unwrap();
+        assert!(result.contains("Downloaded to"));
+        assert!(std::fs::metadata(dir.path().join("big.bin")).unwrap().len() > 1024 * 1024);
     }
 
     // ── UTF-8 boundary truncation ───────────────────────────────────

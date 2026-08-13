@@ -495,6 +495,7 @@ impl WebWorker {
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
         *tools::TOOL_TIMEOUT.lock().unwrap() = config.tool_timeout;
         *tools::TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = config.tool_output_max_chars;
+        *tools::DOWNLOAD_MAX_MB.lock().unwrap() = config.download_max_mb;
         *tools::IMAGE_MAX_DIMENSION.lock().unwrap() = config.image_max_dimension;
         *tools::IMAGE_MAX_MB.lock().unwrap() = config.image_max_mb;
         *tools::IMAGE_QUALITY.lock().unwrap() = config.image_quality;
@@ -1561,6 +1562,7 @@ struct SettingsForm {
     llm_timeout: Option<String>,
     tool_timeout: Option<String>,
     tool_output_max_chars: Option<String>,
+    download_max_mb: Option<String>,
     context_keep_turns: Option<String>,
 }
 
@@ -1613,6 +1615,11 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
     if let Some(v) = &form.tool_output_max_chars {
         if let Ok(n) = v.parse::<usize>() {
             config.tool_output_max_chars = n;
+        }
+    }
+    if let Some(v) = &form.download_max_mb {
+        if let Ok(n) = v.parse::<u64>() {
+            config.download_max_mb = n;
         }
     }
     if let Some(v) = &form.context_keep_turns {
@@ -3385,6 +3392,10 @@ function submitQuestion(override) {{
         <input type="number" name="tool_output_max_chars" class="form-control" value="{tool_output_max_chars}" min="0" max="500000" step="1000">
       </div>
       <div class="mb-3">
+        <label class="form-label fw-semibold">Max Download (MB, 0=no limit)</label>
+        <input type="number" name="download_max_mb" class="form-control" value="{download_max_mb}" min="0" step="100">
+      </div>
+      <div class="mb-3">
         <label class="form-label fw-semibold">Context Keep Turns</label>
         <input type="number" name="context_keep_turns" class="form-control" value="{context_keep_turns}" min="0">
         <div class="form-text">Elide tool results older than N turns (0 = keep all)</div>
@@ -3454,6 +3465,7 @@ async function fetchModels() {{
             llm_timeout = config.llm_timeout,
             tool_timeout = config.tool_timeout,
             tool_output_max_chars = config.tool_output_max_chars,
+            download_max_mb = config.download_max_mb,
             context_keep_turns = config.context_keep_turns,
             user_agent = escape_html(&config.user_agent),
             system_message = escape_html(&config.system_message),

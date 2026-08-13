@@ -170,11 +170,13 @@ void MainWindow::applyTheme() {
 
 void MainWindow::updateLlmClient() {
     QString ua = m_config.value("user_agent").toString("PengyAgent/1.0");
-    int timeout = m_config.value("tool_timeout").toInt(60);
+    int timeout = m_config.value("tool_timeout").toInt(300);
     int outputMax = m_config.value("tool_output_max_chars").toInt(250000);
+    int downloadMax = m_config.value("download_max_mb").toInt(100);
     pengy_tool_set_user_agent(ua.toUtf8().constData());
     pengy_tool_set_timeout(timeout);
     pengy_tool_set_output_max_chars(outputMax);
+    pengy_tool_set_download_max_mb(downloadMax);
 }
 
 void MainWindow::loadChatList() {
