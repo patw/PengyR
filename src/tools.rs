@@ -207,8 +207,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         td("read_multiple_files", "Read multiple files at once, returning each with a clear header.",
             &[("paths", "array", "List of file paths to read")],
             &["paths"]),
-        td("search_content", "Search for a regex pattern in files under a directory. Returns matching lines with file path, line number, and optional surrounding context.",
-            &[("pattern", "string", "The regex pattern to search for"),
+        td("search_content", "Search for text in files under a directory. Returns matching lines with file path, line number, and optional surrounding context. The pattern is matched literally by default — regex metacharacters are escaped automatically; set regex=true to interpret it as a regular expression. Skips binary files and common noise directories.",
+            &[("pattern", "string", "The text to search for. Matched literally by default — metacharacters like '.', '*', '(', '[' are escaped automatically. Set regex=true to interpret it as a regular expression instead."),
+              ("regex", "boolean", "Treat pattern as a regular expression instead of a literal string (default: false)"),
               ("path", "string", "The directory or file to search in"),
               ("file_glob", "string", "Optional glob to filter files"),
               ("context_lines", "integer", "Number of lines of context (default: 0)"),
@@ -459,6 +460,7 @@ async fn execute_tool_inner(
                 aopt(arguments, "file_glob"),
                 aus(arguments, "context_lines", 0),
                 aus(arguments, "max_results", 50),
+                abool(arguments, "regex", false),
             )
             .await
         }
@@ -2482,18 +2484,23 @@ async fn search_content(
     file_glob: Option<String>,
     context_lines: usize,
     max_results: usize,
+    regex: bool,
 ) -> String {
     let root = expand_home(&path);
     if !root.exists() {
         return format!("Error: Path not found: {path}");
     }
 
-    let compiled = match Regex::new(&pattern) {
-        Ok(r) => r,
-        Err(_) => match Regex::new(&regex::escape(&pattern)) {
+    // Literal by default so metacharacters in code symbols (".", "(", "[", "*",
+    // ...) don't silently become regex syntax; regex=true opts into regex.
+    let compiled = if regex {
+        match Regex::new(&pattern) {
             Ok(r) => r,
             Err(e) => return format!("Error: Invalid regex pattern: {e}"),
-        },
+        }
+    } else {
+        // regex::escape always yields a valid pattern.
+        Regex::new(&regex::escape(&pattern)).expect("escaped pattern is always valid")
     };
 
     let context_lines = context_lines.min(10);
@@ -3537,6 +3544,7 @@ mod tests {
             None,
             0,
             50,
+            false,
         )
         .await;
         assert!(result.contains("println"));
@@ -3552,6 +3560,7 @@ mod tests {
             None,
             0,
             50,
+            false,
         )
         .await;
         assert!(result.contains("No matches"));
@@ -3565,9 +3574,42 @@ mod tests {
             None,
             0,
             50,
+            false,
         )
         .await;
         assert!(result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn search_content_literal_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("search.rs");
+        std::fs::write(&file_path, "value = 'a.b'\nvalue2 = 'axb'\n").unwrap();
+
+        // Default: literal match — "a.b" must not match "axb".
+        let literal = search_content(
+            "a.b".into(),
+            file_path.to_str().unwrap().into(),
+            None,
+            0,
+            50,
+            false,
+        )
+        .await;
+        assert!(literal.contains("a.b"));
+        assert!(!literal.contains("axb"));
+
+        // regex=true: '.' is a wildcard, so it should match "axb" too.
+        let regex = search_content(
+            "a.b".into(),
+            file_path.to_str().unwrap().into(),
+            None,
+            0,
+            50,
+            true,
+        )
+        .await;
+        assert!(regex.contains("axb"));
     }
 
     #[tokio::test]
