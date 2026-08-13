@@ -164,7 +164,7 @@ pub fn tool_definitions_json() -> serde_json::Value {
 
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
-        td("read_file", "Read the contents of a text file. Returns the whole file by default; pass offset and limit to read one line range instead, which is how to page through a file too large to return at once. Use read_image for images — this tool cannot decode binary data.",
+        td("read_file", "Read the contents of a text file. Returns the whole file by default; very large files are truncated to the output limit, with a header telling you how to continue with offset/limit. Pass offset and limit to read one line range instead, which is how to page through a file too large to return at once. Use read_image for images — this tool cannot decode binary data.",
             &[("path", "string", "The file path to read"),
               ("offset", "integer", "1-based line number to start reading from. Omit to start at the beginning."),
               ("limit", "integer", "Maximum number of lines to return, counting from offset. Omit to read to the end of the file.")],
@@ -176,47 +176,49 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("path", "string", "The file path to write to"),
               ("content", "string", "The content to write to the file")],
             &["path", "content"]),
-        td("replace_in_file", "Perform an exact string replacement in an existing file. The old_str must match exactly one occurrence — if zero or multiple matches are found, the edit is rejected.",
+        td("replace_in_file", "Perform an exact string replacement in an existing file. The old_str must match exactly one occurrence in the file — if zero or multiple matches are found, the edit is rejected with a clear error. This is the preferred way to make targeted edits instead of rewriting an entire file.",
             &[("path", "string", "The file path to edit"),
-              ("old_str", "string", "The exact text to find and replace. Must match exactly one location."),
+              ("old_str", "string", "The exact text to find and replace. Must match exactly one location in the file, including whitespace and indentation."),
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. sudo is supported and prompts the user for their password separately. Commands are killed once the configured tool timeout elapses.",
-            &[("command", "string", "The bash command to execute")],
+        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). sudo is supported and prompts the user for their password separately. Commands are killed once the configured tool timeout elapses.",
+            &[("command", "string", "The bash command to execute"),
+              ("cwd", "string", "Optional working directory to run the command in")],
             &["command"]),
         td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
             &[("query", "string", "The search query"),
               ("max_results", "integer", "Maximum number of results to return (default: 5)")],
             &["query"]),
-        td("download_file", "Download a file from a URL to the user's Downloads directory",
+        td("download_file", "Download a file from a URL to the user's Downloads directory. Existing files of the same name are overwritten; downloads larger than 100 MB are rejected.",
             &[("url", "string", "The URL of the file to download"),
-              ("filename", "string", "Optional filename to save as")],
+              ("filename", "string", "Optional filename to save as; defaults to the name from the URL")],
             &["url"]),
-        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers.",
+        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers. Very large responses are truncated; a notice is appended when truncation occurs.",
             &[("url", "string", "The URL to fetch")],
             &["url"]),
-        td("run_python", "Execute Python code in a fresh subprocess. Nothing persists between calls — variables, imports and state from an earlier call are gone, so each call must stand on its own. Only what you print() comes back; a bare expression returns nothing.",
-            &[("code", "string", "The Python code to execute")],
+        td("run_python", "Execute Python code in a fresh subprocess. Nothing persists between calls — variables, imports and state from an earlier call are gone, so each call must stand on its own. Only what you print() comes back; a bare expression returns nothing. Set cwd to run in a specific working directory. The process is killed once the configured tool timeout elapses.",
+            &[("code", "string", "The Python code to execute"),
+              ("cwd", "string", "Optional working directory to run the code in")],
             &["code"]),
-        td("directory_tree", "Show a visual tree of the directory structure. Skips common noise directories like .git, node_modules, __pycache__ by default.",
+        td("directory_tree", "Show a visual tree of the directory structure, useful for understanding project layout quickly. Skips common noise directories like .git, node_modules, __pycache__ by default.",
             &[("path", "string", "The directory path to show the tree for"),
               ("max_depth", "integer", "Maximum depth to recurse (default: 3)"),
               ("show_hidden", "boolean", "Whether to show hidden files/directories (default: false)")],
             &["path"]),
-        td("read_multiple_files", "Read multiple files at once, returning each with a clear header.",
+        td("read_multiple_files", "Read multiple files at once, returning each with a clear header. Use this when you know you need to inspect several files to reduce round-trips.",
             &[("paths", "array", "List of file paths to read")],
             &["paths"]),
         td("search_content", "Search for text in files under a directory. Returns matching lines with file path, line number, and optional surrounding context. The pattern is matched literally by default — regex metacharacters are escaped automatically; set regex=true to interpret it as a regular expression. Skips binary files and common noise directories.",
             &[("pattern", "string", "The text to search for. Matched literally by default — metacharacters like '.', '*', '(', '[' are escaped automatically. Set regex=true to interpret it as a regular expression instead."),
               ("regex", "boolean", "Treat pattern as a regular expression instead of a literal string (default: false)"),
               ("path", "string", "The directory or file to search in"),
-              ("file_glob", "string", "Optional glob to filter files"),
+              ("file_glob", "string", "Optional glob to filter files, e.g. '*.py' or '*.{js,ts}'. Defaults to all text files."),
               ("context_lines", "integer", "Number of lines of context (default: 0)"),
               ("max_results", "integer", "Maximum number of matches to return (default: 50)")],
             &["pattern", "path"]),
-        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search. Noise directories are always skipped: .git, node_modules, __pycache__, .venv/venv, build, dist and target. Prefer this over run_bash('find ...') or run_bash('ls ...').",
-            &[("pattern", "string", "The glob pattern to match against file paths"),
+        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search (e.g. 'src/**/*.py'). Noise directories are always skipped: .git, node_modules, __pycache__, .venv/venv, build, dist and target. Prefer this over run_bash('find ...') or run_bash('ls ...'). Results are capped at 200 paths.",
+            &[("pattern", "string", "The glob pattern to match against file paths. Supports ** for recursive matching, * for any characters, ? for single character."),
               ("path", "string", "The directory to search in (default: current working directory)")],
             &["pattern"]),
         todowrite_definition(),
@@ -227,7 +229,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
 fn apply_changes_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "apply_changes".into(),
-        description: "Apply bounded transactional exact-text edits across files. Validate all operations in memory first; if any operation fails, no files are changed. Use dry_run to preview the unified diff.".into(),
+        description: "Apply a bounded, transactional set of exact-text edits across files. Every operation is validated in memory before anything is written — if validation fails, nothing is changed. Use dry_run=true to preview the unified diff before writing. Limits: at most 20 files, 100 operations total, and ~1 MB of content.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
@@ -280,7 +282,7 @@ fn apply_changes_definition() -> ToolDef {
 fn todowrite_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "todowrite".into(),
-        description: "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time — do not send incremental updates. Exactly one task must be in_progress at any time. Mark tasks completed immediately after finishing them. Use imperative forms for content (e.g. 'Run tests', 'Add JWT middleware').".into(),
+        description: "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time — do not send incremental updates. At most one task must be in_progress at any time — it is fine to have none. Mark tasks completed immediately after finishing them. Use imperative forms for content (e.g. 'Run tests', 'Add JWT middleware').".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
@@ -291,7 +293,7 @@ fn todowrite_definition() -> ToolDef {
                         "type": "object",
                         "properties": {
                             "content": {"type": "string", "description": "Imperative task description, e.g. 'Run the tests'"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current task status — exactly one task must be in_progress"}
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current task status — at most one task should be in_progress"}
                         },
                         "required": ["content", "status"]
                     }
@@ -305,7 +307,7 @@ fn todowrite_definition() -> ToolDef {
 fn ask_user_question_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "ask_user_question".into(),
-        description: "Ask the user one or more multiple-choice questions to clarify requirements or resolve ambiguity.".into(),
+        description: "Ask the user one or more multiple-choice questions to clarify requirements, gather preferences, or resolve ambiguity. Use this when instructions are vague, multiple valid approaches exist, or you need a decision before proceeding. Each question includes a header, the question text, and a list of options with descriptions.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
@@ -424,7 +426,7 @@ async fn execute_tool_inner(
             ).await
         }
         "apply_changes" => apply_changes(arguments).await,
-        "run_bash" => run_bash(a(arguments, "command", ""), ctx.clone()).await,
+        "run_bash" => run_bash(a(arguments, "command", ""), aopt(arguments, "cwd"), ctx.clone()).await,
         "web_search" => {
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
         }
@@ -432,7 +434,7 @@ async fn execute_tool_inner(
             download_file(a(arguments, "url", ""), aopt(arguments, "filename")).await
         }
         "fetch_url" => fetch_url(a(arguments, "url", "")).await,
-        "run_python" => run_python(a(arguments, "code", ""), ctx.clone()).await,
+        "run_python" => run_python(a(arguments, "code", ""), aopt(arguments, "cwd"), ctx.clone()).await,
         "directory_tree" => {
             directory_tree(
                 a(arguments, "path", ""),
@@ -1126,8 +1128,26 @@ impl Drop for AskpassHelper {
     }
 }
 
-async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
+fn resolve_cwd(cwd: &Option<String>) -> Result<Option<PathBuf>, String> {
+    match cwd {
+        None => Ok(None),
+        Some(s) => {
+            let p = expand_home(s);
+            if !p.is_dir() {
+                Err(format!("Error: cwd not found or not a directory: {s}"))
+            } else {
+                Ok(Some(p))
+            }
+        }
+    }
+}
+
+async fn run_bash(command: String, cwd: Option<String>, ctx: Arc<ToolContext>) -> String {
     let timeout = timeout_secs();
+    let run_cwd = match resolve_cwd(&cwd) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
 
     let password_needed = SUDO_WORD_RE.is_match(&command);
     if password_needed {
@@ -1180,6 +1200,9 @@ async fn run_bash(command: String, ctx: Arc<ToolContext>) -> String {
     // The command never inherits our stdin: the password goes via askpass, and
     // a child reading the terminal would hang the GUI/CLI.
     cmd.stdin(Stdio::null());
+    if let Some(dir) = &run_cwd {
+        cmd.current_dir(dir);
+    }
     if let Some(ref helper) = askpass {
         cmd.env("SUDO_ASKPASS", &helper.path);
         if let Some(ref pw) = *ctx.cached_sudo_password.lock().unwrap() {
@@ -2145,8 +2168,12 @@ async fn fetch_url(url_str: String) -> String {
     }
 }
 
-async fn run_python(code: String, ctx: Arc<ToolContext>) -> String {
+async fn run_python(code: String, cwd: Option<String>, ctx: Arc<ToolContext>) -> String {
     let timeout = timeout_secs();
+    let run_cwd = match resolve_cwd(&cwd) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let mut tmp = std::env::temp_dir();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2169,6 +2196,9 @@ async fn run_python(code: String, ctx: Arc<ToolContext>) -> String {
     cmd.arg(&tmp)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    if let Some(dir) = &run_cwd {
+        cmd.current_dir(dir);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -3033,6 +3063,7 @@ mod tests {
         *TOOL_TIMEOUT.lock().unwrap() = 1;
         let result = run_python(
             "import time; time.sleep(5)".into(),
+            None,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3045,9 +3076,45 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result = run_bash("sleep 5".into(), Arc::new(ToolContext::new())).await;
+        let result = run_bash("sleep 5".into(), None, Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Command timed out after 1 seconds"));
+    }
+
+    #[tokio::test]
+    async fn run_bash_respects_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_bash(
+            "touch marker.txt && ls".into(),
+            Some(dir.path().to_str().unwrap().to_string()),
+            Arc::new(ToolContext::new()),
+        )
+        .await;
+        assert!(result.contains("marker.txt"));
+        assert!(dir.path().join("marker.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn run_bash_invalid_cwd() {
+        let result = run_bash(
+            "pwd".into(),
+            Some("/nonexistent_dir_xyz".into()),
+            Arc::new(ToolContext::new()),
+        )
+        .await;
+        assert!(result.contains("cwd not found"));
+    }
+
+    #[tokio::test]
+    async fn run_python_respects_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        run_python(
+            "open('marker.txt','w').write('x')".into(),
+            Some(dir.path().to_str().unwrap().to_string()),
+            Arc::new(ToolContext::new()),
+        )
+        .await;
+        assert!(dir.path().join("marker.txt").exists());
     }
 
     #[tokio::test]
@@ -3133,7 +3200,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         // A context with no provider must refuse sudo regardless of any other.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("sudo true".into(), ctx).await;
+        let result = run_bash("sudo true".into(), None, ctx).await;
         assert!(result.contains("no password provider"));
     }
 
@@ -3174,7 +3241,7 @@ mod tests {
             "sudo echo hi < /dev/null",
             "sudo -S echo hi",
         ] {
-            let result = run_bash(command.into(), ctx.clone()).await;
+            let result = run_bash(command.into(), None, ctx.clone()).await;
             assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
             assert!(!result.contains("no tty present"), "{command:?} -> {result:?}");
         }
