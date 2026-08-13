@@ -468,6 +468,7 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
   "llm_timeout": 300,
   "tool_timeout": 300,
   "tool_output_max_chars": 250000,
+  "download_max_mb": 100,
   "image_max_dimension": 4096,
   "image_max_mb": 4.5,
   "image_quality": 85
@@ -491,6 +492,7 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `llm_timeout` | int | `300` | HTTP timeout in seconds for each LLM API request |
 | `tool_timeout` | int | `300` | Timeout in seconds for tool execution (-1 = no timeout) |
 | `tool_output_max_chars` | int | `250000` | Tool output longer than this is snipped head+tail. 0 = no limit |
+| `download_max_mb` | int | `100` | Default maximum download size for `download_file` in MB. Per-call `max_size_mb` overrides it; `0` = no limit |
 | `image_max_dimension` | int | `4096` | Attached images are downscaled so neither side exceeds this (px) |
 | `image_max_mb` | float | `4.5` | Attached images are re-encoded until under this size (MB) |
 | `image_quality` | int | `85` | JPEG quality (0–100) used when re-encoding attached images |
@@ -519,17 +521,17 @@ All 15 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | Tool | Read-only | Description |
 |------|:---:|-------------|
 | `read_file` | ✅ | Read a local file. Expands `~`. |
-| `read_multiple_files` | ✅ | Read up to 20 files at once, each under a clear header. |
+| `read_multiple_files` | ✅ | Read up to 20 files at once; per-file budget follows `tool_output_max_chars`, with a 5× total batch budget. |
 | `write_file` | ❌ | Write content to a file (creates parent dirs). |
 | `replace_in_file` | ❌ | Exact string replacement; must match exactly once. |
 | `apply_changes` | ❌ | Transactional multi-file exact-text edits; all-or-nothing, `dry_run` diff preview. |
-| `run_bash` | ❌ | Execute a bash command (sudo via `SUDO_ASKPASS` with cached password). |
-| `run_python` | ❌ | Write code to temp file and execute with `python3`. |
+| `run_bash` | ❌ | Execute a bash command (optional `cwd`; sudo via `SUDO_ASKPASS` with cached password). |
+| `run_python` | ❌ | Write code to temp file and execute with `python3` (optional `cwd`). |
 | `web_search` | ✅ | DuckDuckGo search via `primp` (browser-impersonating HTTP, 5s timeout). |
-| `download_file` | ❌ | Download file to `~/Downloads/`. |
-| `fetch_url` | ✅ | Fetch URL text content (strips HTML, 50K char limit). |
+| `download_file` | ❌ | Stream a file to a configurable directory (default `~/Downloads/`) with configurable size limits. |
+| `fetch_url` | ✅ | Fetch URL text content (strips HTML; global output limit with optional `max_chars`). |
 | `directory_tree` | ✅ | Visual directory tree (Unicode box-drawing, 500 entry cap). |
-| `search_content` | ✅ | Regex search in files with context lines and region grouping. |
+| `search_content` | ✅ | Literal text search by default, or regex when `regex=true`, with context lines and region grouping. |
 | `glob` | ✅ | Find files by glob pattern (`**/*.py`); respects skip dirs (`.git`, `node_modules`, etc.). |
 | `todowrite` | ✅ | Structured task list (`[ ]`/`[→]`/`[✓]`) for tracking complex multi-step operations. |
 | `ask_user_question` | — | Ask the user clarifying multiple-choice questions. Handled by the harness, never reaches `execute_tool`. |
