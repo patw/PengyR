@@ -194,8 +194,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             &[("url", "string", "The URL of the file to download"),
               ("filename", "string", "Optional filename to save as; defaults to the name from the URL")],
             &["url"]),
-        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers. Very large responses are truncated; a notice is appended when truncation occurs.",
-            &[("url", "string", "The URL to fetch")],
+        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers. Large responses are truncated to the configured tool output limit; pass max_chars to return more (0 = no limit).",
+            &[("url", "string", "The URL to fetch"),
+              ("max_chars", "integer", "Maximum characters to return. Defaults to the configured tool output limit; 0 returns everything (up to the 2 MB response cap).")],
             &["url"]),
         td("run_python", "Execute Python code in a fresh subprocess. Nothing persists between calls — variables, imports and state from an earlier call are gone, so each call must stand on its own. Only what you print() comes back; a bare expression returns nothing. Set cwd to run in a specific working directory. The process is killed once the configured tool timeout elapses.",
             &[("code", "string", "The Python code to execute"),
@@ -433,7 +434,7 @@ async fn execute_tool_inner(
         "download_file" => {
             download_file(a(arguments, "url", ""), aopt(arguments, "filename")).await
         }
-        "fetch_url" => fetch_url(a(arguments, "url", "")).await,
+        "fetch_url" => fetch_url(a(arguments, "url", ""), aopt_usize(arguments, "max_chars")).await,
         "run_python" => run_python(a(arguments, "code", ""), aopt(arguments, "cwd"), ctx.clone()).await,
         "directory_tree" => {
             directory_tree(
@@ -2088,7 +2089,7 @@ async fn download_file(url: String, filename: Option<String>) -> String {
     format!("Downloaded to {} ({total} bytes)", dest.display())
 }
 
-async fn fetch_url(url_str: String) -> String {
+async fn fetch_url(url_str: String, max_chars: Option<usize>) -> String {
     let parsed = match url::Url::parse(&url_str) {
         Ok(u) => u,
         Err(e) => return format!("Error: Invalid URL: {e}"),
@@ -2158,10 +2159,13 @@ async fn fetch_url(url_str: String) -> String {
         text
     };
 
-    if text.len() > 250_000 {
+    let budget = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+    let limit = max_chars.unwrap_or(budget);
+    if limit > 0 && text.len() > limit {
         format!(
-            "{}\n\n[... truncated at 250,000 characters ...]",
-            truncate_on_char_boundary(&text, 250_000)
+            "{}\n\n[... truncated at {} characters — pass max_chars to adjust ...]",
+            truncate_on_char_boundary(&text, limit),
+            limit
         )
     } else {
         text
@@ -2423,8 +2427,6 @@ fn format_size(size: u64) -> String {
 
 async fn read_multiple_files(paths: Vec<String>) -> String {
     const MAX_FILES: usize = 20;
-    const MAX_PER_FILE: usize = 250_000;
-    const MAX_TOTAL: usize = 1_250_000; // 5× the global tool output limit
 
     if paths.is_empty() {
         return "Error: no paths provided.".into();
@@ -2435,6 +2437,13 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
             paths.len()
         );
     }
+
+    // Derive per-file and total budgets from the tool output limit so the
+    // single "max tool output" setting governs how much context a batch can
+    // consume.  0 means "no limit".
+    let budget = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+    let per_file = budget;
+    let total = if budget > 0 { budget * 5 } else { 0 };
 
     let mut parts: Vec<String> = Vec::new();
     let mut total_chars = 0;
@@ -2468,7 +2477,7 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
         // Same head-truncation and line-range reporting as read_file, so the
         // model can follow up with read_file(offset=...) on whichever file was cut.
         let total_lines = content.matches('\n').count() + 1;
-        let (kept_text, kept, truncated) = truncate_head_lines(&content, Some(MAX_PER_FILE));
+        let (kept_text, kept, truncated) = truncate_head_lines(&content, Some(per_file));
         let content = if truncated {
             format!(
                 "{kept_text}\n\n[... showed lines 1-{kept} of {total_lines} — \
@@ -2480,8 +2489,8 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
         };
 
         let block = format!("{header}\n{content}");
-        if total_chars + block.len() > MAX_TOTAL {
-            let remaining = MAX_TOTAL - total_chars;
+        if total > 0 && total_chars + block.len() > total {
+            let remaining = total - total_chars;
             if remaining > 200 {
                 let short_block = format!(
                     "{header}\n{}...",
@@ -2856,6 +2865,14 @@ mod tests {
 
     fn test_tool_timeout_guard() -> std::sync::MutexGuard<'static, ()> {
         TEST_TOOL_TIMEOUT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    static TEST_TOOL_OUTPUT_LOCK: Lazy<TestMutex<()>> = Lazy::new(|| TestMutex::new(()));
+
+    fn test_tool_output_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_TOOL_OUTPUT_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -3708,6 +3725,72 @@ mod tests {
         assert!(result.contains("too many"));
     }
 
+    #[tokio::test]
+    async fn read_multiple_files_limits_follow_output_limit() {
+        let _guard = test_tool_output_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.txt");
+        let body: String = (1..=2000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&p, &body).unwrap();
+
+        let old = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 1000;
+        let result = read_multiple_files(vec![p.to_str().unwrap().into()]).await;
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = old;
+
+        assert!(result.contains("showed lines 1-"));
+        assert!(result.contains("read_file with offset="));
+    }
+
+    fn spawn_http_server(body: &str) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_bytes = body.as_bytes().to_vec();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body_bytes.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body_bytes);
+            }
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    #[tokio::test]
+    async fn fetch_url_truncates_to_output_limit() {
+        let _guard = test_tool_output_guard();
+        let (url, handle) = spawn_http_server(&"x".repeat(5000));
+        let old = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 1000;
+        let result = fetch_url(url, None).await;
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = old;
+        handle.join().unwrap();
+        assert!(result.contains("truncated at 1000"));
+        assert!(result.len() < 5000);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_max_chars_override() {
+        let _guard = test_tool_output_guard();
+        let (url, handle) = spawn_http_server(&"x".repeat(5000));
+        let old = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = 1000;
+        let result = fetch_url(url, Some(0)).await;
+        *TOOL_OUTPUT_MAX_CHARS.lock().unwrap() = old;
+        handle.join().unwrap();
+        assert!(!result.contains("truncated"));
+        assert!(result.len() >= 5000);
+    }
+
     // ── UTF-8 boundary truncation ───────────────────────────────────
 
     #[test]
@@ -3772,6 +3855,7 @@ mod tests {
     /// Python's test_read_file_truncates_from_head_with_continuation.
     #[tokio::test]
     async fn read_file_truncates_from_head_with_continuation() {
+        let _guard = test_tool_output_guard();
         let _guard = test_tool_timeout_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.txt");
@@ -3822,6 +3906,7 @@ mod tests {
     /// the error that matters is usually at the end.
     #[test]
     fn command_output_stays_tail_biased() {
+        let _guard = test_tool_output_guard();
         let _guard = test_tool_timeout_guard();
         let text: String = (1..=5000)
             .map(|i| format!("line {i}"))
@@ -3841,6 +3926,7 @@ mod tests {
     /// source code is a fragment the model may try to "fix".
     #[test]
     fn truncation_never_splits_a_line() {
+        let _guard = test_tool_output_guard();
         let _guard = test_tool_timeout_guard();
         let text: String = (1..=5000)
             .map(|i| format!("line {i}"))
