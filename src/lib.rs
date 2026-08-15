@@ -8,6 +8,7 @@ pub mod chat_manager;
 pub mod config;
 pub mod image_utils;
 pub mod llm_client;
+pub mod model_cache;
 pub mod task_manager;
 pub mod tools;
 
@@ -60,6 +61,27 @@ pub extern "C" fn pengy_config_save(json: *const c_char) -> bool {
 #[no_mangle]
 pub extern "C" fn pengy_config_render(template: *const c_char) -> *mut c_char {
     to_c(&config::render_system_message(&unsafe { cstr(template) }))
+}
+
+// ── Model cache ──────────────────────────────────────────────────
+
+/// Return the cached model list for *base_url* as a JSON array string.
+/// Empty array `[]` if there is no cache or the endpoint does not match.
+#[no_mangle]
+pub extern "C" fn pengy_models_cached_for(base_url: *const c_char) -> *mut c_char {
+    let models = model_cache::cached_models_for(&unsafe { cstr(base_url) });
+    to_c(&serde_json::to_string(&models).unwrap_or_default())
+}
+
+/// Persist *models_json* (a JSON array of strings) as the cache for *base_url*.
+#[no_mangle]
+pub extern "C" fn pengy_models_cache_save(
+    base_url: *const c_char,
+    models_json: *const c_char,
+) -> bool {
+    let models: Vec<String> =
+        serde_json::from_str(&unsafe { cstr(models_json) }).unwrap_or_default();
+    model_cache::save_model_cache(&unsafe { cstr(base_url) }, &models).is_ok()
 }
 
 // ── Chats ─────────────────────────────────────────────────────────

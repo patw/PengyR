@@ -18,6 +18,9 @@ pub struct Chat {
     pub title: String,
     pub messages: Vec<ChatMessage>,
     pub created_at: String,
+    /// Per-tab model override. `None` means "follow the global default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// A message in a chat (OpenAI-compatible format).
@@ -85,6 +88,7 @@ impl Chat {
             title: title.to_string(),
             messages: Vec::new(),
             created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            model: None,
         }
     }
 }
@@ -687,6 +691,24 @@ mod tests {
         assert_eq!(chat2.id, chat.id);
         assert_eq!(chat2.title, "Test");
         assert_eq!(chat2.messages.len(), 2);
+    }
+
+    #[test]
+    fn chat_model_override_is_optional_and_round_trips() {
+        // Default: no override, and the field is omitted from JSON.
+        let chat = Chat::new("Test");
+        assert_eq!(chat.model, None);
+        assert!(!serde_json::to_string(&chat).unwrap().contains("\"model\""));
+
+        // With an override: round-trips, and an old chat without the field
+        // deserialises to None (backwards compatible).
+        let mut chat2 = Chat::new("Test");
+        chat2.model = Some("deepseek-chat".into());
+        let json = serde_json::to_string(&chat2).unwrap();
+        assert_eq!(serde_json::from_str::<Chat>(&json).unwrap().model, Some("deepseek-chat".into()));
+
+        let legacy = r#"{"id":"x","title":"old","messages":[],"created_at":"2026-01-01T00:00:00"}"#;
+        assert_eq!(serde_json::from_str::<Chat>(legacy).unwrap().model, None);
     }
 
     #[test]

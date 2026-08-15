@@ -108,6 +108,22 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     QString currentModel = config["model"].toString("gpt-4o");
     m_model->addItem(currentModel);
     m_model->setCurrentText(currentModel);
+    // Pre-populate from the persistent model cache (possibly stale, but populated).
+    {
+        QByteArray cachedBase = config["base_url"].toString("https://api.openai.com/v1").toUtf8();
+        char* cachedRaw = pengy_models_cached_for(cachedBase.constData());
+        QJsonArray cachedArr = QJsonDocument::fromJson(QByteArray(cachedRaw)).array();
+        pengy_free(cachedRaw);
+        QStringList cachedModels;
+        for (const QJsonValue& v : cachedArr) {
+            QString id = v.toString();
+            if (!id.isEmpty() && id != currentModel) cachedModels << id;
+        }
+        if (!cachedModels.isEmpty()) {
+            m_model->addItems(cachedModels);
+            m_model->setCurrentText(currentModel);
+        }
+    }
     m_model->setToolTip("Model name sent in chat completion requests. Use Fetch to list available models from the endpoint.");
     modelRow->addWidget(m_model, 1);
 
@@ -280,6 +296,11 @@ void SettingsDialog::fetchModels() {
                 if (!id.isEmpty()) modelIds << id;
             }
             modelIds.sort();
+
+            // Persist so the dropdown stays populated across sessions.
+            QByteArray modelsJson = QJsonDocument(QJsonArray::fromStringList(modelIds))
+                                        .toJson(QJsonDocument::Compact);
+            pengy_models_cache_save(baseUrl.toUtf8().constData(), modelsJson.constData());
 
             QMetaObject::invokeMethod(model, [model, btn, modelIds, self]() {
                 btn->setEnabled(true);

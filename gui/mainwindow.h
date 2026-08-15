@@ -51,6 +51,7 @@ private slots:
     void onWorkerError(const QString& msg);
     void stopWorker();
     void pollToolConfirmation();
+    void onModelChanged(const QString& model);
 
 private:
     // ── UI setup ──────────────────────────────────────────────────
@@ -58,6 +59,8 @@ private:
     void applyTheme();
     void updateLlmClient();
     void loadChatList();
+    void refreshModelCombo();
+    QString modelForSession(TabSession* session) const;
 
     // ── Tab management ────────────────────────────────────────────
     TabSession* addTab(const QJsonObject& chat, bool switchTo = true);

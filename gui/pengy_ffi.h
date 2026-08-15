@@ -7,6 +7,9 @@ extern "C" {
     char* pengy_config_render(const char* template_str);
     void  pengy_config_set_dir(const char* path);
 
+    char* pengy_models_cached_for(const char* base_url);
+    bool  pengy_models_cache_save(const char* base_url, const char* models_json);
+
     char* pengy_chats_load();
     char* pengy_chat_index_load();
     char* pengy_chat_create(const char* title);

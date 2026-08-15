@@ -437,6 +437,7 @@ impl PengyCli {
                     reasoning_details: None,
                 }],
                 created_at: chrono_now(),
+                model: None,
             };
             self.current_chat = Some(chat);
         } else {

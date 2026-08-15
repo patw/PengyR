@@ -43,6 +43,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     applyTheme();
     updateLlmClient();
     loadChatList();
+    refreshModelCombo();
 
     // Poll for sudo password requests from any tab's worker
     m_confirmTimer = new QTimer(this);
@@ -92,6 +93,7 @@ void MainWindow::setupUi() {
     connect(m_chatHistory, &ChatHistoryWidget::settingsRequested, this, &MainWindow::openSettings);
     connect(m_chatHistory, &ChatHistoryWidget::tasksRequested, this, &MainWindow::openTasks);
     connect(m_chatHistory, &ChatHistoryWidget::deleteRequested, this, &MainWindow::deleteChat);
+    connect(m_chatHistory, &ChatHistoryWidget::modelChanged, this, &MainWindow::onModelChanged);
     leftSplitter->addWidget(m_chatHistory);
 
     // Right pane: tab widget + input row
@@ -177,6 +179,46 @@ void MainWindow::updateLlmClient() {
     pengy_tool_set_timeout(timeout);
     pengy_tool_set_output_max_chars(outputMax);
     pengy_tool_set_download_max_mb(downloadMax);
+}
+
+void MainWindow::refreshModelCombo() {
+    QByteArray baseUrl = m_config["base_url"].toString().toUtf8();
+    char* raw = pengy_models_cached_for(baseUrl.constData());
+    QJsonArray arr = QJsonDocument::fromJson(QByteArray(raw)).array();
+    pengy_free(raw);
+
+    QStringList models;
+    for (const QJsonValue& v : arr) {
+        QString id = v.toString();
+        if (!id.isEmpty()) models << id;
+    }
+
+    TabSession* session = tabForChat(m_activeChatId);
+    QString current = session ? modelForSession(session)
+                              : m_config["model"].toString("gpt-4o");
+    m_chatHistory->setModels(models, current);
+}
+
+QString MainWindow::modelForSession(TabSession* session) const {
+    if (session) {
+        QString overrideModel = session->chat["model"].toString();
+        if (!overrideModel.isEmpty())
+            return overrideModel;
+    }
+    return m_config["model"].toString("gpt-4o");
+}
+
+void MainWindow::onModelChanged(const QString& model) {
+    QString m = model.trimmed();
+    TabSession* session = tabForChat(m_activeChatId);
+    if (!session || m.isEmpty())
+        return;
+    if (session->chat["model"].toString() == m)
+        return;
+    session->chat["model"] = m;
+    QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+    pengy_chat_save(json.constData());
+    updateQuickSettingsFor(session);
 }
 
 void MainWindow::loadChatList() {
@@ -490,6 +532,7 @@ void MainWindow::openSettings() {
         applyTheme();
         updateLlmClient();
         loadChatList();
+        refreshModelCombo();
         if (!m_activeChatId.isEmpty())
             m_chatHistory->selectChatById(m_activeChatId);
         TabSession* session = tabForChat(m_activeChatId);
@@ -638,7 +681,7 @@ void MainWindow::processResponse(TabSession* session, const QJsonArray& apiMessa
 
     QString baseUrl = m_config["base_url"].toString();
     QString apiKey = m_config["api_key"].toString();
-    QString model = m_config["model"].toString();
+    QString model = modelForSession(session);
     QString tc = m_config["tool_confirmation"].toString("none");
     QString re = m_config["reasoning_effort"].toString("");
     bool preserveReasoning = m_config["preserve_reasoning"].toBool(false);
@@ -1094,7 +1137,7 @@ void MainWindow::pollToolConfirmation() {
 
 void MainWindow::updateQuickSettingsFor(TabSession* session) {
     m_chatHistory->updateQuickSettings(
-        m_config["model"].toString("gpt-4o"),
+        modelForSession(session),
         m_config["tool_confirmation"].toString("none"));
 
     if (session->promptTokens || session->completionTokens)
