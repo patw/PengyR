@@ -576,6 +576,7 @@ impl WebWorker {
                     Some(LlmEvent::AssistantToolCalls { message }) => {
                         yolo_this_turn = false;
                         chat.messages.push(message);
+                        chat_manager::save_chat_progress(&mut chat).ok();
                     }
                     Some(LlmEvent::Retrying {
                         attempt,
@@ -658,6 +659,7 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         });
+                        chat_manager::save_chat_progress(&mut chat).ok();
                         push_event(SseEvent::ToolResult {
                             tool_call_id: tool_call_id.clone(),
                             safe_id: safe_id(&tool_call_id),
@@ -697,6 +699,19 @@ impl WebWorker {
                         name: _name,
                         content,
                     }) => {
+                        // The generator already has this on its own message
+                        // list; persist it too, or the assistant tool_calls
+                        // message above is left dangling in chat history.
+                        chat.messages.push(ChatMessage {
+                            role: "tool".into(),
+                            content: Some(serde_json::Value::String(content.clone())),
+                            tool_calls: vec![],
+                            tool_call_id: Some(tool_call_id.clone()),
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
+                        });
+                        chat_manager::save_chat_progress(&mut chat).ok();
                         push_event(SseEvent::QuestionResult {
                             tool_call_id,
                             content,
@@ -720,7 +735,7 @@ impl WebWorker {
                             html: render_markdown(&content),
                             usage,
                         });
-                        chat_manager::save_chat(&chat).ok();
+                        chat_manager::save_chat_progress(&mut chat).ok();
                         done.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -728,12 +743,18 @@ impl WebWorker {
                         push_event(SseEvent::Error {
                             message: "Chat ended unexpectedly".into(),
                         });
-                        chat_manager::save_chat(&chat).ok();
                         done.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
             }
+
+            // Cancel and errors both leave the loop mid-turn, where the last
+            // assistant message can hold tool_calls with no result behind them
+            // (the API 400s on that next request).  Repair, then persist what
+            // the turn got through.
+            chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
+            chat_manager::save_chat_progress(&mut chat).ok();
 
             tool_ctx.set_sudo_provider(None);
         });

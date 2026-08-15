@@ -512,6 +512,7 @@ impl PengyCli {
                     expecting_api = false;
                     self.yolo_this_turn = false;
                     self.current_chat.as_mut().unwrap().messages.push(message);
+                    self.save_progress();
                 }
                 Some(LlmEvent::Retrying {
                     attempt,
@@ -643,8 +644,28 @@ impl PengyCli {
                         });
                     }
                 }
-                Some(LlmEvent::QuestionResult { .. }) => {
-                    // Pass through — the result is recorded in chat history
+                Some(LlmEvent::QuestionResult {
+                    tool_call_id,
+                    content,
+                    ..
+                }) => {
+                    // The LLM loop already has this on its own message list;
+                    // persist it too, or the assistant tool_calls message
+                    // above is left dangling in chat history.
+                    self.current_chat
+                        .as_mut()
+                        .unwrap()
+                        .messages
+                        .push(ChatMessage {
+                            role: "tool".into(),
+                            content: Some(serde_json::Value::String(content)),
+                            tool_calls: vec![],
+                            tool_call_id: Some(tool_call_id),
+                            reasoning_content: None,
+                            reasoning: None,
+                            reasoning_details: None,
+                        });
+                    self.save_progress();
                 }
                 Some(LlmEvent::ToolResult {
                     tool_call_id,
@@ -667,6 +688,7 @@ impl PengyCli {
                             reasoning: None,
                             reasoning_details: None,
                         });
+                    self.save_progress();
                     eprint!("{}Thinking...{}", DIM, RESET);
                 }
                 Some(LlmEvent::FinalResponse {
@@ -691,9 +713,6 @@ impl PengyCli {
                             reasoning: None,
                             reasoning_details: None,
                         }));
-                    if !self.no_save {
-                        chat_manager::save_chat(self.current_chat.as_ref().unwrap()).ok();
-                    }
                     break;
                 }
                 None => {
@@ -704,6 +723,29 @@ impl PengyCli {
                     break;
                 }
             }
+        }
+
+        // An abort or an error leaves the loop mid-turn, where the last
+        // assistant message can hold tool_calls with no result behind them
+        // (the API 400s on that next request).  Repair, then persist what the
+        // turn got through.
+        if !self.no_save {
+            if let Some(chat) = self.current_chat.as_mut() {
+                chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
+                chat_manager::save_chat(chat).ok();
+            }
+        }
+    }
+
+    /// Persist mid-turn, so a crash can't take the turn's tool calls with it.
+    ///
+    /// One small per-chat file write; the whole store is not touched.
+    fn save_progress(&self) {
+        if self.no_save {
+            return;
+        }
+        if let Some(chat) = self.current_chat.as_ref() {
+            chat_manager::save_chat(chat).ok();
         }
     }
 

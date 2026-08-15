@@ -1,6 +1,25 @@
 # Changelog
 
-## v1.6.3 (current)
+## v1.6.4 (current)
+
+- **Incremental persistence — a turn reaches disk before it finishes.** The CLI
+  (`save_progress()`) and web worker (`chat_manager::save_chat_progress`) write
+  after every message a run produces (assistant tool calls, tool results,
+  question answers, final reply) instead of only when it finishes, and the user
+  message is persisted up front. A crash, cancel, or API error mid-tool-loop
+  used to silently drop the whole turn's tool calls while the user message
+  stayed on disk.
+- **Mid-run renames are preserved.** `save_chat_progress` re-reads the on-disk
+  title before each write, so a rename landing mid-run is no longer clobbered by
+  the worker's stale in-memory snapshot.
+- **Dangling tool calls are repaired on any run end.** Every run-ending path
+  (final response, error, cancel) runs `clean_dangling_tool_calls` before the
+  last save, synthesizing a placeholder tool message for any orphaned assistant
+  `tool_calls` so the next request does not go wrong.
+- Extended `chat_storage` tests cover `save_chat_progress` keeping out-of-band
+  title edits.
+
+## v1.6.3
 
 - **Fix: Stop button left the sidebar status bubble stuck.** Pressing Stop cleared
 the tab's thinking/tool-running state but never refreshed the quick-settings

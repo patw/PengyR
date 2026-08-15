@@ -10,8 +10,8 @@
 //! between phases rather than as separate `#[test]` fns.
 
 use pengy_core::chat_manager::{
-    create_chat, delete_chat, get_chat, load_chats, load_index, save_chat, save_chats, Chat,
-    ChatMessage,
+    create_chat, delete_chat, get_chat, load_chats, load_index, save_chat, save_chat_progress,
+    save_chats, Chat, ChatMessage,
 };
 use pengy_core::config::set_config_dir;
 use std::path::{Path, PathBuf};
@@ -249,6 +249,22 @@ fn split_store_behaves() {
         "CURRENT",
         "per-chat file must win over a stale legacy copy"
     );
+
+    // ── save_chat_progress keeps out-of-band title edits ────────────────
+    // A worker holds its own copy of the chat for a whole run; a rename that
+    // lands mid-run must not be clobbered by the worker's next write.
+    reset(&dir);
+    let mut worker_copy = mk("Original", vec![user_msg("hi")]);
+    let mut renamer_copy = get_chat(&worker_copy.id).unwrap();
+    renamer_copy.title = "Renamed by user".into();
+    save_chat(&renamer_copy).unwrap();
+
+    worker_copy.messages.push(user_msg("mid-turn tool result"));
+    save_chat_progress(&mut worker_copy).unwrap();
+
+    let saved = get_chat(&worker_copy.id).unwrap();
+    assert_eq!(saved.title, "Renamed by user", "rename must survive the run");
+    assert_eq!(saved.messages.len(), 2, "worker's newer messages must land");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

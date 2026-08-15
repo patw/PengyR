@@ -458,6 +458,24 @@ pub fn save_chat(chat: &Chat) -> io::Result<()> {
     Ok(())
 }
 
+/// Save an in-flight chat without clobbering out-of-band metadata edits.
+///
+/// A worker owns its copy of the chat for the whole run, so a rename that
+/// lands mid-run (a different copy, saved by another task) would be
+/// overwritten by the worker's next write. Adopt the on-disk title first;
+/// messages still come from the worker's copy, which is the newer one.
+pub fn save_chat_progress(chat: &mut Chat) -> io::Result<()> {
+    if chat.id.is_empty() {
+        return Ok(());
+    }
+    if let Some(on_disk) = read_json::<Chat>(&chat_file(&chat.id)) {
+        if !on_disk.title.is_empty() && on_disk.title != chat.title {
+            chat.title = on_disk.title;
+        }
+    }
+    save_chat(chat)
+}
+
 /// Get a chat by ID.
 pub fn get_chat(chat_id: &str) -> Option<Chat> {
     if let Some(chat) = read_json::<Chat>(&chat_file(chat_id)) {
