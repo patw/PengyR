@@ -978,6 +978,7 @@ void MainWindow::stopWorker() {
     session->thinking = false;
     session->toolRunning = false;
     updateTabTitle(session);
+    updateQuickSettingsFor(session);
 
     if (!session->chat.isEmpty()) {
         QByteArray priorJson = QJsonDocument(session->chat["messages"].toArray())
