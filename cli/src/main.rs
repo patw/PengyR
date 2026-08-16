@@ -511,6 +511,9 @@ impl PengyCli {
                     }
                     expecting_api = false;
                     self.yolo_this_turn = false;
+                    if let Some(text) = message.content.as_ref().and_then(|c| c.as_str()) {
+                        self.render_assistant_preamble(text);
+                    }
                     self.current_chat.as_mut().unwrap().messages.push(message);
                     self.save_progress();
                 }
@@ -778,6 +781,26 @@ impl PengyCli {
         };
 
         print_box("Tool output", &[display], None);
+    }
+
+    /// Show the narration the model wrote alongside its tool calls.  It is
+    /// persisted with the turn and shows up on a later `/show`, so a live run
+    /// that skipped it looked like the model went straight to the tools with
+    /// nothing to say.  `json` mode stays silent: its output is a single object
+    /// built from the final response.
+    fn render_assistant_preamble(&self, content: &str) {
+        let content = content.trim();
+        if content.is_empty() {
+            return;
+        }
+        match self.output_mode.as_str() {
+            "silent" | "json" => {}
+            "raw" => println!("{}", content),
+            _ => {
+                println!();
+                print_box("Assistant 🤖", &[render_markdown_terminal(content)], None);
+            }
+        }
     }
 
     fn render_final(&self, content: &str, usage: &llm_client::Usage) {

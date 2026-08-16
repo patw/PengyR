@@ -315,17 +315,28 @@ enum SseEvent {
         content: String,
         declined: bool,
     },
+    /// Narration the assistant emitted alongside its tool calls.  Persisted
+    /// history renders it on reload, so it has to stream too or mid-turn
+    /// commentary only shows up after a refresh.
+    AssistantMessage {
+        html: String,
+    },
     FinalResponse {
         html: String,
         usage: llm_client::Usage,
     },
     SudoRequest,
     QuestionRequest {
+        name: String,
+        args: serde_json::Value,
         questions: serde_json::Value,
         tool_call_id: String,
+        safe_id: String,
     },
     QuestionResult {
         tool_call_id: String,
+        safe_id: String,
+        name: String,
         content: String,
     },
     Retrying {
@@ -416,6 +427,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "declined": declined,
         })
         .to_string(),
+        SseEvent::AssistantMessage { html } => serde_json::json!({
+            "type": "assistant_message",
+            "html": html,
+        })
+        .to_string(),
         SseEvent::FinalResponse { html, usage } => serde_json::json!({
             "type": "final_response",
             "html": html,
@@ -428,20 +444,30 @@ fn sse_event_to_json(event: &SseEvent) -> String {
         .to_string(),
         SseEvent::SudoRequest => r#"{"type":"sudo_request"}"#.to_string(),
         SseEvent::QuestionRequest {
+            name,
+            args,
             questions,
             tool_call_id,
+            safe_id,
         } => serde_json::json!({
             "type": "question_request",
+            "name": name,
+            "args": args,
             "questions": questions,
             "tool_call_id": tool_call_id,
+            "safe_id": safe_id,
         })
         .to_string(),
         SseEvent::QuestionResult {
             tool_call_id,
+            safe_id,
+            name,
             content,
         } => serde_json::json!({
             "type": "question_result",
             "tool_call_id": tool_call_id,
+            "safe_id": safe_id,
+            "name": name,
             "content": content,
         })
         .to_string(),
@@ -575,8 +601,20 @@ impl WebWorker {
                 match event_rx.recv().await {
                     Some(LlmEvent::AssistantToolCalls { message }) => {
                         yolo_this_turn = false;
+                        let preamble = message
+                            .content
+                            .as_ref()
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned();
                         chat.messages.push(message);
                         chat_manager::save_chat_progress(&mut chat).ok();
+                        if !preamble.is_empty() {
+                            push_event(SseEvent::AssistantMessage {
+                                html: render_markdown(&preamble),
+                            });
+                        }
                     }
                     Some(LlmEvent::Retrying {
                         attempt,
@@ -669,14 +707,17 @@ impl WebWorker {
                         });
                     }
                     Some(LlmEvent::QuestionRequest {
-                        name: _name,
-                        args: _args,
+                        name,
+                        args,
                         tool_call_id,
                         questions,
                     }) => {
                         push_event(SseEvent::QuestionRequest {
+                            name,
+                            args,
                             questions: questions.clone(),
                             tool_call_id: tool_call_id.clone(),
+                            safe_id: safe_id(&tool_call_id),
                         });
 
                         // Always wait for user answers (ask_user_question is always interactive)
@@ -696,7 +737,7 @@ impl WebWorker {
                     }
                     Some(LlmEvent::QuestionResult {
                         tool_call_id,
-                        name: _name,
+                        name,
                         content,
                     }) => {
                         // The generator already has this on its own message
@@ -713,7 +754,9 @@ impl WebWorker {
                         });
                         chat_manager::save_chat_progress(&mut chat).ok();
                         push_event(SseEvent::QuestionResult {
+                            safe_id: safe_id(&tool_call_id),
                             tool_call_id,
+                            name,
                             content,
                         });
                     }
@@ -2626,6 +2669,8 @@ let isProcessing = false;
 let eventSource = null;
 let sseCursor = sessionStorage.getItem('pengy_sse_cursor_' + CHAT_ID) || '';
 let pendingToolCallId = null;
+let pendingQuestionId = null;
+let pendingQuestions = [];
 let thinkingEl = null;
 let confirmModal, sudoModal, renameModal, questionModal;
 let pendingFiles = [];
@@ -2714,6 +2759,12 @@ function escHtml(text) {{
   return d.innerHTML;
 }}
 
+// escHtml is safe for element content but leaves quotes intact, which would
+// let model-supplied text break out of an attribute. Use this inside "...".
+function escAttr(text) {{
+  return escHtml(text).replace(/"/g, '&quot;');
+}}
+
 function safeId(toolCallId) {{
   return 'tc_' + toolCallId.replace(/[^a-zA-Z0-9]/g, '');
 }}
@@ -2785,6 +2836,10 @@ function stopGeneration() {{
       }});
       pendingToolCallId = null;
     }}
+  }}
+  // The worker blocks on the answer channel — unblock it before stopping.
+  if (questionModal._isShown) {{
+    submitQuestion(null);
   }}
   if (sudoModal._isShown) {{
     sudoModal.hide();
@@ -3036,11 +3091,19 @@ function handleEvent(data) {{
       break;
     case 'question_request':
       hideThinking();
+      appendToolRequest(Object.assign({{}}, data, {{auto_approved: false}}));
       showQuestionModal(data);
       break;
     case 'question_result':
       hideThinking();
-      // Question was answered — result is injected back into context
+      updateToolResult(data);
+      showThinking();
+      break;
+    case 'assistant_message':
+      // Mid-turn narration that arrives before the tool calls it precedes.
+      hideThinking();
+      appendAssistantMessage(data.html, null);
+      showThinking();
       break;
     case 'sudo_request':
       hideThinking();
@@ -3076,6 +3139,8 @@ function appendUserMessage(content) {{
 
 function appendToolRequest(data) {{
   const sid = safeId(data.tool_call_id);
+  // A replayed event (reconnect) must not duplicate a card already on screen.
+  if (document.getElementById(sid)) return;
   data.summary = data.summary || toolSummary(data.name, data.args);
   const el = document.createElement('div');
   el.className = 'msg-tool';
@@ -3084,7 +3149,7 @@ function appendToolRequest(data) {{
       <div class="tool-header" data-bs-toggle="collapse" data-bs-target="#body-${{sid}}">
         <i class="bi bi-gear-fill text-warning" style="font-size:.8rem"></i>
         <code class="fw-semibold text-warning">${{escHtml(data.name)}}</code>
-        ${{data.summary ? `<span class="tool-summary text-muted" title="${{escHtml(data.summary)}}">${{escHtml(data.summary)}}</span>` : ''}}
+        ${{data.summary ? `<span class="tool-summary text-muted" title="${{escAttr(data.summary)}}">${{escHtml(data.summary)}}</span>` : ''}}
         <span class="badge bg-secondary ms-1" id="badge-${{sid}}">
           ${{data.auto_approved ? 'running...' : 'pending'}}
         </span>
@@ -3188,57 +3253,80 @@ function submitSudo(override) {{
 }}
 
 function showQuestionModal(data) {{
+  pendingQuestionId = data.tool_call_id;
+  pendingQuestions = Array.isArray(data.questions) ? data.questions : [];
+
   const body = document.getElementById('questionModalBody');
-  body.innerHTML = '';
-  const questions = data.questions || [];
-  for (let i = 0; i < questions.length; i++) {{
-    const q = questions[i];
-    const header = q.header || ('Question ' + (i + 1));
-    const questionText = q.question || '';
-    const options = q.options || [];
-
-    let optionsHtml = '';
-    for (const opt of options) {{
-      optionsHtml += `
-        <div class="form-check mb-1">
-          <input class="form-check-input question-option" type="radio"
-                 name="q_${{i}}" value="${{escHtml(opt.label)}}"
-                 id="q_${{i}}_${{escHtml(opt.label)}}">
-          <label class="form-check-label" for="q_${{i}}_${{escHtml(opt.label)}}">
-            <strong>${{escHtml(opt.label)}}</strong>
-            ${{opt.description ? '<span class="text-muted"> — ' + escHtml(opt.description) + '</span>' : ''}}
-          </label>
-        </div>`;
-    }}
-
-    body.innerHTML += `
-      <div class="mb-3">
-        <h6 class="fw-semibold">${{escHtml(header)}}</h6>
-        <p class="mb-2">${{escHtml(questionText)}}</p>
-        ${{optionsHtml}}
+  body.innerHTML = pendingQuestions.map((q, qi) => {{
+    const options = Array.isArray(q.options) ? q.options : [];
+    // Radio values are option indices — labels stay out of attributes and are
+    // looked up from pendingQuestions on submit.
+    const opts = options.map((opt, oi) => `
+      <div class="form-check mb-2">
+        <input class="form-check-input question-option" type="radio"
+               name="q${{qi}}" id="q${{qi}}o${{oi}}" value="${{oi}}" ${{oi === 0 ? 'checked' : ''}}>
+        <label class="form-check-label" for="q${{qi}}o${{oi}}">
+          <span class="fw-semibold">${{escHtml(opt.label || '')}}</span>
+          ${{opt.description ? `<div class="text-muted small">${{escHtml(opt.description)}}</div>` : ''}}
+        </label>
+      </div>`).join('');
+    return `
+      <div class="mb-4">
+        <div class="fw-semibold text-info small text-uppercase mb-1">${{escHtml(q.header || ('Question ' + (qi + 1)))}}</div>
+        <div class="mb-2">${{escHtml(q.question || '')}}</div>
+        ${{opts}}
+        <div class="form-check">
+          <input class="form-check-input question-option" type="radio" name="q${{qi}}"
+                 id="q${{qi}}other" value="__other__" ${{options.length ? '' : 'checked'}}>
+          <label class="form-check-label" for="q${{qi}}other">Other</label>
+          <input type="text" class="form-control form-control-sm mt-1" id="q${{qi}}otherText"
+                 placeholder="Your own answer..."
+                 oninput="document.getElementById('q${{qi}}other').checked = true">
+        </div>
       </div>`;
-  }}
+  }}).join('');
+
   questionModal.show();
 }}
 
 function submitQuestion(override) {{
   questionModal.hide();
-  if (override === null) {{
-    fetch(`/chat/${{CHAT_ID}}/confirm`, {{
-      method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{confirmed: false, tool_call_id: CHAT_ID, yolo_turn: false}}),
+  if (!pendingQuestionId) return;
+
+  const tool_call_id = pendingQuestionId;
+  const sid = safeId(tool_call_id);
+  let answered = override !== null;
+  let answers = [];
+
+  if (answered) {{
+    answers = pendingQuestions.map((q, qi) => {{
+      const picked = document.querySelector(`input[name="q${{qi}}"]:checked`);
+      if (!picked) return '';
+      if (picked.value === '__other__') {{
+        return (document.getElementById(`q${{qi}}otherText`).value || '').trim();
+      }}
+      const opt = (q.options || [])[Number(picked.value)];
+      return opt ? (opt.label || '') : '';
     }});
-    return;
+    // An empty "Other" with nothing typed is not an answer.
+    if (answers.every(a => !a)) answered = false;
   }}
-  const body = document.getElementById('questionModalBody');
-  const radios = body.querySelectorAll('.question-option:checked');
-  const answers = Array.from(radios).map(r => r.value);
+
+  const badge = document.getElementById(`badge-${{sid}}`);
+  if (badge) {{
+    badge.className = 'badge ms-1 ' + (answered ? 'text-bg-secondary' : 'bg-danger');
+    badge.textContent = answered ? 'answering...' : 'cancelled';
+  }}
+
   fetch(`/chat/${{CHAT_ID}}/confirm`, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{confirmed: true, tool_call_id: CHAT_ID, yolo_turn: false, answers: answers}}),
+    body: JSON.stringify({{confirmed: answered, tool_call_id: tool_call_id,
+                           yolo_turn: false, answers: answered ? answers : []}}),
   }});
+
+  pendingQuestionId = null;
+  pendingQuestions = [];
   showThinking();
 }}
 </script>"##
@@ -3669,6 +3757,64 @@ mod tests {
         assert!(html.contains("behavior: 'auto'"));
         assert!(!html.contains("readyState !== EventSource.OPEN"));
         assert!(!html.contains("behavior: 'instant'"));
+    }
+
+    // Mid-turn narration is persisted (and rendered on reload), so it has to
+    // reach the browser live too — it used to be saved and never streamed.
+    #[test]
+    fn assistant_message_event_serializes() {
+        let json = sse_event_to_json(&SseEvent::AssistantMessage {
+            html: "<p>checking</p>".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "assistant_message");
+        assert_eq!(v["html"], "<p>checking</p>");
+    }
+
+    #[test]
+    fn chat_template_renders_mid_turn_assistant_text() {
+        let chat = Chat::new("Template test");
+        let html = templates::chat_page(&chat, &[], &Config::default(), &[], true);
+        assert!(html.contains("case 'assistant_message'"));
+    }
+
+    // The question card is built from name/args like any other tool card, and
+    // the result completes that same card.
+    #[test]
+    fn question_events_carry_card_fields() {
+        let json = sse_event_to_json(&SseEvent::QuestionRequest {
+            name: "ask_user_question".into(),
+            args: serde_json::json!({"questions": []}),
+            questions: serde_json::json!([]),
+            tool_call_id: "call-q".into(),
+            safe_id: safe_id("call-q"),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "question_request");
+        assert_eq!(v["name"], "ask_user_question");
+        assert_eq!(v["safe_id"], "tc_callq");
+
+        let json = sse_event_to_json(&SseEvent::QuestionResult {
+            tool_call_id: "call-q".into(),
+            safe_id: safe_id("call-q"),
+            name: "ask_user_question".into(),
+            content: "**Approach**: Rebase".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["safe_id"], "tc_callq");
+        assert_eq!(v["content"], "**Approach**: Rebase");
+    }
+
+    // Option labels must never be interpolated into HTML attributes: radios
+    // carry the option index and the label is looked up on submit.
+    #[test]
+    fn question_modal_uses_index_values_and_defaults_to_first_option() {
+        let chat = Chat::new("Template test");
+        let html = templates::chat_page(&chat, &[], &Config::default(), &[], true);
+        assert!(html.contains("value=\"${oi}\""));
+        assert!(html.contains("${oi === 0 ? 'checked' : ''}"));
+        assert!(!html.contains("value=\"${escHtml(opt.label)}\""));
+        assert!(html.contains("function escAttr"));
     }
 
     #[test]
