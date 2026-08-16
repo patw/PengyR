@@ -171,16 +171,58 @@ impl Default for Config {
 }
 
 /// Return the pengy config directory (`~/.config/pengy/`).
-/// Uses `$HOME/.config/pengy` on all platforms so settings are shared with the
-/// Python edition and consistent across macOS / Linux / Windows.
+///
+/// Resolution order (highest priority first), matching the Python edition:
+///   1. [`set_config_dir`] — `--config-dir`, the `pengy_config_set_dir` FFI
+///   2. `PENGY_CONFIG_DIR` env var — CI, test harnesses, throw-away runs
+///   3. `$HOME/.config/pengy` — the default, shared with the other editions
+///
+/// The env var matters for anything driving a *built binary* rather than
+/// linking the library: without it the only way to point an edition at a
+/// scratch config was `HOME`, so a test run that forgot would silently use the
+/// real settings — and the real API key.
 pub fn pengy_config_dir() -> PathBuf {
-    if let Some(override_dir) = CONFIG_DIR_OVERRIDE.get() {
-        return override_dir.clone();
+    resolve_config_dir(
+        CONFIG_DIR_OVERRIDE.get().cloned(),
+        std::env::var_os("PENGY_CONFIG_DIR"),
+        dirs::home_dir(),
+    )
+}
+
+/// The resolution itself, with every input passed in.
+///
+/// Kept separate from [`pengy_config_dir`] because the real inputs are a
+/// process-global `OnceLock` and the environment: a test that set either would
+/// change the answer for every later test in the same binary.
+fn resolve_config_dir(
+    override_dir: Option<PathBuf>,
+    env: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return dir;
     }
-    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    if let Some(env) = env {
+        if !env.is_empty() {
+            return expand_home(PathBuf::from(env), home);
+        }
+    }
+    let mut p = home.unwrap_or_else(|| PathBuf::from("."));
     p.push(".config");
     p.push(CONFIG_DIR);
     p
+}
+
+/// Expand a leading `~` so `PENGY_CONFIG_DIR=~/scratch` behaves as a shell user
+/// expects (the Python edition's `expanduser()`).
+fn expand_home(path: PathBuf, home: Option<PathBuf>) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path;
+    };
+    match home {
+        Some(home) => home.join(rest),
+        None => path,
+    }
 }
 
 /// Return the path to the config file.
@@ -366,6 +408,68 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    // ── Config directory resolution ──────────────────────────────
+    // Without PENGY_CONFIG_DIR the only way to point a *built binary* at a
+    // scratch config was $HOME, so anything driving pengy-cli/pengy-web that
+    // forgot silently used the real settings — and the real API key.
+
+    fn home() -> Option<PathBuf> {
+        Some(PathBuf::from("/home/tester"))
+    }
+
+    #[test]
+    fn config_dir_defaults_under_home() {
+        assert_eq!(
+            resolve_config_dir(None, None, home()),
+            PathBuf::from("/home/tester/.config/pengy")
+        );
+    }
+
+    #[test]
+    fn config_dir_env_var_wins_over_home() {
+        assert_eq!(
+            resolve_config_dir(None, Some(OsString::from("/tmp/scratch")), home()),
+            PathBuf::from("/tmp/scratch")
+        );
+    }
+
+    #[test]
+    fn config_dir_explicit_override_wins_over_env() {
+        assert_eq!(
+            resolve_config_dir(
+                Some(PathBuf::from("/explicit")),
+                Some(OsString::from("/tmp/scratch")),
+                home()
+            ),
+            PathBuf::from("/explicit")
+        );
+    }
+
+    #[test]
+    fn config_dir_empty_env_var_falls_back_to_home() {
+        assert_eq!(
+            resolve_config_dir(None, Some(OsString::new()), home()),
+            PathBuf::from("/home/tester/.config/pengy")
+        );
+    }
+
+    #[test]
+    fn config_dir_env_var_expands_leading_tilde() {
+        assert_eq!(
+            resolve_config_dir(None, Some(OsString::from("~/scratch")), home()),
+            PathBuf::from("/home/tester/scratch")
+        );
+    }
+
+    #[test]
+    fn config_dir_tilde_only_inside_path_is_literal() {
+        assert_eq!(
+            resolve_config_dir(None, Some(OsString::from("/tmp/~backup")), home()),
+            PathBuf::from("/tmp/~backup")
+        );
+    }
 
     #[test]
     fn config_default_has_expected_values() {
