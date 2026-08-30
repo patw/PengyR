@@ -1,6 +1,7 @@
 use pengy_core::chat_manager::{self, Chat, ChatMessage, ChatSummary};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
+use pengy_core::task_manager;
 use pengy_core::tools;
 
 use axum::extract::{Path, State};
@@ -121,7 +122,10 @@ async fn main() {
         .route("/chat/:chat_id/delete", post(chat_delete))
         .route("/chat/:chat_id/export", get(chat_export))
         .route("/chat/:chat_id/rename", post(chat_rename))
+        .route("/chat/:chat_id/redact", post(chat_redact))
         .route("/chat/:chat_id/command", post(chat_command))
+        .route("/tasks", get(list_tasks))
+        .route("/tasks/render", post(render_task))
         .route("/settings", get(settings_get).post(settings_post))
         .route("/models", get(models_api))
         .route("/files", get(serve_file))
@@ -324,6 +328,11 @@ enum SseEvent {
     FinalResponse {
         html: String,
         usage: llm_client::Usage,
+        /// Running total across every turn in this chat, not just this one
+        /// (see `chat_manager::add_usage`) -- the client's navbar badge shows
+        /// this, since "how much context has this whole chat burned" is a
+        /// more useful signal than the last turn alone.
+        cumulative_usage: llm_client::Usage,
     },
     SudoRequest,
     QuestionRequest {
@@ -432,13 +441,22 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "html": html,
         })
         .to_string(),
-        SseEvent::FinalResponse { html, usage } => serde_json::json!({
+        SseEvent::FinalResponse {
+            html,
+            usage,
+            cumulative_usage,
+        } => serde_json::json!({
             "type": "final_response",
             "html": html,
             "usage": {
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,
                 "total_tokens": usage.total_tokens,
+            },
+            "cumulative_usage": {
+                "prompt_tokens": cumulative_usage.prompt_tokens,
+                "completion_tokens": cumulative_usage.completion_tokens,
+                "total_tokens": cumulative_usage.total_tokens,
             },
         })
         .to_string(),
@@ -774,9 +792,11 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         }));
+                        let cumulative_usage = chat_manager::add_usage(&mut chat, &usage);
                         push_event(SseEvent::FinalResponse {
                             html: render_markdown(&content),
                             usage,
+                            cumulative_usage,
                         });
                         chat_manager::save_chat_progress(&mut chat).ok();
                         done.store(true, Ordering::Relaxed);
@@ -1391,6 +1411,146 @@ async fn chat_rename(
     chat.title = new_title.clone();
     chat_manager::save_chat(&chat).ok();
     Json(serde_json::json!({"status": "ok", "title": new_title})).into_response()
+}
+
+// ── Redact ─────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct RedactRequest {
+    count: Option<serde_json::Value>,
+}
+
+/// Delete the last N raw messages (default 1) from the chat.
+///
+/// The context-pruning "undo" button: repeatable all the way to an empty
+/// chat. Refused while a turn is in flight for this chat, since popping
+/// messages out from under an in-progress LlmClient run (which holds its own
+/// snapshot mid-run) would race with the worker's own saves.
+async fn chat_redact(
+    State(state): State<AppState>,
+    Path(chat_id): Path<String>,
+    body: Option<Json<RedactRequest>>,
+) -> impl IntoResponse {
+    let active = {
+        let workers = state.workers.lock().unwrap();
+        workers
+            .get(&chat_id)
+            .map(|w| !w.done.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+    if active {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "Cannot redact while a response is in progress"})),
+        )
+            .into_response();
+    }
+
+    let count_value = body.and_then(|Json(b)| b.count).unwrap_or(serde_json::json!(1));
+    let n = match count_value.as_u64().or_else(|| {
+        count_value
+            .as_i64()
+            .filter(|v| *v >= 0)
+            .map(|v| v as u64)
+    }) {
+        Some(n) if n >= 1 => n as usize,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "count must be an integer"})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut chat = match chat_manager::get_chat(&chat_id) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Chat not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    let before = chat.messages.len();
+    for _ in 0..n.min(before) {
+        chat.messages = chat_manager::redact_last_message(&chat.messages);
+    }
+    chat_manager::save_chat(&chat).ok();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "removed": before - chat.messages.len(),
+        "message_count": chat.messages.len(),
+    }))
+    .into_response()
+}
+
+// ── Tasks (prompt templates) ──────────────────────────────────────
+// Chat-independent: same store (tasks.json) as the GUI's Tasks dialog. The
+// client fills placeholders, renders here, then feeds the result through the
+// normal /send path.
+
+async fn list_tasks() -> impl IntoResponse {
+    let tasks: Vec<serde_json::Value> = task_manager::load_tasks()
+        .into_iter()
+        .map(|t| {
+            let placeholders = task_manager::extract_placeholders(&t.template);
+            serde_json::json!({
+                "id": t.id,
+                "title": t.title,
+                "template": t.template,
+                "placeholders": placeholders,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"tasks": tasks}))
+}
+
+#[derive(Deserialize)]
+struct RenderTaskRequest {
+    id: String,
+    values: serde_json::Value,
+}
+
+async fn render_task(Json(data): Json<RenderTaskRequest>) -> impl IntoResponse {
+    let task = match task_manager::get_task(&data.id) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Task not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    let values: std::collections::HashMap<String, String> = match data.values {
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    v.as_str().map(String::from).unwrap_or_else(|| v.to_string()),
+                )
+            })
+            .collect(),
+        serde_json::Value::Null => std::collections::HashMap::new(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "values must be an object"})),
+            )
+                .into_response()
+        }
+    };
+
+    let prompt = task_manager::render_template(&task.template, &values)
+        .trim()
+        .to_string();
+    Json(serde_json::json!({"prompt": prompt})).into_response()
 }
 
 // ── NEW: Slash Commands ──────────────────────────────────────────
@@ -2449,13 +2609,28 @@ mod templates {
                 r#"<span class="badge text-bg-secondary small" id="navConfirmBadge">Confirm All</span>"#
             }
         };
+        let tokens_badge = match &chat.usage {
+            Some(u) if u.total_tokens > 0 => format!(
+                r#"<span class="text-muted small d-none d-md-inline ms-2" id="navTokens" title="Cumulative token usage for this chat">{} tokens</span>"#,
+                u.total_tokens
+            ),
+            _ => r#"<span class="text-muted small d-none d-md-inline ms-2" id="navTokens" title="Cumulative token usage for this chat" hidden>0 tokens</span>"#.to_string(),
+        };
         let navbar_center = format!(
             r#"<span class="text-muted small d-none d-sm-inline" id="navModel">{}</span> {}
+{}
+<button class="btn btn-outline-secondary btn-sm ms-1" onclick="openTasks()" title="Run a saved prompt template">
+  <i class="bi bi-list-task"></i>
+</button>
 <button class="btn btn-outline-secondary btn-sm ms-1" onclick="exportChat()" title="Export chat as Markdown">
   <i class="bi bi-download"></i>
+</button>
+<button class="btn btn-outline-secondary btn-sm ms-1" onclick="redactLast()" title="Redact last message — delete the last message from context (repeatable)">
+  <i class="bi bi-eraser"></i>
 </button>"#,
             escape_html(&config.model),
-            tc_badge
+            tc_badge,
+            tokens_badge
         );
 
         let mut messages_html = String::new();
@@ -2637,6 +2812,34 @@ mod templates {
     </div>
   </div>
 </div>
+<div class="modal fade" id="tasksModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title">Tasks</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="tasksListView">
+          <p class="text-muted small" id="tasksEmptyHint" hidden>
+            No tasks saved yet — create one in the desktop app's Tasks dialog
+            (they're shared across all three frontends).
+          </p>
+          <div id="tasksList" class="list-group"></div>
+        </div>
+        <div id="tasksFormView" hidden>
+          <button type="button" class="btn btn-sm btn-link ps-0 mb-2" onclick="showTasksList()">&larr; Back to Tasks</button>
+          <h6 id="tasksFormTitle" class="mb-3"></h6>
+          <div id="tasksFormFields"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button id="tasksRunBtn" class="btn btn-sm btn-primary" onclick="runSelectedTask()" hidden>Run</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="modal fade" id="questionModal" tabindex="-1" data-bs-backdrop="static">
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
@@ -2672,7 +2875,9 @@ let pendingToolCallId = null;
 let pendingQuestionId = null;
 let pendingQuestions = [];
 let thinkingEl = null;
-let confirmModal, sudoModal, renameModal, questionModal;
+let confirmModal, sudoModal, renameModal, questionModal, tasksModal;
+let tasksCache = [];
+let selectedTask = null;
 let pendingFiles = [];
 let wakeLock = null;
 
@@ -2682,6 +2887,7 @@ document.addEventListener('DOMContentLoaded', () => {{
   sudoModal    = new bootstrap.Modal(document.getElementById('sudoModal'));
   renameModal  = new bootstrap.Modal(document.getElementById('renameModal'));
   questionModal = new bootstrap.Modal(document.getElementById('questionModal'));
+  tasksModal   = new bootstrap.Modal(document.getElementById('tasksModal'));
   document.title = CHAT_TITLE + ' — Pengy';
   document.getElementById('navTitle').textContent = 'Pengy';
   document.getElementById('sudoPasswordInput').addEventListener('keydown', e => {{
@@ -2897,6 +3103,148 @@ function doRename() {{
   }});
 }}
 
+// ── Redact last ──────────────────────────────────────────────
+// Context-pruning "undo": deletes the last raw message from the chat.
+// Repeatable straight up to an empty chat — each click just reloads the
+// page against the freshly-trimmed history, same as a normal chat load.
+
+function redactLast() {{
+  if (isProcessing) {{
+    alert('Cannot redact while a response is in progress.');
+    return;
+  }}
+  fetch(`/chat/${{CHAT_ID}}/redact`, {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{count: 1}}),
+  }})
+  .then(r => r.json().then(data => ({{ok: r.ok, data}})))
+  .then(({{ok, data}}) => {{
+    if (!ok) {{
+      alert(data.error || 'Redact failed.');
+      return;
+    }}
+    location.reload();
+  }})
+  .catch(err => console.error('Redact error:', err));
+}}
+
+// ── Tasks ─────────────────────────────────────────────────────
+// Prompt templates shared with the GUI's Tasks dialog (tasks.json). Selecting
+// one fills in its %placeholders%, renders it server-side, then routes the
+// result through the normal send path — same shape as messageInput -> doSend().
+
+function openTasks() {{
+  fetch('/tasks')
+    .then(r => r.json())
+    .then(data => {{
+      tasksCache = data.tasks || [];
+      renderTasksList();
+      showTasksList();
+      tasksModal.show();
+    }})
+    .catch(err => console.error('Failed to load tasks:', err));
+}}
+
+function renderTasksList() {{
+  const list = document.getElementById('tasksList');
+  const empty = document.getElementById('tasksEmptyHint');
+  list.innerHTML = '';
+  empty.hidden = tasksCache.length > 0;
+
+  for (const task of tasksCache) {{
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'list-group-item list-group-item-action';
+    const title = document.createElement('div');
+    title.className = 'fw-semibold';
+    title.textContent = task.title;
+    const preview = document.createElement('div');
+    preview.className = 'text-muted small text-truncate';
+    preview.textContent = task.template;
+    btn.appendChild(title);
+    btn.appendChild(preview);
+    btn.addEventListener('click', () => selectTask(task.id));
+    list.appendChild(btn);
+  }}
+}}
+
+function showTasksList() {{
+  document.getElementById('tasksListView').hidden = false;
+  document.getElementById('tasksFormView').hidden = true;
+  document.getElementById('tasksRunBtn').hidden = true;
+  selectedTask = null;
+}}
+
+function selectTask(id) {{
+  selectedTask = tasksCache.find(t => t.id === id);
+  if (!selectedTask) return;
+
+  document.getElementById('tasksFormTitle').textContent = selectedTask.title;
+  const fields = document.getElementById('tasksFormFields');
+  fields.innerHTML = '';
+  for (const name of selectedTask.placeholders) {{
+    const wrap = document.createElement('div');
+    wrap.className = 'mb-2';
+    const label = document.createElement('label');
+    label.className = 'form-label small mb-1';
+    label.textContent = name;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'form-control form-control-sm task-field-input';
+    input.dataset.name = name;
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    fields.appendChild(wrap);
+  }}
+
+  document.getElementById('tasksListView').hidden = true;
+  document.getElementById('tasksFormView').hidden = false;
+  document.getElementById('tasksRunBtn').hidden = false;
+  if (selectedTask.placeholders.length > 0) {{
+    fields.querySelector('.task-field-input').focus();
+  }}
+}}
+
+function runSelectedTask() {{
+  if (!selectedTask) return;
+  const values = {{}};
+  document.querySelectorAll('#tasksFormFields .task-field-input').forEach(input => {{
+    values[input.dataset.name] = input.value;
+  }});
+
+  fetch('/tasks/render', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{id: selectedTask.id, values}}),
+  }})
+  .then(r => r.json().then(data => ({{ok: r.ok, data}})))
+  .then(({{ok, data}}) => {{
+    if (!ok) {{
+      alert(data.error || 'Failed to run task.');
+      return;
+    }}
+    if (!data.prompt) {{
+      alert('This task produced an empty prompt.');
+      return;
+    }}
+    tasksModal.hide();
+    document.getElementById('messageInput').value = data.prompt;
+    doSend();
+  }})
+  .catch(err => console.error('Task render error:', err));
+}}
+
+// ── Cumulative token usage ───────────────────────────────────
+
+function updateCumulativeTokens(cumulativeUsage) {{
+  const el = document.getElementById('navTokens');
+  const total = cumulativeUsage && cumulativeUsage.total_tokens;
+  if (!total) return;
+  el.textContent = `${{total.toLocaleString()}} tokens`;
+  el.hidden = false;
+}}
+
 function doSend() {{
   if (isProcessing) return;
   const input = document.getElementById('messageInput');
@@ -3085,6 +3433,7 @@ function handleEvent(data) {{
     case 'final_response':
       hideThinking();
       appendAssistantMessage(data.html, data.usage);
+      updateCumulativeTokens(data.cumulative_usage);
       eventSource.close(); eventSource = null;
       sessionStorage.removeItem('pengy_sse_cursor_' + CHAT_ID);
       setProcessing(false);
@@ -3675,6 +4024,11 @@ mod tests {
                     completion_tokens: 0,
                     total_tokens: 0,
                 },
+                cumulative_usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
             },
         ]));
         let (_tx, rx) = tokio::sync::watch::channel(2usize);
@@ -3716,7 +4070,7 @@ mod tests {
         let (events, rx, done) = event_log(vec![
             SseEvent::ToolRequest { name: "read_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), summary: String::new(), auto_approved: false },
             SseEvent::ToolResult { tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "read_file".into(), content: "ok".into(), declined: false },
-            SseEvent::FinalResponse { html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
+            SseEvent::FinalResponse { html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, cumulative_usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
         ]);
         let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
         // retry directive plus result and final; event 0/tool request is not replayed.
@@ -3738,6 +4092,7 @@ mod tests {
         });
         events.lock().unwrap().push(SseEvent::FinalResponse {
             html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            cumulative_usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         });
         done.store(true, Ordering::Relaxed);
         let _ = tx.send(3);

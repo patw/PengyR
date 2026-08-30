@@ -794,6 +794,36 @@ fn truncate_head_lines(text: &str, limit: Option<usize>) -> (&str, usize, bool) 
     (kept, kept.matches('\n').count() + 1, true)
 }
 
+const BINARY_SAMPLE_CHARS: usize = 4096;
+const BINARY_NONPRINTABLE_RATIO: f64 = 0.25;
+
+fn is_nonprintable(c: char) -> bool {
+    !matches!(c, '\n' | '\r' | '\t') && c.is_control()
+}
+
+/// Heuristically detect binary blobs that decoded as text without erroring.
+///
+/// A hard-invalid byte sequence is now handled upstream by decoding with
+/// `String::from_utf8_lossy` (U+FFFD replacement) rather than the strict
+/// `fs::read_to_string` this used to go through -- but that still leaves the
+/// case that never raised in the first place: bytes that happen to form
+/// valid text (a UTF-16 file decoded as UTF-8 leaves a NUL between every
+/// ASCII byte; a core dump or compiled binary can have long printable-looking
+/// runs) but aren't meaningful for the model to read and can blow out the
+/// context window.
+///
+/// Returns `(is_binary, nonprintable_ratio)` computed over a leading sample.
+fn looks_binary(text: &str) -> (bool, f64) {
+    if text.is_empty() {
+        return (false, 0.0);
+    }
+    let sample: Vec<char> = text.chars().take(BINARY_SAMPLE_CHARS).collect();
+    let nonprintable = sample.iter().filter(|c| is_nonprintable(**c)).count();
+    let ratio = nonprintable as f64 / sample.len() as f64;
+    let is_binary = sample.contains(&'\0') || ratio > BINARY_NONPRINTABLE_RATIO;
+    (is_binary, ratio)
+}
+
 /// Tail-biased truncation for *command* output (run_bash, run_python).
 ///
 /// Keeps the head (~20%) and tail (~80%) and snips the middle: a command echo
@@ -801,7 +831,22 @@ fn truncate_head_lines(text: &str, limit: Option<usize>) -> (&str, usize, bool) 
 /// middle of a build log is the disposable part.  File reads use
 /// `truncate_head_lines` instead — a gap in the middle of a source file is not
 /// disposable, and unlike a log it can be paged around.  0 = no limit.
+///
+/// Runs the binary guard first: output that looks like a binary blob rather
+/// than text is blocked outright rather than truncated, since truncating a
+/// binary dump still floods the context with useless bytes.
 fn snip_tool_output(text: String) -> String {
+    let (is_binary, ratio) = looks_binary(&text);
+    if is_binary {
+        return format!(
+            "[Binary output blocked: {} chars, ~{:.0}% non-printable/control characters. \
+             Refusing to load this into context. If you need the data, redirect it to a file \
+             and use read_file/search_content on it, or use download_file for URLs.]",
+            text.chars().count(),
+            ratio * 100.0
+        );
+    }
+
     let limit = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
     if limit == 0 || text.len() <= limit {
         return text;
@@ -1347,9 +1392,15 @@ fn create_output_files(
 }
 
 fn read_and_remove(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    // Decode leniently (U+FFFD for invalid sequences) rather than
+    // `fs::read_to_string`'s strict decoding: that silently turned any
+    // invalid-UTF-8 output (e.g. a command emitting raw binary bytes) into
+    // an empty string via `unwrap_or_default()`. Lossy decoding lets the
+    // content reach `snip_tool_output`'s binary guard as text to classify,
+    // instead of vanishing without a trace.
+    let bytes = std::fs::read(path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
-    text
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn remove_output_files(stdout_path: &Path, stderr_path: &Path) {
@@ -3159,6 +3210,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_bash_blocks_binary_output() {
+        let result = run_bash(
+            "head -c 4000 /dev/urandom".into(),
+            None,
+            Arc::new(ToolContext::new()),
+        )
+        .await;
+        assert!(result.starts_with("[Binary output blocked:"), "{result}");
+    }
+
+    /// A command whose output isn't valid UTF-8 must not silently vanish
+    /// (read_and_remove used to decode strictly and swallow it via
+    /// `unwrap_or_default()`) -- it decodes leniently and goes through the
+    /// same binary guard as everything else.
+    #[tokio::test]
+    async fn run_bash_survives_invalid_utf8() {
+        let result = run_bash(
+            r"printf '\xff\xfe\xfd\xfc'".into(),
+            None,
+            Arc::new(ToolContext::new()),
+        )
+        .await;
+        assert_ne!(result, "(No output)");
+    }
+
+    #[tokio::test]
     async fn run_bash_invalid_cwd() {
         let result = run_bash(
             "pwd".into(),
@@ -4018,6 +4095,33 @@ mod tests {
         assert!(out.starts_with("line 1"));
         assert!(out.trim_end().ends_with("line 5000"));
         assert!(out.contains("snipped"));
+    }
+
+    /// Text with embedded NULs (e.g. a UTF-16 file decoded as UTF-8) is
+    /// blocked outright rather than truncated into context.
+    #[test]
+    fn binary_guard_blocks_null_bytes() {
+        let text = "a\0b\0c\0".repeat(100);
+        let out = snip_tool_output(text);
+        assert!(out.starts_with("[Binary output blocked:"));
+        assert!(out.contains("non-printable"));
+    }
+
+    /// Output that is mostly control/non-printable characters, even without
+    /// NULs, is still classified as binary.
+    #[test]
+    fn binary_guard_blocks_high_control_char_ratio() {
+        let text: String = (0..500).map(|i| ((i % 31) + 1) as u8 as char).collect();
+        let out = snip_tool_output(text);
+        assert!(out.starts_with("[Binary output blocked:"));
+    }
+
+    /// Ordinary command output must not trip the binary guard.
+    #[test]
+    fn binary_guard_leaves_normal_text_alone() {
+        let text = "def foo():\n\treturn 'hello world!' # comment\n".repeat(50);
+        let out = snip_tool_output(text.clone());
+        assert_eq!(out, text);
     }
 
     /// Character-index cuts left a broken half-line at each seam, which on

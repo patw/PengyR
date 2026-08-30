@@ -17,6 +17,8 @@ extern "C" {
     bool  pengy_chat_save(const char* json);
     char* pengy_chat_get(const char* id);
     char* pengy_clean_messages(const char* json);
+    char* pengy_messages_redact_last(const char* json);
+    char* pengy_chat_add_usage(const char* chat_json, const char* usage_json);
 
     char* pengy_tasks_load();
     bool  pengy_tasks_save(const char* json);

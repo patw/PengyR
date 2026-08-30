@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(Pengy VERSION 1.6.3 LANGUAGES CXX)
+project(Pengy VERSION 1.7.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -146,4 +146,44 @@ if(PENGY_BUILD_TESTS)
   target_link_libraries(pengy_chatview_markdown_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg)
   target_include_directories(pengy_chatview_markdown_test PRIVATE ${CMAKE_SOURCE_DIR})
   add_test(NAME pengy_chatview_markdown_test COMMAND pengy_chatview_markdown_test)
+
+  # chathistory.cpp calls into the Rust core (pengy_ffi.h), so this test
+  # target needs the same platform-specific link set as the main `pengy`
+  # target above, not just Qt.
+  add_executable(pengy_chathistory_test
+    tests/test_chathistory.cpp chathistory.cpp
+  )
+  target_compile_definitions(pengy_chathistory_test PRIVATE PENGY_UNIT_TEST)
+  if(PENGY_RUST_STATIC)
+    if(WIN32)
+      target_link_libraries(pengy_chathistory_test PRIVATE
+        Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
+        ${PENGY_CORE_LIB}
+        ws2_32 userenv ntdll bcrypt advapi32
+      )
+    elseif(APPLE)
+      target_link_libraries(pengy_chathistory_test PRIVATE
+        Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
+        ${PENGY_CORE_LIB}
+        "${OPENSSL_ROOT_DIR}/lib/libssl.dylib"
+        "${OPENSSL_ROOT_DIR}/lib/libcrypto.dylib"
+        "-framework Security" "-framework CoreFoundation" "-framework SystemConfiguration"
+        pthread dl
+      )
+    else()
+      target_link_libraries(pengy_chathistory_test PRIVATE
+        Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
+        ${PENGY_CORE_LIB}
+        OpenSSL::SSL OpenSSL::Crypto
+        pthread dl m
+      )
+    endif()
+  else()
+    target_link_libraries(pengy_chathistory_test PRIVATE
+      Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg
+      ${PENGY_CORE_LIB}
+    )
+  endif()
+  target_include_directories(pengy_chathistory_test PRIVATE ${CMAKE_SOURCE_DIR})
+  add_test(NAME pengy_chathistory_test COMMAND pengy_chathistory_test)
 endif()

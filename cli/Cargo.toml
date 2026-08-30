@@ -1,6 +1,6 @@
 [package]
 name = "pengy-cli"
-version = "1.7.0"
+version = "1.7.2"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
 description = "Pengy CLI — command-line interface"
@@ -20,3 +20,6 @@ regex = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 rustyline = { version = "15", features = ["with-file-history"] }
+
+[dev-dependencies]
+tempfile = "3"

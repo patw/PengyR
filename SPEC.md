@@ -37,9 +37,9 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 │  ┌─ Qt6 GUI (C++17) ─────────────┐  ┌─ CLI (Rust) ──────────────┐ │
 │  │ ChatHistory / ChatView /       │  │ Interactive REPL           │ │
 │  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
-│  │ ChatWorker (QThread → FFI)     │  │ 25 slash commands          │ │
+│  │ ChatWorker (QThread → FFI)     │  │ 28 slash commands          │ │
 │  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
-│               │ C FFI (23 extern "C")             │ direct Rust    │
+│               │ C FFI (25 extern "C")             │ direct Rust    │
 │               │                                    │                │
 │  ┌─ Web UI (Rust/Axum) ──────────┐                │                │
 │  │ Bootstrap 5 + SSE streaming    │                │                │
@@ -67,7 +67,7 @@ PengyR/
 │   ├── config.rs               # Settings load/save + system message rendering
 │   ├── chat_manager.rs         # Chat session CRUD + message cleaning
 │   ├── task_manager.rs         # Prompt-template Tasks CRUD (~/.config/pengy/tasks.json)
-│   ├── tools.rs                # 15 OpenAI function-calling tools
+│   ├── tools.rs                # 16 OpenAI function-calling tools
 │   └── llm_client.rs           # Async LLM chat generator (tokio channels)
 ├── cli/                        # CLI binary (pengy-cli)
 │   ├── Cargo.toml
@@ -98,7 +98,7 @@ PengyR/
 
 ## FFI Design
 
-The Rust core exposes 23 C functions via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library.
+The Rust core exposes 25 C functions via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library.
 
 ### Config Functions
 
@@ -118,6 +118,8 @@ The Rust core exposes 23 C functions via `extern "C"`. The C++ GUI includes `pen
 | `pengy_chat_save` | `(json: *const c_char) → bool` | Success |
 | `pengy_chat_get` | `(id: *const c_char) → *mut c_char` | Chat JSON or NULL |
 | `pengy_clean_messages` | `(json: *const c_char) → *mut c_char` | Cleaned message array |
+| `pengy_messages_redact_last` | `(json: *const c_char) → *mut c_char` | Message array with the last message popped (redact "undo"; see `chat_manager::redact_last_message`) |
+| `pengy_chat_add_usage` | `(chat_json: *const c_char, usage_json: *const c_char) → *mut c_char` | Chat JSON with this turn's usage folded into the persisted running total (`chat.usage`) |
 
 ### Tool Functions
 
@@ -176,10 +178,15 @@ typedef struct {
 ```
 
 ### Left Pane (Sidebar)
-- **+ New Chat button** — Creates a new chat session
+- **+ New Chat button** — Creates a new chat session. Inserts one row into the chat list (`ChatHistoryWidget::addChat`) rather than reloading the whole list, so the cost doesn't scale with total chat count.
 - **⚙ Settings button** — Opens the settings dialog
+- **Tasks button** — Opens the prompt-template Tasks manager/player (`TasksDialog`)
 - **Chat history list** — Scrollable, sorted newest first; click to load; chat items have a delete button
-- **Quick settings panel** — Shows current model name, tool confirmation mode (YOLO/Safe/None)
+- **Quick settings panel** — Shows current model name, tool confirmation mode (YOLO/Safe/None), and cumulative token usage for the active chat (`chat.usage`, summed across every turn — not just the last one)
+
+### Input Row
+- **Redact button** — Deletes the last raw message from the active chat (`pengy_messages_redact_last`), repeatable all the way to an empty chat. Refused while a turn is in flight. A context-pruning "undo" for when the model goes down a wrong path; wrecks prompt caching for that chat.
+- **Stop button** — Cancels the running generation (shown only while a turn is in flight)
 
 ### Right-Top Pane (Chat View)
 - Markdown-rendered chat messages via `QTextBrowser`
@@ -286,6 +293,9 @@ The main thread drives the tokio channel receiver. Tool confirmation blocks on u
 | `/load <index>` | Load a chat by its `/list` index |
 | `/delete <index>` | Delete a chat by its `/list` index |
 | `/compact` | Elide old tool results to free context window space |
+| `/redact [n]` | Delete the last n messages (default 1) — repeatable up to the top |
+| `/tasks` | List saved prompt-template Tasks |
+| `/task <#>` | Run a Task by its `/tasks` index, prompting for any `%placeholders%` |
 | `/attach` | Attach a text file (or use `@path` inline in your prompt) |
 | `/quit`, `/exit`, `/q` | Exit the CLI |
 
@@ -343,7 +353,10 @@ The server prints its URL on startup; it does not auto-open a browser.
 | POST | `/chat/:id/delete` | Delete chat and redirect to index |
 | GET | `/chat/:id/export` | Download the chat as a Markdown file |
 | POST | `/chat/:id/rename` | Rename a chat |
+| POST | `/chat/:id/redact` | Delete the last N raw messages (default 1); 409 while a turn is in flight |
 | POST | `/chat/:id/command` | Web slash commands typed in the chat input |
+| GET | `/tasks` | List saved prompt-template Tasks with their placeholders |
+| POST | `/tasks/render` | Render a Task's template with the given placeholder values |
 | GET | `/models` | Fetch available models from the endpoint (settings page Fetch button) |
 | GET/POST | `/settings` | View/update all config fields |
 
@@ -353,7 +366,7 @@ The server prints its URL on startup; it does not auto-open a browser.
 |------|---------|---------------|
 | `tool_request` | `name`, `args`, `auto_approved` | Append tool card; if not auto-approved, show confirmation modal |
 | `tool_result` | `content`, `declined` | Update tool card body and badge |
-| `final_response` | `html`, `usage` | Append assistant bubble |
+| `final_response` | `html`, `usage`, `cumulative_usage` | Append assistant bubble; `cumulative_usage` (running total across the chat, via `chat_manager::add_usage`) updates the navbar token badge |
 | `sudo_request` | — | Show sudo password modal |
 | `error` | `message` | Append error alert, re-enable input |
 | `keepalive` | — | SSE comment (`: keepalive`); browser ignores |
@@ -516,11 +529,12 @@ Array of chat session objects with `user`, `assistant` (including `tool_calls`),
 
 ## Tools
 
-All 15 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
+All 16 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 
 | Tool | Read-only | Description |
 |------|:---:|-------------|
 | `read_file` | ✅ | Read a local file. Expands `~`. |
+| `read_image` | ✅ | Look at an image file (screenshot, photo, diagram, chart) — added to the conversation for the model to see directly. PNG, JPEG, GIF, WebP, BMP, TIFF; large images are downscaled automatically. |
 | `read_multiple_files` | ✅ | Read up to 20 files at once; per-file budget follows `tool_output_max_chars`, with a 5× total batch budget. |
 | `write_file` | ❌ | Write content to a file (creates parent dirs). |
 | `replace_in_file` | ❌ | Exact string replacement; must match exactly once. |
@@ -537,6 +551,8 @@ All 15 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | `ask_user_question` | — | Ask the user clarifying multiple-choice questions. Handled by the harness, never reaches `execute_tool`. |
 
 Tool execution runs on the tokio runtime via `tokio::task::spawn_blocking` for CPU/IO-heavy operations. Sudo password is cached in memory for the duration of the LLM run and cleared when the run completes.
+
+**Binary output guard:** `snip_tool_output()` — the shared truncation point for `run_bash`, `run_python`, `directory_tree`, `search_content`, and `glob` — runs a `looks_binary()` heuristic first (a NUL byte anywhere in the first 4KB, or a non-printable/control-character ratio over ~25%) and blocks the output outright with a short diagnostic instead of loading a binary blob into context. `run_bash`/`run_python` decode command output leniently (`String::from_utf8_lossy`) rather than strictly, so output that isn't valid UTF-8 reaches the guard as text instead of vanishing or erroring.
 
 ---
 
@@ -607,7 +623,7 @@ build_windows.bat
 
 ## Design Decisions
 
-**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — 23 functions with simple types.
+**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — 25 functions with simple types.
 
 **Static linking of Rust core:** The Rust library is compiled as a static archive (`.a` / `.lib`) and linked into the Qt6 binary. This eliminates runtime Rust dependencies in the final binary. The trade-off is a larger binary (~13 MB) but simpler deployment.
 
@@ -636,9 +652,9 @@ build_windows.bat
 | Feature | Status | Notes |
 |---------|:---:|-------|
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
-| 15 tools | ✅ | All tools ported |
+| 16 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
-| CLI (interactive REPL + single-shot) | ✅ | 25 slash commands, @path attachments |
+| CLI (interactive REPL + single-shot) | ✅ | 28 slash commands, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |
 | File attachments (GUI) | ✅ | Image + text file support |
 | Image paste from clipboard | ✅ | |
@@ -646,9 +662,12 @@ build_windows.bat
 | Tool confirmation (YOLO/Safe/None) | ✅ | All three frontends |
 | Sudo password support | ✅ | All three frontends |
 | Context elision | ✅ | `elide_old_tool_results` wired to config |
+| Binary output guard | ✅ | `looks_binary()` blocks binary blobs before they reach context (`run_bash`/`run_python`/`directory_tree`/`search_content`/`glob`) |
+| Redact last message | ✅ | `redact_last_message()`; all three frontends, repeatable to an empty chat |
+| Cumulative token usage | ✅ | `add_usage()`; persisted `chat.usage`, shown by all three frontends |
 | Chat export to Markdown | ✅ | GUI sidebar export button |
 | Settings dialog + Fetch Models | ✅ | GUI dialog + Web settings page + CLI `/config` |
-| Tasks (prompt templates) | ✅ | GUI Tasks dialog; stored in shared `tasks.json` (GUI-only in all editions) |
+| Tasks (prompt templates) | ✅ | All three frontends — GUI Tasks dialog, CLI `/tasks` + `/task <#>`, Web Tasks modal — stored in shared `tasks.json` |
 | Theme system (mode + accent) | ✅ | Desktop GUI; `theme_mode`/`theme_accent` in settings.json |
 | Reasoning effort / preservation | ✅ | `reasoning_effort`/`preserve_reasoning` settings |
 | Skills system | ✅ | Skills are markdown docs loaded via system message (skill files ship in the Python repo) |

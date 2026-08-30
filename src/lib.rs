@@ -139,6 +139,37 @@ pub extern "C" fn pengy_clean_messages(json: *const c_char) -> *mut c_char {
     )
 }
 
+/// Context-pruning "undo": pop the last raw message. See
+/// `chat_manager::redact_last_message`. Safe to call repeatedly down to an
+/// empty list.
+#[no_mangle]
+pub extern "C" fn pengy_messages_redact_last(json: *const c_char) -> *mut c_char {
+    let msgs: Vec<chat_manager::ChatMessage> =
+        serde_json::from_str(&unsafe { cstr(json) }).unwrap_or_default();
+    to_c(&serde_json::to_string(&chat_manager::redact_last_message(&msgs)).unwrap_or_default())
+}
+
+/// Accumulate one turn's token usage into the chat's running total and
+/// return the updated `Chat` JSON (so the GUI can both persist it via
+/// `pengy_chat_save` and read `chat.usage` back for display). See
+/// `chat_manager::add_usage`.
+#[no_mangle]
+pub extern "C" fn pengy_chat_add_usage(
+    chat_json: *const c_char,
+    usage_json: *const c_char,
+) -> *mut c_char {
+    let mut chat: chat_manager::Chat = match serde_json::from_str(&unsafe { cstr(chat_json) }) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let usage: llm_client::Usage = match serde_json::from_str(&unsafe { cstr(usage_json) }) {
+        Ok(u) => u,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    chat_manager::add_usage(&mut chat, &usage);
+    to_c(&serde_json::to_string(&chat).unwrap_or_default())
+}
+
 // ── Tasks ─────────────────────────────────────────────────────────
 
 #[no_mangle]

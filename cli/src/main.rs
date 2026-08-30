@@ -1,6 +1,7 @@
 use pengy_core::chat_manager::{self, Chat, ChatMessage};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
+use pengy_core::task_manager;
 use pengy_core::tools;
 
 use rustyline::completion::{Completer, Pair};
@@ -53,6 +54,9 @@ const SLASH_COMMANDS: &[&str] = &[
     "/delete",
     "/attach",
     "/compact",
+    "/redact",
+    "/tasks",
+    "/task",
     "/quit",
     "/exit",
     "/q",
@@ -397,22 +401,7 @@ impl PengyCli {
                 format!("{}\n{}", file_content, resolved_text)
             };
 
-            let chat = self.current_chat.as_mut().unwrap();
-            chat.messages.push(ChatMessage {
-                role: "user".into(),
-                content: Some(serde_json::Value::String(final_text.clone())),
-                tool_calls: vec![],
-                tool_call_id: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_details: None,
-            });
-
-            if chat.title == "New Chat" {
-                chat.title = truncate(&final_text, 50);
-            }
-
-            self.drive_chat();
+            self.send_text(&final_text);
         }
 
         self.clear_sudo_provider();
@@ -438,6 +427,7 @@ impl PengyCli {
                 }],
                 created_at: chrono_now(),
                 model: None,
+                usage: None,
             };
             self.current_chat = Some(chat);
         } else {
@@ -457,6 +447,31 @@ impl PengyCli {
 
         self.drive_chat();
         self.clear_sudo_provider();
+    }
+
+    /// Append a user message to the active chat and drive the turn.
+    ///
+    /// The REPL's normal send path, factored out so `/task` can feed a
+    /// rendered template through the exact same flow instead of duplicating
+    /// it (mirrors Python's `PengyCLI._send_text`).
+    fn send_text(&mut self, text: &str) {
+        if text.is_empty() || self.current_chat.is_none() {
+            return;
+        }
+        let chat = self.current_chat.as_mut().unwrap();
+        chat.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(serde_json::Value::String(text.to_string())),
+            tool_calls: vec![],
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
+        });
+        if chat.title == "New Chat" {
+            chat.title = truncate(text, 50);
+        }
+        self.drive_chat();
     }
 
     // ── Chat driver ──────────────────────────────────────────────
@@ -702,7 +717,8 @@ impl PengyCli {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
-                    self.render_final(&content, &usage);
+                    let totals = chat_manager::add_usage(self.current_chat.as_mut().unwrap(), &usage);
+                    self.render_final(&content, &usage, &totals);
                     self.current_chat
                         .as_mut()
                         .unwrap()
@@ -803,11 +819,17 @@ impl PengyCli {
         }
     }
 
-    fn render_final(&self, content: &str, usage: &llm_client::Usage) {
+    /// Renders the final response. `usage` is this turn's numbers; `totals`
+    /// is the chat's running total across every turn so far (see
+    /// `chat_manager::add_usage`) — a chat that's been going a while can burn
+    /// far more context than the last turn alone suggests, which is exactly
+    /// the pressure `/compact` and `/redact` exist to relieve.
+    fn render_final(&self, content: &str, usage: &llm_client::Usage, totals: &llm_client::Usage) {
         match self.output_mode.as_str() {
             "silent" => return,
             "json" => {
-                let result = serde_json::json!({"content": content, "usage": usage});
+                let result =
+                    serde_json::json!({"content": content, "usage": usage, "cumulative_usage": totals});
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).unwrap_or_default()
@@ -833,8 +855,13 @@ impl PengyCli {
 
         if usage.total_tokens > 0 {
             println!(
-                "{}Tokens: {} in / {} out ({} total){}",
-                DIM, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens, RESET
+                "{}Tokens: {} in / {} out ({} total this turn, {} total this chat){}",
+                DIM,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                totals.total_tokens,
+                RESET
             );
         }
     }
@@ -903,6 +930,9 @@ impl PengyCli {
             "/system" => self.cmd_system(args),
             "/attach" => self.cmd_attach(),
             "/compact" => self.cmd_compact(),
+            "/redact" => self.cmd_redact(args),
+            "/tasks" => self.cmd_tasks(),
+            "/task" => self.cmd_task(args),
             _ => println!("{}Unknown command:{} {}  (try /help)", RED, RESET, cmd),
         }
         true
@@ -938,6 +968,15 @@ impl PengyCli {
             ("/yolo [all|safe|none]", "Set tool confirmation mode"),
             ("/system [message...]", "Show or set the system message"),
             ("/compact", "Compact context by eliding old tool results"),
+            (
+                "/redact [N]",
+                "Delete the last N messages (default 1) — repeatable up to the top",
+            ),
+            ("/tasks", "List saved prompt-template Tasks"),
+            (
+                "/task <#>",
+                "Run a Task by its /tasks index, prompting for any %placeholders%",
+            ),
             ("/list", "List recent chats"),
             ("/load <index>", "Load a chat by its /list index"),
             ("/delete <index>", "Delete a chat by its /list index"),
@@ -1732,6 +1771,132 @@ impl PengyCli {
             GREEN, RESET, turns, old_count, new_count
         );
         chat_manager::save_chat(chat).ok();
+    }
+
+    /// Delete the last N raw messages (default 1) from the current chat.
+    ///
+    /// This is the "undo the model's last step" button: repeatable all the
+    /// way to an empty chat. It edits chats.json directly, so it wrecks
+    /// prompt caching on most backends — that's the expected trade-off for
+    /// pruning a wrong path out of context.
+    fn cmd_redact(&mut self, args: &[&str]) {
+        let chat = match self.current_chat.as_mut() {
+            Some(c) => c,
+            None => {
+                println!("{}No active chat.{}", DIM, RESET);
+                return;
+            }
+        };
+        let n: usize = if args.is_empty() {
+            1
+        } else {
+            match args[0].parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    println!(
+                        "{}Usage: /redact [N]  — delete the last N messages (default 1){}",
+                        RED, RESET
+                    );
+                    return;
+                }
+            }
+        };
+
+        if chat.messages.is_empty() {
+            println!("{}Chat is already empty.{}", DIM, RESET);
+            return;
+        }
+
+        let before = chat.messages.len();
+        for _ in 0..n.min(before) {
+            chat.messages = chat_manager::redact_last_message(&chat.messages);
+        }
+        chat_manager::save_chat(chat).ok();
+
+        let removed = before - chat.messages.len();
+        let after = chat.messages.len();
+        println!(
+            "{}Redacted {} message(s).{} ({} -> {})",
+            GREEN, removed, RESET, before, after
+        );
+        if after > 0 {
+            let three = ["3"];
+            self.cmd_show(&three);
+        }
+    }
+
+    /// List saved prompt-template Tasks (shared with the GUI's Tasks dialog).
+    fn cmd_tasks(&self) {
+        let tasks = task_manager::load_tasks();
+        if tasks.is_empty() {
+            println!(
+                "{}No tasks defined yet. Create one in the GUI's Tasks dialog (or add one to \
+                 tasks.json), then run it here with /task <#>.{}",
+                DIM, RESET
+            );
+            return;
+        }
+        println!();
+        println!("{}Tasks{}", BOLD, RESET);
+        println!("{}{}{}", DIM, "-".repeat(60), RESET);
+        for (i, task) in tasks.iter().enumerate() {
+            let mut preview = task.template.replace('\n', " ");
+            if preview.chars().count() > 60 {
+                let head: String = preview.chars().take(57).collect();
+                preview = format!("{head}...");
+            }
+            println!(
+                "  {}{:<3}{} {:<24} {}",
+                CYAN,
+                format!("{}.", i + 1),
+                RESET,
+                task.title,
+                preview
+            );
+        }
+        println!("{}Run one with /task <#>{}", DIM, RESET);
+    }
+
+    /// Run a Task: fill in its `%placeholders%`, then send it like a normal
+    /// message.
+    fn cmd_task(&mut self, args: &[&str]) {
+        if self.current_chat.is_none() {
+            println!("{}No active chat.{}", DIM, RESET);
+            return;
+        }
+        if args.is_empty() {
+            self.cmd_tasks();
+            return;
+        }
+
+        let tasks = task_manager::load_tasks();
+        let index: usize = match args[0].parse::<usize>() {
+            Ok(n) if n >= 1 && n <= tasks.len() => n,
+            _ => {
+                println!(
+                    "{}Usage: /task <#>  (use /tasks to see indices){}",
+                    RED, RESET
+                );
+                return;
+            }
+        };
+        let task = &tasks[index - 1];
+        let placeholders = task_manager::extract_placeholders(&task.template);
+        let mut values = std::collections::HashMap::new();
+        for name in &placeholders {
+            let label = format!("  {}: ", name);
+            if let Some(value) = self.prompt(&label) {
+                values.insert(name.clone(), value);
+            }
+        }
+
+        let rendered = task_manager::render_template(&task.template, &values);
+        let rendered = rendered.trim();
+        if rendered.is_empty() {
+            println!("{}This task produced an empty prompt.{}", YELLOW, RESET);
+            return;
+        }
+        self.send_text(rendered);
     }
 
     // ── Helpers ──────────────────────────────────────────────────

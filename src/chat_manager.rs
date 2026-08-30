@@ -3,6 +3,7 @@
 //! Stores chat sessions as a JSON array at `~/.config/pengy/chats.json`.
 //! Shared between the GUI and any future CLI/web frontends.
 
+use crate::llm_client::Usage;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
@@ -21,6 +22,10 @@ pub struct Chat {
     /// Per-tab model override. `None` means "follow the global default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Cumulative token usage across every turn in this chat (not just the
+    /// last one). `None` until the first turn reports usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /// A message in a chat (OpenAI-compatible format).
@@ -89,6 +94,7 @@ impl Chat {
             messages: Vec::new(),
             created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             model: None,
+            usage: None,
         }
     }
 }
@@ -611,6 +617,92 @@ pub fn elide_old_tool_results(messages: &[ChatMessage], keep_turns: usize) -> Ve
         .collect()
 }
 
+/// Drop the last message and repair any dangling `tool_calls` it leaves
+/// behind.
+///
+/// One "redact" call pops exactly one raw message off the end -- a tool
+/// result, an assistant `tool_calls` request, or a final response.
+///
+/// Popping a tool result can't just fall through to
+/// [`clean_dangling_tool_calls`]: that function *synthesizes* a "cancelled"
+/// placeholder for any `tool_calls` entry left unsatisfied, so a naive
+/// pop-then-repair would regenerate an equivalent stub every time and
+/// redaction could never advance past it. Instead the popped `tool_call_id`
+/// is struck directly from its assistant message's `tool_calls` list; if
+/// that empties the list (and the assistant left no other text), the
+/// now-empty assistant message is dropped too, so redacting a
+/// single-tool-call round removes it in one call, not two.
+///
+/// Safe to call repeatedly down to an empty list.
+pub fn redact_last_message(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let mut messages: Vec<ChatMessage> = messages.to_vec();
+    let last = messages.pop().unwrap();
+
+    if last.role == "tool" {
+        if let Some(ref last_id) = last.tool_call_id {
+            // Find the assistant message that declared this tool_call_id --
+            // not necessarily the immediately preceding message, since a
+            // multi-tool round has several tool results trailing one
+            // assistant message.
+            for i in (0..messages.len()).rev() {
+                if messages[i].role != "assistant" {
+                    continue;
+                }
+                if messages[i].tool_calls.iter().any(|tc| &tc.id == last_id) {
+                    let remaining: Vec<ToolCall> = messages[i]
+                        .tool_calls
+                        .iter()
+                        .filter(|tc| &tc.id != last_id)
+                        .cloned()
+                        .collect();
+                    if !remaining.is_empty() {
+                        messages[i].tool_calls = remaining;
+                    } else {
+                        let has_text = messages[i]
+                            .content
+                            .as_ref()
+                            .and_then(|c| c.as_str())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if has_text {
+                            messages[i].tool_calls = Vec::new();
+                        } else {
+                            messages.remove(i);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    clean_dangling_tool_calls(&messages)
+}
+
+/// Accumulate one turn's token usage into the chat's running total.
+///
+/// `LlmEvent::FinalResponse` reports usage for that turn only (reset every
+/// call), so without this each frontend only ever showed the *last* turn's
+/// numbers -- no signal for how much context a long-running chat has
+/// actually burned through. Stored on `chat.usage` (not tab/session-only
+/// state) so the running total persists across reloads and is visible from
+/// any frontend, not just the process that made the call. Mutates and
+/// returns `chat.usage`.
+pub fn add_usage(chat: &mut Chat, usage: &Usage) -> Usage {
+    let totals = chat.usage.get_or_insert_with(|| Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    });
+    totals.prompt_tokens += usage.prompt_tokens;
+    totals.completion_tokens += usage.completion_tokens;
+    totals.total_tokens += usage.total_tokens;
+    totals.clone()
+}
+
 fn backup_corrupt_file(path: &std::path::Path) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -966,5 +1058,119 @@ mod tests {
         assert!(out.contains("iVBORw0KGgo="));
         assert!(out.contains(r#""type":"text"#));
         assert!(!out.contains("tool_calls"));
+    }
+
+    // ── redact_last_message tests ──────────────────────────────────
+
+    #[test]
+    fn redact_empty_is_noop() {
+        assert!(redact_last_message(&[]).is_empty());
+    }
+
+    #[test]
+    fn redact_pops_plain_final_response() {
+        let msgs = vec![user_msg("hello"), assistant_msg("hi there")];
+        let redacted = redact_last_message(&msgs);
+        assert_eq!(redacted.len(), 1);
+        assert_eq!(redacted[0].role, "user");
+    }
+
+    #[test]
+    fn redact_single_tool_call_removes_whole_round() {
+        // Popping the last (and only) tool result of a round strikes it from
+        // its assistant's tool_calls list; since nothing is left of that
+        // assistant message, it's dropped too rather than left as a
+        // dangling stub that redaction could never get past.
+        let msgs = vec![
+            user_msg("hello"),
+            assistant_with_tools(&["tc-1"]),
+            tool_msg("tc-1", "file contents"),
+        ];
+        let redacted = redact_last_message(&msgs);
+        assert_eq!(redacted.len(), 1);
+        assert_eq!(redacted[0].role, "user");
+    }
+
+    #[test]
+    fn redact_one_of_two_tool_calls_keeps_sibling_result() {
+        let msgs = vec![
+            user_msg("hello"),
+            assistant_with_tools(&["tc-1", "tc-2"]),
+            tool_msg("tc-1", "result1"),
+            tool_msg("tc-2", "result2"),
+        ];
+        let redacted = redact_last_message(&msgs);
+        assert_eq!(redacted.len(), 3);
+        assert_eq!(redacted[1].tool_calls.len(), 1);
+        assert_eq!(redacted[1].tool_calls[0].id, "tc-1");
+        assert_eq!(redacted[2].tool_call_id.as_deref(), Some("tc-1"));
+        assert_eq!(
+            redacted[2].content.as_ref().unwrap().as_str().unwrap(),
+            "result1"
+        );
+    }
+
+    #[test]
+    fn redact_repeated_calls_walk_back_to_empty() {
+        let msgs = vec![
+            user_msg("hello"),
+            assistant_with_tools(&["tc-1"]),
+            tool_msg("tc-1", "file contents"),
+        ];
+        let step1 = redact_last_message(&msgs);
+        assert_eq!(step1.len(), 1);
+        let step2 = redact_last_message(&step1);
+        assert!(step2.is_empty());
+        // Calling again on an already-empty list must not panic.
+        let step3 = redact_last_message(&step2);
+        assert!(step3.is_empty());
+    }
+
+    #[test]
+    fn redact_does_not_mutate_input() {
+        let original = vec![user_msg("a"), assistant_msg("b")];
+        let original_copy = original.clone();
+        let _ = redact_last_message(&original);
+        assert_eq!(original.len(), original_copy.len());
+        assert_eq!(original[0].role, original_copy[0].role);
+    }
+
+    // ── add_usage tests ─────────────────────────────────────────────
+
+    #[test]
+    fn add_usage_creates_and_accumulates() {
+        let mut chat = Chat::new("Test");
+        assert!(chat.usage.is_none());
+
+        let totals = add_usage(
+            &mut chat,
+            &Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        );
+        assert_eq!(totals.total_tokens, 15);
+        assert_eq!(chat.usage.as_ref().unwrap().total_tokens, 15);
+
+        let totals = add_usage(
+            &mut chat,
+            &Usage {
+                prompt_tokens: 20,
+                completion_tokens: 8,
+                total_tokens: 28,
+            },
+        );
+        assert_eq!(totals.prompt_tokens, 30);
+        assert_eq!(totals.completion_tokens, 13);
+        assert_eq!(totals.total_tokens, 43);
+        assert_eq!(chat.usage.as_ref().unwrap().total_tokens, 43);
+    }
+
+    #[test]
+    fn chat_usage_omitted_from_json_until_set() {
+        let chat = Chat::new("Test");
+        let json = serde_json::to_string(&chat).unwrap();
+        assert!(!json.contains("usage"));
     }
 }

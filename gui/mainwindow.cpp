@@ -116,6 +116,17 @@ void MainWindow::setupUi() {
     connect(m_chatInput, &ChatInputWidget::messageSent, this, &MainWindow::sendMessage);
     inputLayout->addWidget(m_chatInput);
 
+    m_redactBtn = new QPushButton("Redact");
+    m_redactBtn->setFixedHeight(scaledSize(32, m_runtimeUiScale));
+    applyPengyIcon(m_redactBtn, "delete", makeTheme(m_config["theme_mode"].toString("system"), m_config["theme_accent"].toString("default")), 16, "muted", "danger");
+    m_redactBtn->setToolTip(
+        "Delete the last message from the active chat. Repeatable up to "
+        "the top — a way to prune context after the model goes down a "
+        "wrong path. Wrecks prompt caching for this chat.");
+    m_redactBtn->setAccessibleName("Redact last message");
+    connect(m_redactBtn, &QPushButton::clicked, this, &MainWindow::redactLast);
+    inputLayout->addWidget(m_redactBtn);
+
     m_stopBtn = new QPushButton("Stop");
     m_stopBtn->setFixedHeight(scaledSize(32, m_runtimeUiScale));
     applyPengyIcon(m_stopBtn, "stop", makeTheme(m_config["theme_mode"].toString("system"), m_config["theme_accent"].toString("default")), 16, "primary_fg", "primary_fg");
@@ -151,6 +162,10 @@ void MainWindow::applyTheme() {
     qApp->setStyleSheet(appStyleSheet(theme, themeScale));
     if (m_chatInput) m_chatInput->applyTheme(theme, themeScale);
     if (m_chatHistory) m_chatHistory->applyTheme(theme, themeScale);
+    if (m_redactBtn) {
+        m_redactBtn->setFixedHeight(scaledSize(32, themeScale));
+        applyPengyIcon(m_redactBtn, "delete", theme, 16, "muted", "danger");
+    }
     if (m_stopBtn) {
         m_stopBtn->setFixedHeight(scaledSize(32, themeScale));
         m_stopBtn->setStyleSheet(QString(
@@ -236,6 +251,11 @@ TabSession* MainWindow::addTab(const QJsonObject& chat, bool switchTo) {
     TabSession session;
     session.chat     = chat;
     session.chatView = chatView;
+    // Seed the cumulative token display from what's already on disk, so
+    // reopening a chat shows its running total instead of resetting to 0.
+    QJsonObject usage = chat["usage"].toObject();
+    session.promptTokens = usage["prompt_tokens"].toInt();
+    session.completionTokens = usage["completion_tokens"].toInt();
 
     // Apply theme FIRST so renderNow() uses the correct colours
     int themeScale = m_runtimeUiScale;
@@ -303,9 +323,16 @@ void MainWindow::closeTab(int index) {
     // Save or delete
     bool isEmptyNew = (session.chat["title"].toString() == "New Chat"
                        && session.chat["messages"].toArray().isEmpty());
-    if (isEmptyNew)
+    if (isEmptyNew) {
         pengy_chat_delete(chatId.toUtf8().constData());
-    else {
+        // addChat() put a row in the sidebar for this chat when it was
+        // created; deleting it from disk without also dropping that row
+        // left a phantom "New Chat" entry that a later createNewChat()
+        // would never recognize as already gone (its dedup check only
+        // looks at *open* tabs), so every close-then-reopen added another
+        // ghost row -- endless "New Chat" entries piling up in the sidebar.
+        m_chatHistory->removeChat(chatId);
+    } else {
         QByteArray json = QJsonDocument(session.chat).toJson(QJsonDocument::Compact);
         pengy_chat_save(json.constData());
     }
@@ -366,6 +393,9 @@ void MainWindow::loadIntoNewTab(const QString& chatId) {
         if (onlySession.chat["title"].toString() == "New Chat"
             && onlySession.chat["messages"].toArray().isEmpty()) {
             pengy_chat_delete(onlySession.chat["id"].toString().toUtf8().constData());
+            // Same ghost-row leak as closeTab() if the sidebar row (added by
+            // createNewChat()'s addChat() call) isn't dropped too.
+            m_chatHistory->removeChat(onlySession.chat["id"].toString());
             for (int i = 0; i < m_tabWidget->count(); ++i) {
                 if (m_tabWidget->widget(i) == onlySession.chatView) {
                     m_tabWidget->removeTab(i);
@@ -460,9 +490,14 @@ void MainWindow::createNewChat() {
     QJsonObject chat = QJsonDocument::fromJson(QByteArray(json)).object();
     pengy_free(json);
 
-    loadChatList();
     addTab(chat, true);
     m_activeChatId = chat["id"].toString();
+    // A single insert, not a full loadChatList() rebuild: that rebuilds
+    // every row in the sidebar (one QWidget with icon-bearing buttons per
+    // *existing* chat) and was the dominant cost behind "New Chat feels
+    // slow" once the sidebar has more than a handful of chats. The new
+    // chat is always the newest, so it always belongs at the top.
+    m_chatHistory->addChat(chat["id"].toString(), chat["title"].toString());
     m_chatHistory->selectChatById(m_activeChatId);
 
     TabSession* session = tabForChat(m_activeChatId);
@@ -774,6 +809,25 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
 void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& response) {
     QString content = response["content"].toString();
 
+    // Accumulate into chat["usage"] rather than overwrite: LLM events report
+    // usage per turn, and this label is more useful as "how much context has
+    // this whole chat burned through" than "last turn only" -- the same
+    // signal that tells you when it's time to /compact or redact. Stored on
+    // the chat object (not just session state) so it persists across
+    // reloads. Done *before* the message-append save below so both land in
+    // the same write instead of the usage total lagging a turn behind.
+    QJsonObject usage = response["usage"].toObject();
+    QByteArray usageJson = QJsonDocument(usage).toJson(QJsonDocument::Compact);
+    QByteArray chatJsonForUsage = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+    char* updatedChatRaw = pengy_chat_add_usage(chatJsonForUsage.constData(), usageJson.constData());
+    if (updatedChatRaw) {
+        session->chat = QJsonDocument::fromJson(QByteArray(updatedChatRaw)).object();
+        pengy_free(updatedChatRaw);
+    }
+    QJsonObject cumulative = session->chat["usage"].toObject();
+    session->promptTokens = cumulative["prompt_tokens"].toInt();
+    session->completionTokens = cumulative["completion_tokens"].toInt();
+
     if (!content.isEmpty()) {
         QJsonObject asstMsg = response["message"].toObject();
         if (asstMsg.isEmpty()) {
@@ -796,10 +850,6 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
         QByteArray chatJson = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
         pengy_chat_save(chatJson.constData());
     }
-
-    QJsonObject usage = response["usage"].toObject();
-    session->promptTokens = usage["prompt_tokens"].toInt();
-    session->completionTokens = usage["completion_tokens"].toInt();
 
     if (session == tabForChat(m_activeChatId))
         updateQuickSettingsFor(session);
@@ -992,6 +1042,39 @@ void MainWindow::stopWorker() {
         QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
         pengy_chat_save(json.constData());
     }
+}
+
+void MainWindow::redactLast() {
+    // User pressed Redact -- drop the last raw message from the active
+    // tab's chat and rebuild the view from what remains.
+    //
+    // Refused while a turn is in flight: popping messages out from under a
+    // running worker (which holds its own snapshot for the whole run) would
+    // race with the worker's own saves.
+    TabSession* session = tabForChat(m_activeChatId);
+    if (!session || session->chat.isEmpty()) return;
+    if (session->worker) {
+        QMessageBox::information(
+            this, "Redact",
+            "Cannot redact while a response is in progress. Press Stop first.");
+        return;
+    }
+    QJsonArray messages = session->chat["messages"].toArray();
+    if (messages.isEmpty()) return;
+
+    QByteArray json = QJsonDocument(messages).toJson(QJsonDocument::Compact);
+    char* redacted = pengy_messages_redact_last(json.constData());
+    if (!redacted) return;
+    session->chat["messages"] = QJsonDocument::fromJson(QByteArray(redacted)).array();
+    pengy_free(redacted);
+
+    QByteArray chatJson = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+    pengy_chat_save(chatJson.constData());
+
+    session->chatView->clear();
+    for (const QJsonValue& v : session->chat["messages"].toArray())
+        renderMessage(session->chatView, v.toObject());
+    session->chatView->renderNow();
 }
 
 void MainWindow::handleQuestionRequest(TabSession* session) {
