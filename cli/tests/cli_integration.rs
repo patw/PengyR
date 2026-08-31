@@ -252,6 +252,7 @@ fn help_lists_new_and_old_commands() {
     assert!(out.contains("/redact"), "{out}");
     assert!(out.contains("/tasks"), "{out}");
     assert!(out.contains("/task"), "{out}");
+    assert!(out.contains("/download-max"), "{out}");
     // Pre-existing commands must still be listed -- catches a help-table
     // edit that accidentally drops an entry.
     assert!(out.contains("/compact"), "{out}");
@@ -319,6 +320,23 @@ fn model_command_persists_across_invocations() {
     h.run(&["/model gpt-4o-mini"]);
     let out = h.run(&["/config"]);
     assert!(out.contains("gpt-4o-mini"), "{out}");
+}
+
+#[test]
+fn download_max_sets_and_persists() {
+    let h = Harness::new();
+    let out = h.run(&["/download-max 50"]);
+    assert!(out.contains("Download max changed"), "{out}");
+    // A second, independent process must see the same setting.
+    let out2 = h.run(&["/download-max"]);
+    assert!(out2.contains("50 MB"), "{out2}");
+}
+
+#[test]
+fn download_max_invalid_is_rejected() {
+    let h = Harness::new();
+    let out = h.run(&["/download-max abc"]);
+    assert!(out.contains("Usage"), "{out}");
 }
 
 #[test]

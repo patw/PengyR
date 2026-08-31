@@ -3,7 +3,8 @@
 //! Chats live one per file in `<config>/chats/<id>.json`. `index.json` caches
 //! the sidebar summary but is never authoritative -- these pin that it always
 //! converges back to what the chat files say, and that the legacy `chats.json`
-//! is read but never written.
+//! is read as a one-time seed and only trimmed by `delete_chat` (so a deleted
+//! chat can't resurrect on a later import).
 //!
 //! `set_config_dir` writes a `OnceLock`, so the config dir can only be chosen
 //! once per test binary. Everything therefore runs as one test with `reset()`
@@ -205,7 +206,7 @@ fn split_store_behaves() {
     );
     assert_eq!(load_chats().len(), 1);
 
-    // ── legacy chats.json is never modified ─────────────────────────────
+    // ── legacy chats.json is only trimmed by delete ─────────────────────
     reset(&dir);
     write_legacy(&dir, &[legacy_chat("old-1", "OLD", vec![])]);
     let legacy_bytes = std::fs::read(dir.join("chats.json")).unwrap();
@@ -213,13 +214,42 @@ fn split_store_behaves() {
     let mut c = get_chat("old-1").unwrap();
     c.title = "RENAMED".into();
     save_chat(&c).unwrap();
-    delete_chat("old-1").unwrap();
     load_chats();
     assert_eq!(
         std::fs::read(dir.join("chats.json")).unwrap(),
         legacy_bytes,
-        "legacy store must never be written or deleted"
+        "load/save/rename must not touch the legacy store"
     );
+    delete_chat("old-1").unwrap();
+    let remaining: Vec<Chat> =
+        serde_json::from_slice(&std::fs::read(dir.join("chats.json")).unwrap()).unwrap();
+    assert!(remaining.is_empty(), "delete must trim the deleted chat out");
+
+    // ── deleted chat does not resurrect from legacy ─────────────────────
+    reset(&dir);
+    write_legacy(
+        &dir,
+        &[
+            legacy_chat("old-1", "OLD", vec![]),
+            legacy_chat("old-2", "KEEP", vec![]),
+        ],
+    );
+    assert!(titles().contains(&"OLD".to_string()));
+    delete_chat("old-1").unwrap();
+    assert!(get_chat("old-1").is_none());
+    // Simulate index loss: a rebuild re-runs the legacy import, but old-1
+    // was trimmed out of chats.json, so it stays gone.
+    std::fs::remove_file(chats_dir.join("index.json")).unwrap();
+    let t = titles();
+    assert!(
+        !t.contains(&"OLD".to_string()),
+        "deleted chat must not resurrect"
+    );
+    assert!(
+        t.contains(&"KEEP".to_string()),
+        "unrelated legacy chat survives"
+    );
+    assert!(get_chat("old-1").is_none());
 
     // ── another edition rewrote chats.json ──────────────────────────────
     reset(&dir);

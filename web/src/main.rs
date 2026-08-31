@@ -3074,6 +3074,16 @@ function hideThinking() {{
   if (thinkingEl) {{ thinkingEl.remove(); thinkingEl = null; }}
 }}
 
+function showRetrying(data) {{
+  hideThinking();
+  thinkingEl = document.createElement('div');
+  thinkingEl.className = 'msg-thinking';
+  const delay = (data.delay_secs != null ? data.delay_secs : 0);
+  thinkingEl.innerHTML = '<div class="spinner-border spinner-border-sm" role="status"></div>' +
+    `<span>Overloaded — retrying in ${{delay.toFixed(1)}}s (${{data.attempt}}/${{data.max_attempts}})</span>`;
+  appendToArea(thinkingEl);
+}}
+
 function exportChat() {{
   window.open(`/chat/${{CHAT_ID}}/export`, '_blank');
 }}
@@ -3429,6 +3439,9 @@ function handleEvent(data) {{
       hideThinking();
       updateToolResult(data);
       showThinking();
+      break;
+    case 'retrying':
+      showRetrying(data);
       break;
     case 'final_response':
       hideThinking();

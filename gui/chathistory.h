@@ -25,6 +25,7 @@ public:
     void updateTokenUsage(int prompt, int completion);
     void setThinking(bool thinking);
     void setToolRunning(bool running);
+    void setRetrying(const QString& text);
 
 #ifdef PENGY_UNIT_TEST
     int testChatCount() const { return m_chatList->count(); }

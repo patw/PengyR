@@ -116,7 +116,9 @@ impl Chat {
 //
 // The legacy `chats.json` is still read, so a machine that switches between the
 // Python, Rust and C++ editions doesn't appear to lose history. It is never
-// written and never deleted.
+// appended to — it stays as a one-time seed. The single exception:
+// `delete_chat` removes a deleted chat's entry from it too, so a later legacy
+// re-import can't silently resurrect it.
 
 const CHATS_DIR: &str = "chats";
 const INDEX_FILE: &str = "index.json";
@@ -450,7 +452,25 @@ pub fn delete_chat(chat_id: &str) -> io::Result<()> {
     ensure_current();
     let _ = fs::remove_file(chat_file(chat_id));
     drop_index_entry(chat_id);
+    remove_from_legacy(chat_id);
     Ok(())
+}
+
+/// Drop `chat_id` from the legacy `chats.json` seed, so a deleted chat can't be
+/// resurrected by a later legacy import (triggered by an index rebuild or an
+/// externally rewritten `chats.json`).
+fn remove_from_legacy(chat_id: &str) {
+    let Some(legacy) = read_json::<Vec<Chat>>(&legacy_path()) else {
+        return;
+    };
+    let original_len = legacy.len();
+    let filtered: Vec<Chat> = legacy
+        .into_iter()
+        .filter(|c| c.id != chat_id)
+        .collect();
+    if filtered.len() != original_len {
+        let _ = atomic_write(&legacy_path(), &filtered);
+    }
 }
 
 /// Save a single chat -- one small file write, not the whole store.

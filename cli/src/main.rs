@@ -48,6 +48,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/apikey",
     "/llm-timeout",
     "/timeout",
+    "/download-max",
     "/agent",
     "/context-keep",
     "/system",
@@ -925,6 +926,7 @@ impl PengyCli {
             "/apikey" => self.cmd_apikey(args),
             "/llm-timeout" => self.cmd_llm_timeout(args),
             "/timeout" => self.cmd_timeout(args),
+            "/download-max" => self.cmd_download_max(args),
             "/agent" => self.cmd_agent(args),
             "/context-keep" => self.cmd_context_keep(args),
             "/system" => self.cmd_system(args),
@@ -963,6 +965,10 @@ impl PengyCli {
                 "Set LLM API request timeout in seconds",
             ),
             ("/timeout <sec>", "Set tool execution timeout in seconds"),
+            (
+                "/download-max <mb>",
+                "Set default download size limit in MB (0 = no limit)",
+            ),
             ("/agent <string>", "Set the user agent string"),
             ("/context-keep <n>", "Set how many recent turns to keep"),
             ("/yolo [all|safe|none]", "Set tool confirmation mode"),
@@ -1663,6 +1669,33 @@ impl PengyCli {
                 );
             }
             _ => println!("{}Invalid number. Usage: /timeout <seconds>{}", RED, RESET),
+        }
+    }
+
+    fn cmd_download_max(&mut self, args: &[&str]) {
+        if args.is_empty() {
+            println!(
+                "{}Current download max:{} {} MB",
+                DIM, RESET, self.config.download_max_mb
+            );
+            println!("{}Usage: /download-max <mb> (0 = no limit){}", DIM, RESET);
+            return;
+        }
+        match args[0].parse::<u64>() {
+            Ok(mb) => {
+                let old = self.config.download_max_mb;
+                self.config.download_max_mb = mb;
+                self.save_config();
+                *tools::DOWNLOAD_MAX_MB.lock().unwrap() = mb;
+                println!(
+                    "{}Download max changed:{} {} MB -> {}{} MB{}",
+                    GREEN, RESET, old, BOLD, mb, RESET
+                );
+            }
+            _ => println!(
+                "{}Invalid number. Usage: /download-max <mb> (0 = no limit){}",
+                RED, RESET
+            ),
         }
     }
 

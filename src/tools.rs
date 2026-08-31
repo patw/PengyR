@@ -945,6 +945,13 @@ async fn read_file(path: String, offset: Option<usize>, limit: Option<usize>) ->
         }
     };
 
+    // Hard-invalid UTF-8 already failed read_to_string above; this catches the
+    // other half — bytes that decode as valid UTF-8 but aren't text (a UTF-16
+    // file leaves a NUL between every ASCII byte).
+    if looks_binary(&text).0 {
+        return format!("Error: File appears to be binary (not text): {path}");
+    }
+
     let lines: Vec<&str> = text.split('\n').collect();
     let total = lines.len();
     let start = offset.unwrap_or(1).max(1);
@@ -1157,16 +1164,20 @@ fn rewrite_sudo_for_askpass(command: &str) -> String {
 
 /// Temporary `SUDO_ASKPASS` helper script.
 ///
-/// The password itself never touches the disk — the script just echoes the
-/// `PENGY_SUDO_PASSWORD` environment variable handed to the child process.
-/// The containing directory and the script are both mode 0700.
+/// The password is written to a private 0600 file that only the askpass script
+/// reads. It is deliberately *not* placed in the child process's environment:
+/// a `PENGY_SUDO_PASSWORD` env var would be visible to every child of the
+/// command (`printenv`/`env`, a build script, a package post-install) and could
+/// leak back into tool output and the chat log. Directory, script and password
+/// file are all single-use and removed when the command exits.
 struct AskpassHelper {
     dir: PathBuf,
     path: PathBuf,
+    pw_path: PathBuf,
 }
 
 impl AskpassHelper {
-    fn new() -> Result<Self, std::io::Error> {
+    fn new(password: &str) -> Result<Self, std::io::Error> {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1174,21 +1185,25 @@ impl AskpassHelper {
         let mut dir = std::env::temp_dir();
         dir.push(format!("pengy-askpass-{}-{nanos}", std::process::id()));
         std::fs::create_dir(&dir)?;
+        let pw_path = dir.join("pw");
+        std::fs::write(&pw_path, password)?;
         let path = dir.join("askpass.sh");
-        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$PENGY_SUDO_PASSWORD\"\n")?;
+        std::fs::write(&path, format!("#!/bin/sh\ncat '{}'\n", pw_path.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        Ok(Self { dir, path })
+        Ok(Self { dir, path, pw_path })
     }
 }
 
 impl Drop for AskpassHelper {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.pw_path);
         let _ = std::fs::remove_dir(&self.dir);
     }
 }
@@ -1242,7 +1257,12 @@ async fn run_bash(command: String, cwd: Option<String>, ctx: Arc<ToolContext>) -
     // lookahead support, so the rewrite is a manual scan.
     let mut askpass = None;
     let command = if password_needed {
-        match AskpassHelper::new() {
+        let password = ctx.cached_sudo_password.lock().unwrap().clone();
+        let password = match password {
+            Some(p) => p,
+            None => return "Error: sudo detected but no password provider is configured.".into(),
+        };
+        match AskpassHelper::new(&password) {
             Ok(helper) => {
                 askpass = Some(helper);
                 rewrite_sudo_for_askpass(&command)
@@ -1270,9 +1290,6 @@ async fn run_bash(command: String, cwd: Option<String>, ctx: Arc<ToolContext>) -
     }
     if let Some(ref helper) = askpass {
         cmd.env("SUDO_ASKPASS", &helper.path);
-        if let Some(ref pw) = *ctx.cached_sudo_password.lock().unwrap() {
-            cmd.env("PENGY_SUDO_PASSWORD", pw);
-        }
     }
     #[cfg(unix)]
     {
@@ -2259,6 +2276,9 @@ async fn fetch_url(url_str: String, max_chars: Option<usize>) -> String {
 
     let budget = *TOOL_OUTPUT_MAX_CHARS.lock().unwrap();
     let limit = max_chars.unwrap_or(budget);
+    if looks_binary(&text).0 {
+        return "Error fetching URL: response appears to be binary data, not text".to_string();
+    }
     if limit > 0 && text.len() > limit {
         format!(
             "{}\n\n[... truncated at {} characters — pass max_chars to adjust ...]",
@@ -2545,7 +2565,6 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
 
     let mut parts: Vec<String> = Vec::new();
     let mut total_chars = 0;
-    let mut errors = 0;
 
     for raw_path in &paths {
         let p = expand_home(raw_path);
@@ -2554,12 +2573,10 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
 
         if !p.exists() {
             parts.push(format!("{header}\n  ❌ File not found."));
-            errors += 1;
             continue;
         }
         if !p.is_file() {
             parts.push(format!("{header}\n  ❌ Not a file."));
-            errors += 1;
             continue;
         }
 
@@ -2567,10 +2584,16 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
             Ok(c) => c,
             Err(e) => {
                 parts.push(format!("{header}\n  ❌ Error reading file: {e}"));
-                errors += 1;
                 continue;
             }
         };
+
+        // Same binary guard as read_file: valid-UTF-8 bytes that aren't text
+        // (e.g. a UTF-16 file's NUL-interleaved ASCII) must not flood context.
+        if looks_binary(&content).0 {
+            parts.push(format!("{header}\n  ❌ Binary file (not text)."));
+            continue;
+        }
 
         // Same head-truncation and line-range reporting as read_file, so the
         // model can follow up with read_file(offset=...) on whichever file was cut.
@@ -2608,11 +2631,7 @@ async fn read_multiple_files(paths: Vec<String>) -> String {
         total_chars += parts.last().map(|s| s.len()).unwrap_or(0);
     }
 
-    if errors == paths.len() {
-        parts.join("\n\n")
-    } else {
-        parts.join("\n\n")
-    }
+    parts.join("\n\n")
 }
 
 async fn search_content(
@@ -3360,6 +3379,7 @@ mod tests {
              if [ \"$1\" != \"-A\" ]; then echo \"sudo: no tty present\" >&2; exit 1; fi\n\
              shift\n\
              pw=\"$(\"$SUDO_ASKPASS\")\"\n\
+             if [ -n \"${PENGY_SUDO_PASSWORD:-}\" ]; then echo \"LEAK:${PENGY_SUDO_PASSWORD}\"; fi\n\
              echo \"pw=$pw\"\n\
              exec \"$@\"\n",
         )
@@ -3385,9 +3405,37 @@ mod tests {
             let result = run_bash(command.into(), None, ctx.clone()).await;
             assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
             assert!(!result.contains("no tty present"), "{command:?} -> {result:?}");
+            assert!(!result.contains("LEAK:"), "password leaked into env: {command:?} -> {result:?}");
         }
 
         std::env::set_var("PATH", old_path);
+    }
+
+    #[test]
+    fn askpass_helper_keeps_password_out_of_env_and_script() {
+        let helper = AskpassHelper::new("s3cret").unwrap();
+        let script = std::fs::read_to_string(&helper.path).unwrap();
+        // The script must not embed the password itself.
+        assert!(!script.contains("s3cret"), "{script:?}");
+        // The password lives in a separate file the script cats.
+        let pw_file = script
+            .split("cat '")
+            .nth(1)
+            .unwrap()
+            .split('\'')
+            .next()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(pw_file).unwrap(), "s3cret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&helper.path), 0o700);
+            assert_eq!(mode(std::path::Path::new(pw_file)), 0o600);
+        }
+        drop(helper);
     }
 
     #[test]
@@ -4122,6 +4170,45 @@ mod tests {
         let text = "def foo():\n\treturn 'hello world!' # comment\n".repeat(50);
         let out = snip_tool_output(text.clone());
         assert_eq!(out, text);
+    }
+
+    /// UTF-16 text decodes as *valid* UTF-8 (ASCII interleaved with NULs), so
+    /// the strict decode alone misses it — read_file needs the guard too.
+    #[tokio::test]
+    async fn read_file_blocks_binary_that_decodes_as_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("utf16.txt");
+        std::fs::write(&p, "hello".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
+            .unwrap();
+        let result = read_file(p.to_str().unwrap().into(), None, None).await;
+        assert!(result.to_lowercase().contains("binary"), "{result:?}");
+        assert!(!result.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn read_multiple_files_blocks_binary_that_decodes_as_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("utf16.txt");
+        std::fs::write(&bin, "hello".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
+            .unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, "plain text").unwrap();
+        let result = read_multiple_files(vec![
+            bin.to_str().unwrap().into(),
+            good.to_str().unwrap().into(),
+        ])
+        .await;
+        assert!(result.to_lowercase().contains("binary"), "{result:?}");
+        assert!(result.contains("plain text"));
+    }
+
+    #[tokio::test]
+    async fn fetch_url_blocks_binary_body() {
+        let (url, handle) = spawn_http_server(&"a\0b\0c\0".repeat(200));
+        let result = fetch_url(url, None).await;
+        handle.join().unwrap();
+        assert!(result.to_lowercase().contains("binary"), "{result:?}");
+        assert!(!result.contains("a\0"));
     }
 
     /// Character-index cuts left a broken half-line at each seam, which on
