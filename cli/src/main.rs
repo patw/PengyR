@@ -889,7 +889,16 @@ impl PengyCli {
 
     fn set_sudo_provider(&self) {
         self.tool_ctx.set_sudo_provider(Some(Box::new(|| {
-            eprint!("{}Enter sudo password: {}", YELLOW, RESET);
+            // Tool cards are written to stdout while this callback writes to
+            // stderr. Flush the card before prompting so a terminal never
+            // shows a bare password field followed by the command it belongs
+            // to; this is especially visible when stdout is block-buffered.
+            io::stdout().flush().ok();
+            eprintln!();
+            eprint!(
+                "{}🔐 Sudo authentication required — enter your macOS password (input hidden): {}",
+                YELLOW, RESET
+            );
             io::stderr().flush().ok();
             rpassword::read_password().ok()
         })));
@@ -2104,6 +2113,10 @@ fn print_box(title: &str, blocks: &[String], requested_width: Option<usize>) {
     }
 
     println!("╰{}╯", "─".repeat(width.saturating_sub(2)));
+    // A sudo-provider callback writes its password request to stderr from the
+    // tool thread. Explicitly flush stdout so the complete tool card is shown
+    // before that prompt, even when stdout is block-buffered by the terminal.
+    io::stdout().flush().ok();
 }
 
 fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {

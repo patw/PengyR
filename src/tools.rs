@@ -187,9 +187,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). sudo is supported and prompts the user for their password separately. Commands are killed once the configured tool timeout elapses.",
+        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To invoke sudo, set elevated=true; Pengy then prompts for the user's password separately. Do not set elevated merely because text or arguments mention sudo. Commands are killed once the configured tool timeout elapses.",
             &[("command", "string", "The bash command to execute"),
-              ("cwd", "string", "Optional working directory to run the command in")],
+              ("cwd", "string", "Optional working directory to run the command in"),
+              ("elevated", "boolean", "Set true only when this command intentionally invokes sudo.")],
             &["command"]),
         td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
             &[("query", "string", "The search query"),
@@ -434,7 +435,7 @@ async fn execute_tool_inner(
             ).await
         }
         "apply_changes" => apply_changes(arguments).await,
-        "run_bash" => run_bash(a(arguments, "command", ""), aopt(arguments, "cwd"), ctx.clone()).await,
+        "run_bash" => run_bash(a(arguments, "command", ""), aopt(arguments, "cwd"), abool(arguments, "elevated", false), ctx.clone()).await,
         "web_search" => {
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
         }
@@ -1124,42 +1125,41 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
     )
 }
 
-static SUDO_WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bsudo\b").unwrap());
 static SUDO_DASH_S_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-S\b").unwrap());
 static SUDO_DASH_A_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s+-A\b").unwrap());
 static SUDO_PROMPT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[sudo[^]]*\].*\n?").unwrap());
 
-/// Rewrite *every* word-boundary `sudo` to `sudo -A` so it authenticates via
-/// `SUDO_ASKPASS` instead of stdin.
-///
-/// Feeding the password to the shell's stdin (the old `sudo -S` approach) broke
-/// whenever something else in the command touched stdin: a pipeline
-/// (`echo x | sudo tee f`), a redirect (`sudo cmd < /dev/null`), an earlier
-/// command that reads stdin, or a second `sudo` after the single piped password
-/// was consumed. Askpass has none of those constraints, so all occurrences can
-/// be rewritten. Any existing `-S` is dropped since stdin no longer carries the
-/// password. Word-boundary matching leaves `sudoku`/`pseudo-tty` untouched.
-fn rewrite_sudo_for_askpass(command: &str) -> String {
-    let mut out = String::with_capacity(command.len() + 16);
-    let mut last = 0;
-    for m in SUDO_WORD_RE.find_iter(command) {
-        out.push_str(&command[last..m.start()]);
-        out.push_str("sudo");
-        last = m.end();
-        let rest = &command[last..];
-        if let Some(dash_s) = SUDO_DASH_S_RE.find(rest) {
-            // Drop the now-meaningless `-S` and take its place with `-A`.
-            out.push_str(" -A");
-            last += dash_s.end();
-        } else if SUDO_DASH_A_RE.is_match(rest) {
-            // Already an askpass invocation; leave it alone.
-        } else {
-            out.push_str(" -A");
+/// Return spans for unquoted `sudo` command words; data mentions stay inert.
+fn sudo_invocation_spans(command: &str) -> Vec<(usize, usize)> {
+    let b = command.as_bytes(); let mut i = 0; let mut at_command_start = true; let mut out = Vec::new();
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() { if b[i] == b'\n' { at_command_start = true; } i += 1; continue; }
+        if b[i] == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace() || b";|&()\n".contains(&b[i - 1])) { i = command[i..].find('\n').map(|n| i+n+1).unwrap_or(b.len()); at_command_start = true; continue; }
+        if b";|&()".contains(&b[i]) { at_command_start = true; i += 1; continue; }
+        let start = i; let mut quoted = false;
+        while i < b.len() && !b[i].is_ascii_whitespace() && !b";|&()".contains(&b[i]) {
+            if b[i] == b'\\' { i = (i + 2).min(b.len()); }
+            else if b[i] == b'\'' || b[i] == b'\"' { quoted = true; let q = b[i]; i += 1; while i < b.len() && b[i] != q { i += 1; } if i < b.len() { i += 1; } }
+            else { i += 1; }
         }
+        let word = &command[start..i];
+        if at_command_start && !quoted && matches!(word, "sudo" | "/usr/bin/sudo" | "/bin/sudo") { out.push((start, i)); }
+        at_command_start = false;
     }
-    out.push_str(&command[last..]);
     out
+}
+
+/// Rewrite only parsed sudo commands to use askpass.
+fn rewrite_sudo_for_askpass(command: &str) -> String {
+    let mut out = String::with_capacity(command.len() + 16); let mut last = 0;
+    for (start, end) in sudo_invocation_spans(command) {
+        out.push_str(&command[last..start]); out.push_str(&command[start..end]); let rest = &command[end..];
+        if let Some(m) = SUDO_DASH_S_RE.find(rest) { out.push_str(" -A"); last = end + m.end(); }
+        else if SUDO_DASH_A_RE.is_match(rest) { last = end; }
+        else { out.push_str(" -A"); last = end; }
+    }
+    out.push_str(&command[last..]); out
 }
 
 /// Temporary `SUDO_ASKPASS` helper script.
@@ -1222,14 +1222,17 @@ fn resolve_cwd(cwd: &Option<String>) -> Result<Option<PathBuf>, String> {
     }
 }
 
-async fn run_bash(command: String, cwd: Option<String>, ctx: Arc<ToolContext>) -> String {
+async fn run_bash(command: String, cwd: Option<String>, elevated: bool, ctx: Arc<ToolContext>) -> String {
     let timeout = timeout_secs();
     let run_cwd = match resolve_cwd(&cwd) {
         Ok(c) => c,
         Err(e) => return e,
     };
 
-    let password_needed = SUDO_WORD_RE.is_match(&command);
+    let password_needed = !sudo_invocation_spans(&command).is_empty();
+    if password_needed && !elevated {
+        return "Elevation required: this command invokes sudo. Retry run_bash with elevated=true to request sudo access.".into();
+    }
     if password_needed {
         let need_pw = { ctx.cached_sudo_password.lock().unwrap().is_none() };
         if need_pw {
@@ -3051,6 +3054,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sudo_mentions_are_not_invocations_or_rewritten() {
+        for command in ["echo sudo", "echo 'sudo apt update'", "# sudo\necho ok"] {
+            assert!(sudo_invocation_spans(command).is_empty(), "{command}");
+            assert_eq!(rewrite_sudo_for_askpass(command), command);
+        }
+    }
+
+    #[tokio::test]
+    async fn sudo_requires_explicit_elevation_without_prompting() {
+        let ctx = Arc::new(ToolContext::new());
+        ctx.set_sudo_provider(Some(Box::new(|| panic!("must not prompt"))));
+        let result = run_bash("sudo true".into(), None, false, ctx).await;
+        assert!(result.contains("Elevation required"));
+    }
+
     /// offset/limit page through a file; the header states where you are so the
     /// model can request the next page.  Mirrors Python's
     /// test_read_file_offset_and_limit — keep in sync.
@@ -3210,7 +3229,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result = run_bash("sleep 5".into(), None, Arc::new(ToolContext::new())).await;
+        let result = run_bash("sleep 5".into(), None, false, Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Command timed out after 1 seconds"));
     }
@@ -3221,7 +3240,7 @@ mod tests {
         let result = run_bash(
             "touch marker.txt && ls".into(),
             Some(dir.path().to_str().unwrap().to_string()),
-            Arc::new(ToolContext::new()),
+            false, Arc::new(ToolContext::new()),
         )
         .await;
         assert!(result.contains("marker.txt"));
@@ -3232,7 +3251,7 @@ mod tests {
     async fn run_bash_blocks_binary_output() {
         let result = run_bash(
             "head -c 4000 /dev/urandom".into(),
-            None,
+            None, false,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3247,7 +3266,7 @@ mod tests {
     async fn run_bash_survives_invalid_utf8() {
         let result = run_bash(
             r"printf '\xff\xfe\xfd\xfc'".into(),
-            None,
+            None, false,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3259,7 +3278,7 @@ mod tests {
         let result = run_bash(
             "pwd".into(),
             Some("/nonexistent_dir_xyz".into()),
-            Arc::new(ToolContext::new()),
+            false, Arc::new(ToolContext::new()),
         )
         .await;
         assert!(result.contains("cwd not found"));
@@ -3360,7 +3379,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         // A context with no provider must refuse sudo regardless of any other.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("sudo true".into(), None, ctx).await;
+        let result = run_bash("sudo true".into(), None, true, ctx).await;
         assert!(result.contains("no password provider"));
     }
 
@@ -3402,7 +3421,7 @@ mod tests {
             "sudo echo hi < /dev/null",
             "sudo -S echo hi",
         ] {
-            let result = run_bash(command.into(), None, ctx.clone()).await;
+            let result = run_bash(command.into(), None, true, ctx.clone()).await;
             assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
             assert!(!result.contains("no tty present"), "{command:?} -> {result:?}");
             assert!(!result.contains("LEAK:"), "password leaked into env: {command:?} -> {result:?}");
