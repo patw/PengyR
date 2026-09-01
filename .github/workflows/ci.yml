@@ -7,9 +7,10 @@ on:
     branches: [ main, master ]
 
 jobs:
-  rust-tests:
-    name: Rust checks and tests
+  rust-check:
+    name: Rust check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +30,28 @@ jobs:
 
       - name: Check Rust workspace
         run: cargo check --workspace
+
+  rust-tests:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    needs: rust-check
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo build data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build and test Rust workspace
         run: cargo test --profile ci --workspace
