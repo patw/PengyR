@@ -7,7 +7,10 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 echo "==> Building Rust core + CLI + Web (release)..."
-cargo build --release
+# --workspace: build all members. A bare `cargo build --release` at the
+# workspace root rebuilds the root package (pengy_core) but NOT the cli/web
+# bins, so they can stay stale on a version bump.
+cargo build --release --workspace
 
 echo "==> Building Qt6 GUI..."
 mkdir -p gui/build
