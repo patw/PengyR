@@ -116,7 +116,9 @@ impl Harness {
         let settings = self.config_path().join("settings.json");
         std::fs::write(
             &settings,
-            format!(r#"{{"base_url": "{base_url}", "api_key": "test", "tool_confirmation": "all"}}"#),
+            format!(
+                r#"{{"base_url": "{base_url}", "api_key": "test", "tool_confirmation": "all"}}"#
+            ),
         )
         .unwrap();
     }
@@ -509,9 +511,10 @@ fn single_shot_no_save_does_not_touch_disk() {
         .chats_dir()
         .read_dir()
         .map(|it| {
-            it.filter_map(|e| e.ok())
-                .any(|e| e.path().extension().map(|x| x == "json").unwrap_or(false)
-                    && e.path().file_stem().map(|s| s != "index").unwrap_or(true))
+            it.filter_map(|e| e.ok()).any(|e| {
+                e.path().extension().map(|x| x == "json").unwrap_or(false)
+                    && e.path().file_stem().map(|s| s != "index").unwrap_or(true)
+            })
         })
         .unwrap_or(false);
     assert!(!has_any_chat);

@@ -3,6 +3,7 @@
 //! Stores chat sessions as a JSON array at `~/.config/pengy/chats.json`.
 //! Shared between the GUI and any future CLI/web frontends.
 
+use crate::attachments::AttachmentRef;
 use crate::llm_client::Usage;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -35,6 +36,8 @@ pub struct ChatMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -51,6 +54,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content,
+            attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning_content: None,
@@ -63,6 +67,7 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: Some(serde_json::Value::String(content.into())),
+            attachments: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
@@ -464,10 +469,7 @@ fn remove_from_legacy(chat_id: &str) {
         return;
     };
     let original_len = legacy.len();
-    let filtered: Vec<Chat> = legacy
-        .into_iter()
-        .filter(|c| c.id != chat_id)
-        .collect();
+    let filtered: Vec<Chat> = legacy.into_iter().filter(|c| c.id != chat_id).collect();
     if filtered.len() != original_len {
         let _ = atomic_write(&legacy_path(), &filtered);
     }
@@ -569,6 +571,7 @@ pub fn clean_dangling_tool_calls(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     content: Some(serde_json::Value::String(
                         "Tool execution was cancelled by user.".into(),
                     )),
+                    attachments: vec![],
                     tool_calls: vec![],
                     tool_call_id: Some(missing_id),
                     reasoning_content: None,
@@ -746,6 +749,7 @@ mod tests {
         ChatMessage {
             role: "user".into(),
             content: Some(serde_json::Value::String(content.into())),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
@@ -758,6 +762,7 @@ mod tests {
         ChatMessage {
             role: "assistant".into(),
             content: Some(serde_json::Value::String(content.into())),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
@@ -770,6 +775,7 @@ mod tests {
         ChatMessage {
             role: "assistant".into(),
             content: Some(serde_json::Value::String(String::new())),
+            attachments: vec![],
             tool_calls: tool_ids
                 .iter()
                 .map(|id| ToolCall {
@@ -792,6 +798,7 @@ mod tests {
         ChatMessage {
             role: "tool".into(),
             content: Some(serde_json::Value::String(content.into())),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: Some(tool_call_id.into()),
             reasoning_content: None,
@@ -835,7 +842,10 @@ mod tests {
         let mut chat2 = Chat::new("Test");
         chat2.model = Some("deepseek-chat".into());
         let json = serde_json::to_string(&chat2).unwrap();
-        assert_eq!(serde_json::from_str::<Chat>(&json).unwrap().model, Some("deepseek-chat".into()));
+        assert_eq!(
+            serde_json::from_str::<Chat>(&json).unwrap().model,
+            Some("deepseek-chat".into())
+        );
 
         let legacy = r#"{"id":"x","title":"old","messages":[],"created_at":"2026-01-01T00:00:00"}"#;
         assert_eq!(serde_json::from_str::<Chat>(legacy).unwrap().model, None);

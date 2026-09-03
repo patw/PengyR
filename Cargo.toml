@@ -3,7 +3,7 @@ members = [".", "cli", "web"]
 
 [package]
 name = "pengy_core"
-version = "1.7.3"
+version = "1.8.0"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
 description = "Pengy core library — config, chat, tools, LLM client"
@@ -51,6 +51,7 @@ scraper = "0.21"
 rand = "0.8"
 image = "0.25"
 base64 = "0.22"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

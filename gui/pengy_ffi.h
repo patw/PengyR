@@ -81,5 +81,7 @@ extern "C" {
     );
 
     void pengy_llm_cancel(PengyRun* run);
+    char* pengy_attachment_import_image(const char* path, const char* name, unsigned int max_dimension, double max_mb, unsigned char quality);
+    char* pengy_attachment_data_url(const char* ref_json, unsigned int max_dimension, double max_mb, unsigned char quality);
     void pengy_free(char* s);
 }

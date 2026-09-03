@@ -880,9 +880,7 @@ fn aopt(args: &serde_json::Value, key: &str) -> Option<String> {
 /// Optional integer argument — `None` when the model omitted the key, which
 /// `read_file` needs in order to tell "whole file" from an explicit range.
 fn aopt_usize(args: &serde_json::Value, key: &str) -> Option<usize> {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
+    args.get(key).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
 /// Optional signed integer argument — `None` when the model omitted the key.
@@ -1132,19 +1130,56 @@ static SUDO_PROMPT_RE: LazyLock<Regex> =
 
 /// Return spans for unquoted `sudo` command words; data mentions stay inert.
 fn sudo_invocation_spans(command: &str) -> Vec<(usize, usize)> {
-    let b = command.as_bytes(); let mut i = 0; let mut at_command_start = true; let mut out = Vec::new();
+    let b = command.as_bytes();
+    let mut i = 0;
+    let mut at_command_start = true;
+    let mut out = Vec::new();
     while i < b.len() {
-        if b[i].is_ascii_whitespace() { if b[i] == b'\n' { at_command_start = true; } i += 1; continue; }
-        if b[i] == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace() || b";|&()\n".contains(&b[i - 1])) { i = command[i..].find('\n').map(|n| i+n+1).unwrap_or(b.len()); at_command_start = true; continue; }
-        if b";|&()".contains(&b[i]) { at_command_start = true; i += 1; continue; }
-        let start = i; let mut quoted = false;
+        if b[i].is_ascii_whitespace() {
+            if b[i] == b'\n' {
+                at_command_start = true;
+            }
+            i += 1;
+            continue;
+        }
+        if b[i] == b'#'
+            && (i == 0 || b[i - 1].is_ascii_whitespace() || b";|&()\n".contains(&b[i - 1]))
+        {
+            i = command[i..]
+                .find('\n')
+                .map(|n| i + n + 1)
+                .unwrap_or(b.len());
+            at_command_start = true;
+            continue;
+        }
+        if b";|&()".contains(&b[i]) {
+            at_command_start = true;
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut quoted = false;
         while i < b.len() && !b[i].is_ascii_whitespace() && !b";|&()".contains(&b[i]) {
-            if b[i] == b'\\' { i = (i + 2).min(b.len()); }
-            else if b[i] == b'\'' || b[i] == b'\"' { quoted = true; let q = b[i]; i += 1; while i < b.len() && b[i] != q { i += 1; } if i < b.len() { i += 1; } }
-            else { i += 1; }
+            if b[i] == b'\\' {
+                i = (i + 2).min(b.len());
+            } else if b[i] == b'\'' || b[i] == b'\"' {
+                quoted = true;
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
         }
         let word = &command[start..i];
-        if at_command_start && !quoted && matches!(word, "sudo" | "/usr/bin/sudo" | "/bin/sudo") { out.push((start, i)); }
+        if at_command_start && !quoted && matches!(word, "sudo" | "/usr/bin/sudo" | "/bin/sudo") {
+            out.push((start, i));
+        }
         at_command_start = false;
     }
     out
@@ -1152,14 +1187,24 @@ fn sudo_invocation_spans(command: &str) -> Vec<(usize, usize)> {
 
 /// Rewrite only parsed sudo commands to use askpass.
 fn rewrite_sudo_for_askpass(command: &str) -> String {
-    let mut out = String::with_capacity(command.len() + 16); let mut last = 0;
+    let mut out = String::with_capacity(command.len() + 16);
+    let mut last = 0;
     for (start, end) in sudo_invocation_spans(command) {
-        out.push_str(&command[last..start]); out.push_str(&command[start..end]); let rest = &command[end..];
-        if let Some(m) = SUDO_DASH_S_RE.find(rest) { out.push_str(" -A"); last = end + m.end(); }
-        else if SUDO_DASH_A_RE.is_match(rest) { last = end; }
-        else { out.push_str(" -A"); last = end; }
+        out.push_str(&command[last..start]);
+        out.push_str(&command[start..end]);
+        let rest = &command[end..];
+        if let Some(m) = SUDO_DASH_S_RE.find(rest) {
+            out.push_str(" -A");
+            last = end + m.end();
+        } else if SUDO_DASH_A_RE.is_match(rest) {
+            last = end;
+        } else {
+            out.push_str(" -A");
+            last = end;
+        }
     }
-    out.push_str(&command[last..]); out
+    out.push_str(&command[last..]);
+    out
 }
 
 /// Temporary `SUDO_ASKPASS` helper script.
@@ -1222,7 +1267,12 @@ fn resolve_cwd(cwd: &Option<String>) -> Result<Option<PathBuf>, String> {
     }
 }
 
-async fn run_bash(command: String, cwd: Option<String>, elevated: bool, ctx: Arc<ToolContext>) -> String {
+async fn run_bash(
+    command: String,
+    cwd: Option<String>,
+    elevated: bool,
+    ctx: Arc<ToolContext>,
+) -> String {
     let timeout = timeout_secs();
     let run_cwd = match resolve_cwd(&cwd) {
         Ok(c) => c,
@@ -2139,19 +2189,23 @@ async fn download_file(
         return format!("Error: dir is not a directory: {}", target_dir.display());
     }
 
-    let fname = safe_download_name(&filename
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
+    let fname = safe_download_name(&filename.filter(|s| !s.trim().is_empty()).unwrap_or_else(
+        || {
             parsed
                 .path_segments()
                 .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
                 .unwrap_or("download")
                 .to_string()
-        }));
+        },
+    ));
     let dest = target_dir.join(&fname);
 
     let limit_mb = max_size_mb.unwrap_or_else(|| *DOWNLOAD_MAX_MB.lock().unwrap() as i64);
-    let limit_bytes: usize = if limit_mb <= 0 { 0 } else { (limit_mb as usize) * 1024 * 1024 };
+    let limit_bytes: usize = if limit_mb <= 0 {
+        0
+    } else {
+        (limit_mb as usize) * 1024 * 1024
+    };
 
     let client = reqwest::Client::builder()
         .user_agent(ua())
@@ -2174,25 +2228,23 @@ async fn download_file(
 
     let mut stream = resp.bytes_stream();
     loop {
-        let chunk = match tokio::time::timeout(
-            Duration::from_secs(DOWNLOAD_STALL_TIMEOUT),
-            stream.next(),
-        )
-        .await
-        {
-            Err(_) => {
-                let _ = std::fs::remove_file(&dest);
-                return format!(
-                    "Error downloading: no data for {DOWNLOAD_STALL_TIMEOUT} seconds"
-                );
-            }
-            Ok(None) => break,
-            Ok(Some(Err(e))) => {
-                let _ = std::fs::remove_file(&dest);
-                return format!("Error downloading: {e}");
-            }
-            Ok(Some(Ok(c))) => c,
-        };
+        let chunk =
+            match tokio::time::timeout(Duration::from_secs(DOWNLOAD_STALL_TIMEOUT), stream.next())
+                .await
+            {
+                Err(_) => {
+                    let _ = std::fs::remove_file(&dest);
+                    return format!(
+                        "Error downloading: no data for {DOWNLOAD_STALL_TIMEOUT} seconds"
+                    );
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => {
+                    let _ = std::fs::remove_file(&dest);
+                    return format!("Error downloading: {e}");
+                }
+                Ok(Some(Ok(c))) => c,
+            };
         total += chunk.len();
         if limit_bytes > 0 && total > limit_bytes {
             let _ = std::fs::remove_file(&dest);
@@ -3091,9 +3143,15 @@ mod tests {
 
         // limit alone starts at line 1; offset alone runs to the end.
         let head = read_file(p.clone(), None, Some(2)).await;
-        assert_eq!(head.lines().skip(1).collect::<Vec<_>>(), vec!["line 1", "line 2"]);
+        assert_eq!(
+            head.lines().skip(1).collect::<Vec<_>>(),
+            vec!["line 1", "line 2"]
+        );
         let tail = read_file(p.clone(), Some(19), None).await;
-        assert_eq!(tail.lines().skip(1).collect::<Vec<_>>(), vec!["line 19", "line 20"]);
+        assert_eq!(
+            tail.lines().skip(1).collect::<Vec<_>>(),
+            vec!["line 19", "line 20"]
+        );
 
         // A limit past the end clamps instead of erroring.
         let clamped = read_file(p.clone(), Some(19), Some(100)).await;
@@ -3240,7 +3298,8 @@ mod tests {
         let result = run_bash(
             "touch marker.txt && ls".into(),
             Some(dir.path().to_str().unwrap().to_string()),
-            false, Arc::new(ToolContext::new()),
+            false,
+            Arc::new(ToolContext::new()),
         )
         .await;
         assert!(result.contains("marker.txt"));
@@ -3251,7 +3310,8 @@ mod tests {
     async fn run_bash_blocks_binary_output() {
         let result = run_bash(
             "head -c 4000 /dev/urandom".into(),
-            None, false,
+            None,
+            false,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3266,7 +3326,8 @@ mod tests {
     async fn run_bash_survives_invalid_utf8() {
         let result = run_bash(
             r"printf '\xff\xfe\xfd\xfc'".into(),
-            None, false,
+            None,
+            false,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3278,7 +3339,8 @@ mod tests {
         let result = run_bash(
             "pwd".into(),
             Some("/nonexistent_dir_xyz".into()),
-            false, Arc::new(ToolContext::new()),
+            false,
+            Arc::new(ToolContext::new()),
         )
         .await;
         assert!(result.contains("cwd not found"));
@@ -3423,8 +3485,14 @@ mod tests {
         ] {
             let result = run_bash(command.into(), None, true, ctx.clone()).await;
             assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
-            assert!(!result.contains("no tty present"), "{command:?} -> {result:?}");
-            assert!(!result.contains("LEAK:"), "password leaked into env: {command:?} -> {result:?}");
+            assert!(
+                !result.contains("no tty present"),
+                "{command:?} -> {result:?}"
+            );
+            assert!(
+                !result.contains("LEAK:"),
+                "password leaked into env: {command:?} -> {result:?}"
+            );
         }
 
         std::env::set_var("PATH", old_path);
@@ -3448,9 +3516,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &std::path::Path| {
-                std::fs::metadata(p).unwrap().permissions().mode() & 0o777
-            };
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&helper.path), 0o700);
             assert_eq!(mode(std::path::Path::new(pw_file)), 0o600);
         }
@@ -4197,8 +4264,14 @@ mod tests {
     async fn read_file_blocks_binary_that_decodes_as_utf8() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("utf16.txt");
-        std::fs::write(&p, "hello".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
-            .unwrap();
+        std::fs::write(
+            &p,
+            "hello"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let result = read_file(p.to_str().unwrap().into(), None, None).await;
         assert!(result.to_lowercase().contains("binary"), "{result:?}");
         assert!(!result.contains("hello"));
@@ -4208,8 +4281,14 @@ mod tests {
     async fn read_multiple_files_blocks_binary_that_decodes_as_utf8() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("utf16.txt");
-        std::fs::write(&bin, "hello".encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
-            .unwrap();
+        std::fs::write(
+            &bin,
+            "hello"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let good = dir.path().join("good.txt");
         std::fs::write(&good, "plain text").unwrap();
         let result = read_multiple_files(vec![
@@ -4249,9 +4328,7 @@ mod tests {
 
         let (head, rest) = out.split_once("[... snipped").unwrap();
         let tail = rest.split_once("]").unwrap().1;
-        let whole = |frag: &str| {
-            frag.split_whitespace().count() == 2 && frag.starts_with("line ")
-        };
+        let whole = |frag: &str| frag.split_whitespace().count() == 2 && frag.starts_with("line ");
         for frag in head.trim().lines().chain(tail.trim().lines()) {
             assert!(whole(frag), "broken fragment at seam: {frag:?}");
         }
@@ -4336,7 +4413,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/.config"), "x").unwrap();
-        let args = serde_json::json!({"pattern": "**/.config", "path": dir.path().to_str().unwrap()});
+        let args =
+            serde_json::json!({"pattern": "**/.config", "path": dir.path().to_str().unwrap()});
         let ctx = std::sync::Arc::new(ToolContext::new());
         let result = execute_tool("glob", &args, &ctx).await;
         assert!(result.contains(".config"), "{result}");
@@ -4349,7 +4427,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/Makefile"), "x").unwrap();
-        let args = serde_json::json!({"pattern": "**/Makefile", "path": dir.path().to_str().unwrap()});
+        let args =
+            serde_json::json!({"pattern": "**/Makefile", "path": dir.path().to_str().unwrap()});
         let ctx = std::sync::Arc::new(ToolContext::new());
         let result = execute_tool("glob", &args, &ctx).await;
         assert!(result.contains("Makefile"), "{result}");
@@ -4370,7 +4449,7 @@ mod tests {
         assert_eq!(safe_download_name("report.pdf"), "report.pdf");
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn glob_tool_skips_node_modules() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("node_modules")).unwrap();
@@ -4425,10 +4504,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "x").unwrap();
 
-        let result = glob_tool(
-            "*.py".into(),
-            Some(dir.path().to_str().unwrap().into()),
-        ).await;
+        let result = glob_tool("*.py".into(), Some(dir.path().to_str().unwrap().into())).await;
         assert!(result.contains("a.py"));
     }
 
@@ -4522,13 +4598,21 @@ mod tests {
     #[test]
     fn ask_user_question_schema_items_are_objects_not_strings() {
         let defs = tool_definitions();
-        let td = defs.iter().find(|t| t.function.name == "ask_user_question").unwrap();
+        let td = defs
+            .iter()
+            .find(|t| t.function.name == "ask_user_question")
+            .unwrap();
         let questions = &td.function.parameters.properties["questions"];
         assert_eq!(questions["type"], "array");
         let items = &questions["items"];
-        assert_eq!(items["type"], "object", "questions items must be objects, not strings!");
+        assert_eq!(
+            items["type"], "object",
+            "questions items must be objects, not strings!"
+        );
         let required: Vec<String> = items["required"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(required, vec!["header", "question", "options"]);
@@ -4541,7 +4625,9 @@ mod tests {
         let opt_items = &options["items"];
         assert_eq!(opt_items["type"], "object");
         let opt_required: Vec<String> = opt_items["required"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(opt_required, vec!["label", "description"]);
@@ -4555,13 +4641,18 @@ mod tests {
     #[test]
     fn todowrite_schema_items_are_objects_not_strings() {
         let defs = tool_definitions();
-        let td = defs.iter().find(|t| t.function.name == "todowrite").unwrap();
+        let td = defs
+            .iter()
+            .find(|t| t.function.name == "todowrite")
+            .unwrap();
         let todos = &td.function.parameters.properties["todos"];
         assert_eq!(todos["type"], "array");
         let items = &todos["items"];
         assert_eq!(items["type"], "object");
         let required: Vec<String> = items["required"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(required, vec!["content", "status"]);
@@ -4569,7 +4660,9 @@ mod tests {
         assert_eq!(props["content"]["type"], "string");
         assert_eq!(props["status"]["type"], "string");
         let status_enum: Vec<String> = props["status"]["enum"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(status_enum, vec!["pending", "in_progress", "completed"]);
@@ -4580,7 +4673,10 @@ mod tests {
     #[test]
     fn apply_changes_schema_has_full_operation_properties() {
         let defs = tool_definitions();
-        let ac = defs.iter().find(|t| t.function.name == "apply_changes").unwrap();
+        let ac = defs
+            .iter()
+            .find(|t| t.function.name == "apply_changes")
+            .unwrap();
         let params = &ac.function.parameters.properties;
 
         // changes array
@@ -4589,7 +4685,9 @@ mod tests {
         let change_items = &changes["items"];
         assert_eq!(change_items["type"], "object");
         let change_required: Vec<String> = change_items["required"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(change_required, vec!["path", "operations"]);
@@ -4600,13 +4698,17 @@ mod tests {
         let op_items = &operations["items"];
         assert_eq!(op_items["type"], "object");
         let op_required: Vec<String> = op_items["required"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(op_required.contains(&"kind".to_string()));
         let op_props = &op_items["properties"];
         let kind_enum: Vec<String> = op_props["kind"]["enum"]
-            .as_array().unwrap().iter()
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(kind_enum, vec!["replace", "insert_after", "delete"]);
@@ -4618,7 +4720,10 @@ mod tests {
 
         // dry_run
         assert_eq!(params["dry_run"]["type"], "boolean");
-        assert!(!params["dry_run"]["description"].as_str().unwrap_or("").is_empty());
+        assert!(!params["dry_run"]["description"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty());
 
         // postconditions
         let post = &params["postconditions"];
@@ -4651,15 +4756,9 @@ fn extract_dir_from_glob_pattern(pattern: &str) -> Option<(String, String)> {
         }
         if parent.exists() && parent.is_dir() {
             let dir_str = parent.to_string_lossy().to_string();
-            let file_pattern = current
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_pattern = current.file_name().and_then(|n| n.to_str()).unwrap_or("");
             // Use the original last component from the pattern (preserves wildcards)
-            let original_file_part = pattern
-                .rsplit('/')
-                .next()
-                .unwrap_or(file_pattern);
+            let original_file_part = pattern.rsplit('/').next().unwrap_or(file_pattern);
             // Preserve `**/` prefix if the original pattern had it before the
             // last component — the caller needs it for recursive matching.
             let has_recursive = pattern.contains("**/");
@@ -4790,7 +4889,11 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         // path only worked when the suffix began with a wildcard, which made
         // literal suffixes like "**/.config" or "**/Makefile" unmatchable.
         let file_name = entry.file_name().to_string_lossy().to_string();
-        let target = if has_recursive { &file_name } else { &rel_str.to_string() };
+        let target = if has_recursive {
+            &file_name
+        } else {
+            &rel_str.to_string()
+        };
         if !simple_glob_match(target, glob_suffix) {
             continue;
         }

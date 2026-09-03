@@ -22,6 +22,7 @@
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QFile>
+#include <QFileInfo>
 #include <QMimeDatabase>
 #include <QMimeType>
 #include <QCloseEvent>
@@ -439,7 +440,10 @@ void MainWindow::renderMessage(ChatView* view, const QJsonObject& msg) {
     QString role = msg["role"].toString();
 
     if (role == "user") {
-        view->appendMessageText("user", msg["content"].toString(), false);
+        QJsonObject display;
+        display["content"] = msg["content"];
+        display["attachments"] = msg["attachments"];
+        view->appendMessage("user", display, false);
 
     } else if (role == "assistant") {
         // Text first, tool cards after: the model wrote its narration *before*
@@ -600,15 +604,34 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     if (!text.isEmpty())
         placeholderParts.append(text);
     QString displayContent = placeholderParts.join("\n");
+    QJsonArray attachmentRefs;
+    for (const QString& img : images) {
+        QByteArray pathBytes = img.toUtf8();
+        QByteArray nameBytes = QFileInfo(img).fileName().toUtf8();
+        char* imported = pengy_attachment_import_image(pathBytes.constData(), nameBytes.constData(),
+            m_config.value("image_max_dimension").toInt(4096), m_config.value("image_max_mb").toDouble(4.5),
+            static_cast<unsigned char>(m_config.value("image_quality").toInt(85)));
+        if (imported) {
+            QJsonDocument refDoc = QJsonDocument::fromJson(QByteArray(imported));
+            pengy_free(imported);
+            if (refDoc.isObject()) attachmentRefs.append(refDoc.object());
+        } else {
+            QMessageBox::warning(this, "Image attachment", "The image could not be imported and was not sent.");
+        }
+    }
 
     // Add user message to chat
     QJsonObject userMsg;
     userMsg["role"] = "user";
-    userMsg["content"] = displayContent;
+    userMsg["content"] = text;
+    if (!attachmentRefs.isEmpty()) userMsg["attachments"] = attachmentRefs;
     QJsonArray messages = session->chat["messages"].toArray();
     messages.append(userMsg);
     session->chat["messages"] = messages;
-    session->chatView->appendMessageText("user", displayContent);
+    QJsonObject display;
+    display["content"] = text;
+    display["attachments"] = attachmentRefs;
+    session->chatView->appendMessage("user", display);
 
     // Update title from first message
     if (session->chat["title"].toString() == "New Chat") {
@@ -655,28 +678,25 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     for (const QJsonValue& v : cleanedMsgs) apiMessages.append(v);
 
     // Current user message (with real image data if any)
-    if (!images.isEmpty()) {
+    if (!attachmentRefs.isEmpty()) {
         int maxDim = m_config.value("image_max_dimension").toInt(4096);
         double maxMb = m_config.value("image_max_mb").toDouble(4.5);
         int quality = m_config.value("image_quality").toInt(85);
 
         QJsonArray contentParts;
-        for (const QString& imgPath : images) {
-            char* result = pengy_image_preprocess(
-                imgPath.toUtf8().constData(),
-                static_cast<unsigned int>(maxDim),
-                maxMb,
-                static_cast<unsigned char>(quality));
+        for (const QJsonValue& refValue : attachmentRefs) {
+            QJsonObject ref = refValue.toObject();
+            QByteArray refJson = QJsonDocument(ref).toJson(QJsonDocument::Compact);
+            char* result = pengy_attachment_data_url(refJson.constData(),
+                static_cast<unsigned int>(maxDim), maxMb, static_cast<unsigned char>(quality));
             if (result) {
-                QJsonObject preprocessed = QJsonDocument::fromJson(QByteArray(result)).object();
+                QString dataUrl = QString::fromUtf8(result);
                 pengy_free(result);
-                QString b64 = preprocessed["bytes_base64"].toString();
-                QString mime = preprocessed["mime"].toString("image/jpeg");
 
                 QJsonObject imgPart;
                 imgPart["type"] = "image_url";
                 QJsonObject imgUrlObj;
-                imgUrlObj["url"] = QString("data:%1;base64,%2").arg(mime, b64);
+                imgUrlObj["url"] = dataUrl;
                 imgPart["image_url"] = imgUrlObj;
                 contentParts.append(imgPart);
             }

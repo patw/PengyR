@@ -223,7 +223,10 @@ fn split_store_behaves() {
     delete_chat("old-1").unwrap();
     let remaining: Vec<Chat> =
         serde_json::from_slice(&std::fs::read(dir.join("chats.json")).unwrap()).unwrap();
-    assert!(remaining.is_empty(), "delete must trim the deleted chat out");
+    assert!(
+        remaining.is_empty(),
+        "delete must trim the deleted chat out"
+    );
 
     // ── deleted chat does not resurrect from legacy ─────────────────────
     reset(&dir);
@@ -293,7 +296,10 @@ fn split_store_behaves() {
     save_chat_progress(&mut worker_copy).unwrap();
 
     let saved = get_chat(&worker_copy.id).unwrap();
-    assert_eq!(saved.title, "Renamed by user", "rename must survive the run");
+    assert_eq!(
+        saved.title, "Renamed by user",
+        "rename must survive the run"
+    );
     assert_eq!(saved.messages.len(), 2, "worker's newer messages must land");
 
     let _ = std::fs::remove_dir_all(&dir);

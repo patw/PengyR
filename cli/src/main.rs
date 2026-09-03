@@ -54,6 +54,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/system",
     "/delete",
     "/attach",
+    "/attachments",
     "/compact",
     "/redact",
     "/tasks",
@@ -175,7 +176,8 @@ fn require_value(args: &[String], i: &mut usize, flag: &str) -> String {
     }
 }
 
-fn main() {
+fn main() {    // Durable attachment maintenance is exposed as a read-only report via /attachments.
+
     let args: Vec<String> = std::env::args().collect();
 
     if args.iter().any(|a| a == "--version" || a == "-v") {
@@ -354,7 +356,9 @@ impl PengyCli {
             );
             if !last_user.is_empty() {
                 println!("{}Last:{}", DIM, RESET);
-                for line in last_user { println!("  {}", line); }
+                for line in last_user {
+                    println!("  {}", line);
+                }
             }
         } else {
             self.current_chat = Some(chat_manager::create_chat("New Chat").unwrap());
@@ -395,14 +399,9 @@ impl PengyCli {
                 continue;
             }
 
-            let (resolved_text, file_content) = resolve_attachments(text);
-            let final_text = if file_content.is_empty() {
-                resolved_text
-            } else {
-                format!("{}\n{}", file_content, resolved_text)
-            };
-
-            self.send_text(&final_text);
+            let (resolved_text, file_content, images) = resolve_attachments(text);
+            let final_text = if file_content.is_empty() { resolved_text } else { format!("{}\n{}", file_content, resolved_text) };
+            self.send_text_with_attachments(&final_text, images);
         }
 
         self.clear_sudo_provider();
@@ -420,6 +419,7 @@ impl PengyCli {
                 messages: vec![ChatMessage {
                     role: "user".into(),
                     content: Some(serde_json::Value::String(prompt_text.to_string())),
+                    attachments: vec![],
                     tool_calls: vec![],
                     tool_call_id: None,
                     reasoning_content: None,
@@ -436,6 +436,7 @@ impl PengyCli {
             chat.messages.push(ChatMessage {
                 role: "user".into(),
                 content: Some(serde_json::Value::String(prompt_text.to_string())),
+                attachments: vec![],
                 tool_calls: vec![],
                 tool_call_id: None,
                 reasoning_content: None,
@@ -455,24 +456,18 @@ impl PengyCli {
     /// The REPL's normal send path, factored out so `/task` can feed a
     /// rendered template through the exact same flow instead of duplicating
     /// it (mirrors Python's `PengyCLI._send_text`).
-    fn send_text(&mut self, text: &str) {
-        if text.is_empty() || self.current_chat.is_none() {
-            return;
-        }
+    fn send_text_with_attachments(&mut self, text: &str, attachments: Vec<pengy_core::attachments::AttachmentRef>) {
+
+        if text.is_empty() || self.current_chat.is_none() { return; }
         let chat = self.current_chat.as_mut().unwrap();
-        chat.messages.push(ChatMessage {
-            role: "user".into(),
-            content: Some(serde_json::Value::String(text.to_string())),
-            tool_calls: vec![],
-            tool_call_id: None,
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_details: None,
-        });
-        if chat.title == "New Chat" {
-            chat.title = truncate(text, 50);
-        }
+        chat.messages.push(ChatMessage { role: "user".into(), content: Some(serde_json::Value::String(text.to_string())), attachments, tool_calls: vec![], tool_call_id: None, reasoning_content: None, reasoning: None, reasoning_details: None });
+        if chat.title == "New Chat" { chat.title = truncate(text, 50); }
         self.drive_chat();
+    }
+
+
+    fn send_text(&mut self, text: &str) {
+        self.send_text_with_attachments(text, Vec::new());
     }
 
     // ── Chat driver ──────────────────────────────────────────────
@@ -505,6 +500,7 @@ impl PengyCli {
                 &re,
                 pr,
                 lt,
+                config::load_config().attachment_context_keep_turns,
                 event_tx,
                 confirm_rx,
                 cancel2,
@@ -678,6 +674,7 @@ impl PengyCli {
                         .push(ChatMessage {
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(content)),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id),
                             reasoning_content: None,
@@ -701,6 +698,7 @@ impl PengyCli {
                         .push(ChatMessage {
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(content)),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id),
                             reasoning_content: None,
@@ -718,7 +716,8 @@ impl PengyCli {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
-                    let totals = chat_manager::add_usage(self.current_chat.as_mut().unwrap(), &usage);
+                    let totals =
+                        chat_manager::add_usage(self.current_chat.as_mut().unwrap(), &usage);
                     self.render_final(&content, &usage, &totals);
                     self.current_chat
                         .as_mut()
@@ -727,6 +726,7 @@ impl PengyCli {
                         .push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
                             content: Some(serde_json::Value::String(content)),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: None,
                             reasoning_content: None,
@@ -829,8 +829,7 @@ impl PengyCli {
         match self.output_mode.as_str() {
             "silent" => return,
             "json" => {
-                let result =
-                    serde_json::json!({"content": content, "usage": usage, "cumulative_usage": totals});
+                let result = serde_json::json!({"content": content, "usage": usage, "cumulative_usage": totals});
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).unwrap_or_default()
@@ -940,6 +939,7 @@ impl PengyCli {
             "/context-keep" => self.cmd_context_keep(args),
             "/system" => self.cmd_system(args),
             "/attach" => self.cmd_attach(),
+            "/attachments" => self.cmd_attachments(),
             "/compact" => self.cmd_compact(),
             "/redact" => self.cmd_redact(args),
             "/tasks" => self.cmd_tasks(),
@@ -996,6 +996,7 @@ impl PengyCli {
             ("/load <index>", "Load a chat by its /list index"),
             ("/delete <index>", "Delete a chat by its /list index"),
             ("/attach", "Show file attachment help"),
+            ("/attachments", "Show durable attachment storage usage (read-only)"),
             ("/quit, /exit", "Exit Pengy CLI"),
         ];
         for (cmd, desc) in &cmds {
@@ -1265,6 +1266,9 @@ impl PengyCli {
 
             if role == "user" {
                 lines.push("### 🧑 You".to_string());
+                for attachment in &msg.attachments {
+                    lines.push(pengy_core::attachments::label(attachment));
+                }
                 lines.push(content);
                 lines.push(String::new());
             } else if role == "assistant" {
@@ -1780,6 +1784,13 @@ impl PengyCli {
         println!("{}Rendered:{} {}", BOLD, RESET, rendered);
     }
 
+    fn cmd_attachments(&self) {
+        let mut refs = std::collections::BTreeSet::new();
+        if let Some(chat) = &self.current_chat { for msg in &chat.messages { for a in &msg.attachments { refs.insert(a.id.clone()); } } }
+        let report = pengy_core::attachments::storage_report(&refs);
+        println!("{}{}{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()), RESET, "");
+    }
+
     fn cmd_attach(&self) {
         println!("{}File attachment:{}", BOLD, RESET);
         println!(
@@ -1996,13 +2007,21 @@ fn last_message_lines(text: &str) -> Vec<String> {
         while rest.chars().count() > width {
             lines.push(rest.chars().take(width).collect());
             rest = rest.chars().skip(width).collect();
-            if lines.len() == 10 { break; }
+            if lines.len() == 10 {
+                break;
+            }
         }
-        if lines.len() == 10 { break; }
+        if lines.len() == 10 {
+            break;
+        }
         lines.push(rest);
     }
-    if lines.len() > 10 { lines.truncate(10); }
-    if lines.len() == 10 && text.lines().count() > 10 { lines[9].push('…'); }
+    if lines.len() > 10 {
+        lines.truncate(10);
+    }
+    if lines.len() == 10 && text.lines().count() > 10 {
+        lines[9].push('…');
+    }
     lines
 }
 
@@ -2127,6 +2146,7 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
             content: Some(serde_json::Value::String(config::render_system_message(
                 &config.system_message,
             ))),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
@@ -2151,10 +2171,11 @@ fn truncate(text: &str, max_len: usize) -> String {
     }
 }
 
-fn resolve_attachments(text: &str) -> (String, String) {
+fn resolve_attachments(text: &str) -> (String, String, Vec<pengy_core::attachments::AttachmentRef>) {
     let re = regex::Regex::new(r"@(\S+)").unwrap();
     let mut resolved = text.to_string();
     let mut blocks = Vec::new();
+    let mut images = Vec::new();
 
     for cap in re.captures_iter(text) {
         let raw = &cap[1];
@@ -2164,7 +2185,12 @@ fn resolve_attachments(text: &str) -> (String, String) {
         }
         let path = Path::new(path_str);
         if path.exists() && path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(path) {
+            if path.extension().and_then(|e| e.to_str()).map(|e| matches!(e.to_ascii_lowercase().as_str(), "png"|"jpg"|"jpeg"|"gif"|"webp"|"bmp")).unwrap_or(false) {
+                if let Ok(reference) = pengy_core::attachments::import_image(path, path.file_name().and_then(|n| n.to_str()).unwrap_or("image"), 4096, 4.5, 85) {
+                    images.push(reference);
+                    resolved = resolved.replacen(&cap[0], "", 1);
+                }
+            } else if let Ok(content) = std::fs::read_to_string(path) {
                 blocks.push(format!(
                     "[File: {}]\n```\n{}\n```",
                     path.file_name()
@@ -2177,7 +2203,7 @@ fn resolve_attachments(text: &str) -> (String, String) {
         }
     }
 
-    (resolved.trim().to_string(), blocks.join("\n\n"))
+    (resolved.trim().to_string(), blocks.join("\n\n"), images)
 }
 
 fn uuid_v4() -> String {

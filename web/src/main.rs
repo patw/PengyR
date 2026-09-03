@@ -121,6 +121,7 @@ async fn main() {
         .route("/chat/:chat_id/stop", post(chat_stop))
         .route("/chat/:chat_id/delete", post(chat_delete))
         .route("/chat/:chat_id/export", get(chat_export))
+        .route("/chat/:chat_id/export/:format", get(chat_export_bundle))
         .route("/chat/:chat_id/rename", post(chat_rename))
         .route("/chat/:chat_id/redact", post(chat_redact))
         .route("/chat/:chat_id/command", post(chat_command))
@@ -129,6 +130,7 @@ async fn main() {
         .route("/settings", get(settings_get).post(settings_post))
         .route("/models", get(models_api))
         .route("/files", get(serve_file))
+        .route("/attachments/:digest/:derivative", get(serve_attachment))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             OriginGuard {
@@ -379,26 +381,93 @@ fn safe_id(tool_call_id: &str) -> String {
     )
 }
 fn tool_summary(name: &str, args: &serde_json::Value) -> String {
-    let Some(obj) = args.as_object() else { return String::new() };
-    let secret = |key: &str| matches!(key, "password" | "passwd" | "api_key" | "apikey" | "token" | "access_token" | "refresh_token" | "authorization" | "secret" | "private_key");
+    let Some(obj) = args.as_object() else {
+        return String::new();
+    };
+    let secret = |key: &str| {
+        matches!(
+            key,
+            "password"
+                | "passwd"
+                | "api_key"
+                | "apikey"
+                | "token"
+                | "access_token"
+                | "refresh_token"
+                | "authorization"
+                | "secret"
+                | "private_key"
+        )
+    };
     let val = |key: &str| -> String {
-        if secret(key) { return "[redacted]".into(); }
-        obj.get(key).map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()).replace('\n', " ").trim().to_owned()).unwrap_or_default()
+        if secret(key) {
+            return "[redacted]".into();
+        }
+        obj.get(key)
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| v.to_string())
+                    .replace('\n', " ")
+                    .trim()
+                    .to_owned()
+            })
+            .unwrap_or_default()
     };
     let mut s = match name {
         "read_file" | "write_file" | "replace_in_file" | "directory_tree" => val("path"),
-        "read_multiple_files" => obj.get("paths").and_then(|v| v.as_array()).map(|v| format!("{} files", v.len())).unwrap_or_default(),
+        "read_multiple_files" => obj
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|v| format!("{} files", v.len()))
+            .unwrap_or_default(),
         "web_search" => val("query"),
         "fetch_url" => val("url"),
-        "download_file" => { let f = val("filename"); if f.is_empty() { val("url") } else { f } },
+        "download_file" => {
+            let f = val("filename");
+            if f.is_empty() {
+                val("url")
+            } else {
+                f
+            }
+        }
         "run_bash" => val("command"),
         "run_python" => val("code"),
-        "search_content" | "glob" => { let p = val("pattern"); let path = val("path"); if p.is_empty() { path } else if path.is_empty() { p } else { format!("{} in {}", p, path) } },
-        "apply_changes" => obj.get("changes").and_then(|v| v.as_array()).map(|v| format!("{} files", v.len())).unwrap_or_default(),
-        "ask_user_question" => obj.get("questions").and_then(|v| v.as_array()).map(|v| format!("{} questions", v.len())).unwrap_or_default(),
-        _ => obj.iter().find_map(|(k, v)| if secret(k) { None } else { Some(v.as_str().unwrap_or("").replace('\n', " ")) }).unwrap_or_default(),
+        "search_content" | "glob" => {
+            let p = val("pattern");
+            let path = val("path");
+            if p.is_empty() {
+                path
+            } else if path.is_empty() {
+                p
+            } else {
+                format!("{} in {}", p, path)
+            }
+        }
+        "apply_changes" => obj
+            .get("changes")
+            .and_then(|v| v.as_array())
+            .map(|v| format!("{} files", v.len()))
+            .unwrap_or_default(),
+        "ask_user_question" => obj
+            .get("questions")
+            .and_then(|v| v.as_array())
+            .map(|v| format!("{} questions", v.len()))
+            .unwrap_or_default(),
+        _ => obj
+            .iter()
+            .find_map(|(k, v)| {
+                if secret(k) {
+                    None
+                } else {
+                    Some(v.as_str().unwrap_or("").replace('\n', " "))
+                }
+            })
+            .unwrap_or_default(),
     };
-    if s.chars().count() > 100 { s = format!("{}…", s.chars().take(97).collect::<String>().trim_end()); }
+    if s.chars().count() > 100 {
+        s = format!("{}…", s.chars().take(97).collect::<String>().trim_end());
+    }
     s
 }
 
@@ -511,11 +580,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
 }
 
 impl WebWorker {
-    fn start_with_messages(
-        chat: Chat,
-        config: Config,
-        messages: Vec<ChatMessage>,
-    ) -> Arc<Self> {
+    fn start_with_messages(chat: Chat, config: Config, messages: Vec<ChatMessage>) -> Arc<Self> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
@@ -595,6 +660,7 @@ impl WebWorker {
                     &re,
                     pr,
                     lt,
+                    config::load_config().attachment_context_keep_turns,
                     event_tx,
                     confirm_rx,
                     cancel2,
@@ -709,6 +775,7 @@ impl WebWorker {
                         chat.messages.push(ChatMessage {
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(content)),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id.clone()),
                             reasoning_content: None,
@@ -764,6 +831,7 @@ impl WebWorker {
                         chat.messages.push(ChatMessage {
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(content.clone())),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: Some(tool_call_id.clone()),
                             reasoning_content: None,
@@ -786,6 +854,7 @@ impl WebWorker {
                         chat.messages.push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
                             content: Some(serde_json::Value::String(content.clone())),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: None,
                             reasoning_content: None,
@@ -902,6 +971,7 @@ async fn chat_send(
     // Handle file attachments — detect images vs text
     let mut text_blocks = Vec::new();
     let mut image_parts: Vec<serde_json::Value> = Vec::new();
+    let mut attachment_refs: Vec<pengy_core::attachments::AttachmentRef> = Vec::new();
     let mut display_parts = Vec::new();
 
     if let Some(files) = &data.files {
@@ -920,20 +990,12 @@ async fn chat_send(
                         ext
                     ));
                     if std::fs::write(&tmp, &decoded).is_ok() {
-                        if let Ok(result) = pengy_core::image_utils::preprocess(
-                            &tmp,
-                            config.image_max_dimension,
-                            config.image_max_mb,
-                            config.image_quality,
-                        ) {
-                            use base64::Engine;
-                            let b64 =
-                                base64::engine::general_purpose::STANDARD.encode(&result.bytes);
-                            image_parts.push(serde_json::json!({
-                                "type": "image_url",
-                                "image_url": {"url": format!("data:{};base64,{}", result.mime, b64)}
-                            }));
-                            display_parts.push(format!("[Image: {}]", f.name));
+                        if let Ok(reference) = pengy_core::attachments::import_image(&tmp, &f.name, config.image_max_dimension, config.image_max_mb, config.image_quality) {
+                            if let Some(url) = pengy_core::attachments::image_data_url(&reference, config.image_max_dimension, config.image_max_mb, config.image_quality) {
+                                image_parts.push(serde_json::json!({"type":"image_url","image_url":{"url":url}}));
+                                attachment_refs.push(reference);
+                                display_parts.push(format!("[Image: {}]", f.name));
+                            }
                         }
                         let _ = std::fs::remove_file(&tmp);
                     }
@@ -999,7 +1061,8 @@ async fn chat_send(
 
     chat.messages.push(ChatMessage {
         role: "user".into(),
-        content: Some(serde_json::Value::String(display_content.clone())),
+        content: Some(serde_json::Value::String(content.clone())),
+        attachments: attachment_refs,
         tool_calls: vec![],
         tool_call_id: None,
         reasoning_content: None,
@@ -1104,12 +1167,13 @@ async fn chat_stream(
             }
             None => {
                 let error_stream = futures_util::stream::once(async move {
-                    Ok::<_, Infallible>(Event::default().data(
-                        r#"{"type":"error","message":"No active task"}"#,
-                    ))
+                    Ok::<_, Infallible>(
+                        Event::default().data(r#"{"type":"error","message":"No active task"}"#),
+                    )
                 });
-                return Sse::new(Box::pin(error_stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-                    .keep_alive(KeepAlive::default());
+                return Sse::new(Box::pin(error_stream)
+                    as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+                .keep_alive(KeepAlive::default());
             }
         }
     };
@@ -1129,9 +1193,8 @@ fn async_stream(
     let retry_event = Ok(Event::default().retry(std::time::Duration::from_millis(1000)));
     let retry_stream = futures_util::stream::once(async move { retry_event });
 
-    let main_stream = futures_util::stream::unfold(
-        (start_index, event_count_rx),
-        move |(mut index, mut rx)| {
+    let main_stream =
+        futures_util::stream::unfold((start_index, event_count_rx), move |(mut index, mut rx)| {
             let events = events.clone();
             let done = done.clone();
             async move {
@@ -1155,25 +1218,18 @@ fn async_stream(
                     }
                     // Wait for new events or emit a keepalive comment so
                     // proxies / mobile browsers don't drop the long-running SSE.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(25),
-                        rx.changed(),
-                    )
-                    .await
+                    match tokio::time::timeout(std::time::Duration::from_secs(25), rx.changed())
+                        .await
                     {
                         Ok(Ok(_)) => continue,
                         Ok(Err(_)) => return None, // sender dropped
                         Err(_) => {
-                            return Some((
-                                Ok(Event::default().comment("keepalive")),
-                                (index, rx),
-                            ));
+                            return Some((Ok(Event::default().comment("keepalive")), (index, rx)));
                         }
                     }
                 }
             }
-        },
-    );
+        });
 
     retry_stream.chain(main_stream)
 }
@@ -1263,7 +1319,71 @@ async fn chat_stop(
     Json(serde_json::json!({"status": "stopped"}))
 }
 
-// ── NEW: Export ──────────────────────────────────────────────────
+// ── Export ───────────────────────────────────────────────────────
+
+fn html_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        .replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn export_filename(title: &str, extension: &str) -> String {
+    let safe: String = title.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' }).collect();
+    let safe = safe.trim().chars().take(50).collect::<String>();
+    format!("{}.{}", if safe.is_empty() { "chat" } else { &safe }, extension)
+}
+
+fn message_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts.iter().filter_map(|p| p.get("text").and_then(|v| v.as_str())).collect::<Vec<_>>().join(" "),
+        Some(v) => v.to_string(),
+        None => String::new(),
+    }
+}
+
+fn export_html(chat: &Chat) -> String {
+    let title = html_escape(&chat.title);
+    let mut html = format!("<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font:16px system-ui;max-width:900px;margin:2em auto}}section{{margin:1.5em 0}}pre{{white-space:pre-wrap;background:#f5f5f5;padding:1em}}h3{{text-transform:capitalize}}</style></head><body><h1>{}</h1>", title, title);
+    for msg in &chat.messages {
+        let text = html_escape(&message_text(msg.content.as_ref()));
+        html.push_str(&format!("<section><h3>{}</h3><pre>{}</pre>", html_escape(&msg.role), text));
+        for reference in &msg.attachments {
+            if reference.kind == "image" {
+                let path = format!("attachments/{}.jpg", reference.id.strip_prefix("sha256:").unwrap_or(&reference.id));
+                html.push_str(&format!("<p><img src=\"{}\" alt=\"{}\" style=\"max-width:100%\"></p>", path, html_escape(&reference.name)));
+            } else { html.push_str(&format!("<p>{}</p>", html_escape(&pengy_core::attachments::label(reference)))); }
+        }
+        html.push_str("</section>");
+    }
+    html.push_str("</body></html>");
+    html
+}
+
+async fn chat_export_bundle(Path((chat_id, format)): Path<(String, String)>) -> impl IntoResponse {
+    if format != "html" && format != "zip" { return (StatusCode::BAD_REQUEST, "format must be html or zip").into_response(); }
+    let chat = match chat_manager::get_chat(&chat_id) { Some(c) => c, None => return (StatusCode::NOT_FOUND, "Chat not found").into_response() };
+    let html = export_html(&chat);
+    if format == "html" {
+        return (StatusCode::OK, [("Content-Type", "text/html; charset=utf-8"), ("Content-Disposition", &format!("attachment; filename=\"{}\"", export_filename(&chat.title, "html")))], html).into_response();
+    }
+    let mut bytes = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut bytes);
+        let mut archive = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        if archive.start_file("index.html", options).is_err() || std::io::Write::write_all(&mut archive, html.as_bytes()).is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, "Could not create ZIP export").into_response(); }
+        for reference in chat.messages.iter().flat_map(|m| m.attachments.iter()).filter(|r| r.kind == "image") {
+            if let Ok(path) = pengy_core::attachments::derivative_path(&reference.id, "image-display-v1.jpg") {
+                if let Ok(data) = std::fs::read(path) {
+                    let name = format!("attachments/{}.jpg", reference.id.strip_prefix("sha256:").unwrap_or(&reference.id));
+                    if archive.start_file(name, options).is_ok() { let _ = std::io::Write::write_all(&mut archive, &data); }
+                }
+            }
+        }
+        if archive.finish().is_err() { return (StatusCode::INTERNAL_SERVER_ERROR, "Could not finish ZIP export").into_response(); }
+    }
+    (StatusCode::OK, [("Content-Type", "application/zip"), ("Content-Disposition", &format!("attachment; filename=\"{}\"", export_filename(&chat.title, "zip")))], bytes).into_response()
+}
 
 async fn chat_export(Path(chat_id): Path<String>) -> impl IntoResponse {
     let chat = match chat_manager::get_chat(&chat_id) {
@@ -1446,13 +1566,13 @@ async fn chat_redact(
             .into_response();
     }
 
-    let count_value = body.and_then(|Json(b)| b.count).unwrap_or(serde_json::json!(1));
-    let n = match count_value.as_u64().or_else(|| {
-        count_value
-            .as_i64()
-            .filter(|v| *v >= 0)
-            .map(|v| v as u64)
-    }) {
+    let count_value = body
+        .and_then(|Json(b)| b.count)
+        .unwrap_or(serde_json::json!(1));
+    let n = match count_value
+        .as_u64()
+        .or_else(|| count_value.as_i64().filter(|v| *v >= 0).map(|v| v as u64))
+    {
         Some(n) if n >= 1 => n as usize,
         _ => {
             return (
@@ -1533,7 +1653,9 @@ async fn render_task(Json(data): Json<RenderTaskRequest>) -> impl IntoResponse {
             .map(|(k, v)| {
                 (
                     k,
-                    v.as_str().map(String::from).unwrap_or_else(|| v.to_string()),
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string()),
                 )
             })
             .collect(),
@@ -1703,6 +1825,21 @@ async fn models_api() -> impl IntoResponse {
 }
 
 // ── File serving for local images ───────────────────────────────────
+
+async fn serve_attachment(
+    axum::extract::Path((digest, derivative)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    if !regex::Regex::new(r"^[0-9a-f]{64}$").unwrap().is_match(&digest) || !matches!(derivative.as_str(), "thumbnail" | "display") {
+        return (StatusCode::BAD_REQUEST, "Invalid attachment").into_response();
+    }
+    let name = if derivative == "thumbnail" { "thumbnail-256-v1.jpg" } else { "image-display-v1.jpg" };
+    let id = format!("sha256:{digest}");
+    let path = match pengy_core::attachments::derivative_path(&id, name) { Ok(p) => p, Err(_) => return (StatusCode::BAD_REQUEST, "Invalid attachment").into_response() };
+    match tokio::fs::read(path).await {
+        Ok(data) => (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "image/jpeg"), (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")], data).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Attachment not found").into_response(),
+    }
+}
 
 async fn serve_file(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -1884,7 +2021,7 @@ struct Turn {
 }
 
 enum TurnType {
-    User { content: String },
+    User { content: String, attachments: Vec<pengy_core::attachments::AttachmentRef> },
     Assistant { html: String },
     ToolUse { events: Vec<ToolEvent> },
 }
@@ -1915,7 +2052,7 @@ fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
                 .unwrap_or("")
                 .to_string();
             turns.push(Turn {
-                turn_type: TurnType::User { content },
+                turn_type: TurnType::User { content, attachments: msg.attachments.clone() },
             });
             i += 1;
         } else if msg.role == "assistant" {
@@ -2376,6 +2513,7 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
             content: Some(serde_json::Value::String(config::render_system_message(
                 &config.system_message,
             ))),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
@@ -2646,10 +2784,11 @@ mod templates {
 
         for turn in turns {
             match &turn.turn_type {
-                TurnType::User { content } => {
+                TurnType::User { content, attachments } => {
+                    let cards: String = attachments.iter().map(|a| if a.kind == "image" && a.id.starts_with("sha256:") { let d = &a.id[7..]; format!(r#"<img class="attachment-thumb" src="/attachments/{}/thumbnail" alt="{}" loading="lazy">"#, d, escape_html(&a.name)) } else { format!("<span class=\"attachment-unavailable\">Attachment unavailable: {}</span>", escape_html(&a.name)) }).collect();
                     messages_html.push_str(&format!(
-                        r#"<div class="msg-user"><div class="bubble-user">{}</div></div>"#,
-                        escape_html(content)
+                        r#"<div class="msg-user"><div class="bubble-user"><div class="attachment-grid">{}</div>{}</div></div>"#,
+                        cards, escape_html(content)
                     ));
                 }
                 TurnType::Assistant { html } => {
@@ -2713,7 +2852,15 @@ mod templates {
 </div>"##,
                             safe_id = ev.safe_id,
                             name = escape_html(&ev.name),
-                            summary = if ev.summary.is_empty() { String::new() } else { format!(r#"<span class="tool-summary text-muted" title="{}">{}</span>"#, escape_html(&ev.summary), escape_html(&ev.summary)) },
+                            summary = if ev.summary.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    r#"<span class="tool-summary text-muted" title="{}">{}</span>"#,
+                                    escape_html(&ev.summary),
+                                    escape_html(&ev.summary)
+                                )
+                            },
                             args = escape_html(&args_str),
                         ));
                     }
@@ -4071,7 +4218,13 @@ mod tests {
         assert_eq!(items.len(), 2); // retry + SudoRequest
     }
 
-    fn event_log(events: Vec<SseEvent>) -> (Arc<Mutex<Vec<SseEvent>>>, tokio::sync::watch::Receiver<usize>, Arc<AtomicBool>) {
+    fn event_log(
+        events: Vec<SseEvent>,
+    ) -> (
+        Arc<Mutex<Vec<SseEvent>>>,
+        tokio::sync::watch::Receiver<usize>,
+        Arc<AtomicBool>,
+    ) {
         let count = events.len();
         let events = Arc::new(Mutex::new(events));
         let (_tx, rx) = tokio::sync::watch::channel(count);
@@ -4081,9 +4234,34 @@ mod tests {
     #[tokio::test]
     async fn reconnect_replays_only_events_after_cursor() {
         let (events, rx, done) = event_log(vec![
-            SseEvent::ToolRequest { name: "read_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), summary: String::new(), auto_approved: false },
-            SseEvent::ToolResult { tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "read_file".into(), content: "ok".into(), declined: false },
-            SseEvent::FinalResponse { html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, cumulative_usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } },
+            SseEvent::ToolRequest {
+                name: "read_file".into(),
+                args: serde_json::json!({}),
+                tool_call_id: "tool-1".into(),
+                safe_id: "tc_tool1".into(),
+                summary: String::new(),
+                auto_approved: false,
+            },
+            SseEvent::ToolResult {
+                tool_call_id: "tool-1".into(),
+                safe_id: "tc_tool1".into(),
+                name: "read_file".into(),
+                content: "ok".into(),
+                declined: false,
+            },
+            SseEvent::FinalResponse {
+                html: "<p>done</p>".into(),
+                usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+                cumulative_usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            },
         ]);
         let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
         // retry directive plus result and final; event 0/tool request is not replayed.
@@ -4093,7 +4271,12 @@ mod tests {
     #[tokio::test]
     async fn disconnected_stream_can_resume_final_response_exactly_once() {
         let events = Arc::new(Mutex::new(vec![SseEvent::ToolRequest {
-            name: "write_file".into(), args: serde_json::json!({}), tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), summary: String::new(), auto_approved: false,
+            name: "write_file".into(),
+            args: serde_json::json!({}),
+            tool_call_id: "tool-1".into(),
+            safe_id: "tc_tool1".into(),
+            summary: String::new(),
+            auto_approved: false,
         }]));
         let (tx, rx) = tokio::sync::watch::channel(1usize);
         let done = Arc::new(AtomicBool::new(false));
@@ -4101,11 +4284,24 @@ mod tests {
         // The first client has seen event 0 and disconnects. The worker makes
         // progress while no stream is consuming it.
         events.lock().unwrap().push(SseEvent::ToolResult {
-            tool_call_id: "tool-1".into(), safe_id: "tc_tool1".into(), name: "write_file".into(), content: "written".into(), declined: false,
+            tool_call_id: "tool-1".into(),
+            safe_id: "tc_tool1".into(),
+            name: "write_file".into(),
+            content: "written".into(),
+            declined: false,
         });
         events.lock().unwrap().push(SseEvent::FinalResponse {
-            html: "<p>done</p>".into(), usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            cumulative_usage: llm_client::Usage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            html: "<p>done</p>".into(),
+            usage: llm_client::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+            cumulative_usage: llm_client::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
         });
         done.store(true, Ordering::Relaxed);
         let _ = tx.send(3);
@@ -4187,8 +4383,19 @@ mod tests {
 
     #[test]
     fn tool_summary_redacts_and_bounds_arguments() {
-        assert_eq!(tool_summary("read_file", &serde_json::json!({"path": "/tmp/x"})), "/tmp/x");
-        assert_eq!(tool_summary("custom", &serde_json::json!({"api_key": "secret"})), "");
-        assert!(tool_summary("run_bash", &serde_json::json!({"command": "x".repeat(200)})).chars().count() <= 100);
+        assert_eq!(
+            tool_summary("read_file", &serde_json::json!({"path": "/tmp/x"})),
+            "/tmp/x"
+        );
+        assert_eq!(
+            tool_summary("custom", &serde_json::json!({"api_key": "secret"})),
+            ""
+        );
+        assert!(
+            tool_summary("run_bash", &serde_json::json!({"command": "x".repeat(200)}))
+                .chars()
+                .count()
+                <= 100
+        );
     }
 }

@@ -14,7 +14,11 @@ use tokio::sync::mpsc;
 // ── Graceful image-stripping helpers ────────────────────────────
 
 const IMAGE_ERROR_KEYWORDS: &[&str] = &[
-    "image", "multimodal", "vision", "not support", "unsupported",
+    "image",
+    "multimodal",
+    "vision",
+    "not support",
+    "unsupported",
 ];
 
 fn has_image_url_parts(messages: &[ChatMessage]) -> bool {
@@ -203,6 +207,37 @@ impl ToolConfirmation {
 /// - Emits events via `event_tx`
 /// - Receives tool confirmations via `confirm_rx`
 /// - Checks `cancel` flag before each API call
+/// Convert persisted messages into provider-safe messages. Local attachment
+/// references are always removed; image bytes are resolved only for retained
+/// recent user turns.
+fn provider_messages(messages: &[ChatMessage], keep_turns: usize) -> Vec<ChatMessage> {
+    let user_indices: Vec<usize> = messages.iter().enumerate()
+        .filter_map(|(i, m)| (m.role == "user").then_some(i)).collect();
+    let keep_from = if keep_turns == 0 { 0 } else { user_indices.len().saturating_sub(keep_turns) };
+    messages.iter().enumerate().map(|(index, original)| {
+        let mut msg = original.clone();
+        let refs = std::mem::take(&mut msg.attachments);
+        let retained = msg.role == "user" && !refs.is_empty()
+            && user_indices.iter().position(|i| *i == index).map(|n| n >= keep_from).unwrap_or(false);
+        if retained {
+            let mut parts = Vec::new();
+            for reference in &refs {
+                if let Some(url) = crate::attachments::image_data_url(reference,
+                    *tools::IMAGE_MAX_DIMENSION.lock().unwrap(),
+                    *tools::IMAGE_MAX_MB.lock().unwrap(),
+                    *tools::IMAGE_QUALITY.lock().unwrap()) {
+                    parts.push(serde_json::json!({"type":"image_url","image_url":{"url":url}}));
+                }
+            }
+            if let Some(serde_json::Value::String(text)) = &msg.content {
+                if !text.is_empty() { parts.push(serde_json::json!({"type":"text","text":text})); }
+            }
+            if !parts.is_empty() { msg.content = Some(serde_json::Value::Array(parts)); }
+        }
+        msg
+    }).collect()
+}
+
 fn format_question_answers(questions: &serde_json::Value, answers: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(qs) = questions.as_array() {
@@ -235,6 +270,7 @@ pub async fn chat(
     reasoning_effort: &str,
     preserve_reasoning: bool,
     llm_timeout: u64,
+    attachment_context_keep_turns: usize,
     event_tx: mpsc::UnboundedSender<LlmEvent>,
     mut confirm_rx: mpsc::UnboundedReceiver<Confirmation>,
     cancel: Arc<AtomicBool>,
@@ -261,10 +297,13 @@ pub async fn chat(
             return;
         }
 
+        // Attachment refs are local history only. Resolve image derivatives at
+        // request time so provider payloads never leak back into chat JSON.
+        let api_messages = provider_messages(&current_messages, attachment_context_keep_turns);
         // Build API request payload
         let mut payload = serde_json::json!({
             "model": model,
-            "messages": current_messages,
+            "messages": api_messages,
             "tools": tools::tool_definitions_json(),
             "tool_choice": "auto",
         });
@@ -319,8 +358,10 @@ pub async fn chat(
                                 content: Some(serde_json::Value::String(
                                     "[This AI model does not support image/vision inputs, \
                                      so the image could not be attached. \
-                                     The file metadata was returned above.]".into(),
+                                     The file metadata was returned above.]"
+                                        .into(),
                                 )),
+                                attachments: vec![],
                                 tool_calls: vec![],
                                 tool_call_id: None,
                                 reasoning_content: None,
@@ -441,6 +482,7 @@ pub async fn chat(
                 let assistant_msg = ChatMessage {
                     role: "assistant".into(),
                     content: Some(serde_json::Value::String(content.clone())),
+                    attachments: vec![],
                     tool_calls: tool_calls
                         .iter()
                         .map(|tc| crate::chat_manager::ToolCall {
@@ -513,6 +555,7 @@ pub async fn chat(
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(result_text.clone())),
+                                    attachments: vec![],
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                     reasoning_content: None,
@@ -530,6 +573,7 @@ pub async fn chat(
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
+                                    attachments: vec![],
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                     reasoning_content: None,
@@ -567,6 +611,7 @@ pub async fn chat(
                         current_messages.push(ChatMessage {
                             role: "tool".into(),
                             content: Some(serde_json::Value::String(result.clone())),
+                            attachments: vec![],
                             tool_calls: vec![],
                             tool_call_id: Some(tc_id.clone()),
                             reasoning_content: None,
@@ -601,6 +646,7 @@ pub async fn chat(
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(result.clone())),
+                                    attachments: vec![],
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                     reasoning_content: None,
@@ -623,6 +669,7 @@ pub async fn chat(
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
+                                    attachments: vec![],
                                     tool_calls: vec![],
                                     tool_call_id: Some(tc_id.clone()),
                                     reasoning_content: None,
@@ -665,6 +712,7 @@ pub async fn chat(
                     current_messages.push(ChatMessage {
                         role: "user".into(),
                         content: Some(serde_json::Value::Array(parts)),
+                        attachments: vec![],
                         tool_calls: vec![],
                         tool_call_id: None,
                         reasoning_content: None,
@@ -682,6 +730,7 @@ pub async fn chat(
         let final_msg = ChatMessage {
             role: "assistant".into(),
             content: Some(serde_json::Value::String(content.clone())),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: if preserve_reasoning {
@@ -815,6 +864,41 @@ mod tests {
         let parsed: Usage = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.total_tokens, 0);
     }
+
+    fn attached_user(text: &str, id: &str) -> ChatMessage {
+        let mut msg = ChatMessage::new("user", Some(serde_json::Value::String(text.into())));
+        msg.attachments.push(crate::attachments::AttachmentRef {
+            v: 1,
+            id: id.into(),
+            kind: "image".into(),
+            name: "missing.png".into(),
+            media_type: "image/png".into(),
+            byte_size: 1,
+            created_at: "now".into(),
+            image: None,
+            extra: std::collections::BTreeMap::new(),
+        });
+        msg
+    }
+
+    #[test]
+    fn provider_messages_strip_attachment_metadata_from_old_turns() {
+        let messages = vec![attached_user("old", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), attached_user("new", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
+        let provider = provider_messages(&messages, 1);
+        assert!(provider.iter().all(|message| message.attachments.is_empty()));
+        assert_eq!(provider[0].content.as_ref().unwrap(), "old");
+        // The newest retained image is unavailable in this fixture, but its
+        // local metadata is still stripped rather than sent to the provider.
+        assert_eq!(provider[1].content.as_ref().unwrap(), &serde_json::json!([{"type":"text","text":"new"}]));
+    }
+
+    #[test]
+    fn provider_messages_zero_keeps_all_turns_but_strips_metadata() {
+        let messages = vec![attached_user("one", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), attached_user("two", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
+        let provider = provider_messages(&messages, 0);
+        assert_eq!(provider.len(), 2);
+        assert!(provider.iter().all(|message| message.attachments.is_empty()));
+    }
 }
 
 #[cfg(test)]
@@ -831,6 +915,7 @@ mod loop_tests {
         ChatMessage {
             role: "user".into(),
             content: Some(serde_json::Value::String(text.into())),
+            attachments: vec![],
             tool_calls: vec![],
             tool_call_id: None,
             reasoning_content: None,
@@ -953,6 +1038,7 @@ mod loop_tests {
                 &effort,
                 preserve_reasoning,
                 300,
+                4,
                 event_tx,
                 confirm_rx,
                 cancel,
@@ -1122,10 +1208,7 @@ mod loop_tests {
         let last = &msgs[msgs.len() - 1];
         assert_eq!(last["role"], "user");
         let parts = last["content"].as_array().expect("array content");
-        let images: Vec<_> = parts
-            .iter()
-            .filter(|p| p["type"] == "image_url")
-            .collect();
+        let images: Vec<_> = parts.iter().filter(|p| p["type"] == "image_url").collect();
         assert_eq!(images.len(), 1);
         let url = images[0]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/"), "{url}");

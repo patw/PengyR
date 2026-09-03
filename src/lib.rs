@@ -4,6 +4,7 @@
 //! Events are reported via callback. Tool confirmations block
 //! on a condition variable that the Qt main thread signals.
 
+pub mod attachments;
 pub mod chat_manager;
 pub mod config;
 pub mod image_utils;
@@ -397,6 +398,7 @@ pub extern "C" fn pengy_llm_chat_run(
             &re_str,
             preserve_reasoning,
             300,
+            config::load_config().attachment_context_keep_turns,
             event_tx,
             confirm_rx,
             cancel2,
@@ -469,22 +471,19 @@ pub extern "C" fn pengy_llm_chat_run(
                     } => {
                         if !question_state.is_null() {
                             // Serialise questions into the shared buffer
-                            let q_json =
-                                serde_json::to_string(questions).unwrap_or_default();
+                            let q_json = serde_json::to_string(questions).unwrap_or_default();
                             let q_bytes = q_json.as_bytes();
                             let q_len = q_bytes.len().min(16383);
                             unsafe {
                                 let qs = &mut *question_state;
-                                qs.questions_json[..q_len]
-                                    .copy_from_slice(&q_bytes[..q_len]);
+                                qs.questions_json[..q_len].copy_from_slice(&q_bytes[..q_len]);
                                 qs.questions_json[q_len] = 0;
                                 std::ptr::write_volatile(&mut qs.status, 1);
                             }
                             // Busy-wait for Qt main thread to respond
                             loop {
-                                let status = unsafe {
-                                    std::ptr::read_volatile(&(*question_state).status)
-                                };
+                                let status =
+                                    unsafe { std::ptr::read_volatile(&(*question_state).status) };
                                 if status == 2 || status == 3 {
                                     break;
                                 }
@@ -505,16 +504,12 @@ pub extern "C" fn pengy_llm_chat_run(
                                 (s == 2, qs.answers_json)
                             };
                             unsafe {
-                                std::ptr::write_volatile(
-                                    &mut (*question_state).status,
-                                    0,
-                                );
+                                std::ptr::write_volatile(&mut (*question_state).status, 0);
                             }
                             let answers: Vec<String> = if answered {
-                                let ans_str =
-                                    String::from_utf8_lossy(&answers_buf)
-                                        .trim_end_matches('\0')
-                                        .to_string();
+                                let ans_str = String::from_utf8_lossy(&answers_buf)
+                                    .trim_end_matches('\0')
+                                    .to_string();
                                 serde_json::from_str(&ans_str).unwrap_or_default()
                             } else {
                                 vec![]
@@ -523,11 +518,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                 tool_call_id: tool_call_id.clone(),
                                 confirmed: answered,
                                 yolo_turn: false,
-                                answers: if answered {
-                                    Some(answers)
-                                } else {
-                                    None
-                                },
+                                answers: if answered { Some(answers) } else { None },
                             });
                         }
                     }
@@ -654,7 +645,25 @@ pub extern "C" fn pengy_image_preprocess(
     }
 }
 
-// ── Memory ────────────────────────────────────────────────────────
+// ── Attachments ───────────────────────────────────────────────────
+#[no_mangle]
+pub extern "C" fn pengy_attachment_import_image(path: *const c_char, name: *const c_char, max_dimension: u32, max_mb: f64, quality: u8) -> *mut c_char {
+    let p = unsafe { cstr(path) }; let n = unsafe { cstr(name) };
+    match attachments::import_image(std::path::Path::new(&p), &n, if max_dimension == 0 {4096} else {max_dimension}, if max_mb <= 0.0 {4.5} else {max_mb}, if quality == 0 {85} else {quality}) {
+        Ok(reference) => to_c(&serde_json::to_string(&reference).unwrap_or_default()), Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_attachment_data_url(ref_json: *const c_char, max_dimension: u32, max_mb: f64, quality: u8) -> *mut c_char {
+    let raw = unsafe { cstr(ref_json) };
+    let Ok(reference) = serde_json::from_str::<attachments::AttachmentRef>(&raw) else { return std::ptr::null_mut(); };
+    match attachments::image_data_url(&reference, if max_dimension == 0 {4096} else {max_dimension}, if max_mb <= 0.0 {4.5} else {max_mb}, if quality == 0 {85} else {quality}) {
+        Some(url) => to_c(&url), None => std::ptr::null_mut(),
+    }
+}
+
+
 
 #[no_mangle]
 pub extern "C" fn pengy_free(s: *mut c_char) {

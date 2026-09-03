@@ -50,6 +50,9 @@ pub struct Config {
     /// Number of recent turns to keep when compacting context. 0 = keep all.
     #[serde(default)]
     pub context_keep_turns: usize,
+    /// Number of recent user turns whose media is included in provider context.
+    #[serde(default = "default_attachment_context_keep_turns")]
+    pub attachment_context_keep_turns: usize,
 
     /// UI scale percentage (75–200).
     #[serde(default = "default_ui_scale")]
@@ -110,6 +113,7 @@ fn default_system_message() -> String {
 fn default_tool_confirmation() -> String {
     "none".into()
 }
+fn default_attachment_context_keep_turns() -> usize { 4 }
 fn default_ui_scale() -> u32 {
     100
 }
@@ -155,6 +159,7 @@ impl Default for Config {
             reasoning_effort: String::new(),
             preserve_reasoning: false,
             context_keep_turns: 0,
+            attachment_context_keep_turns: default_attachment_context_keep_turns(),
             ui_scale: default_ui_scale(),
             theme_mode: default_theme_mode(),
             theme_accent: default_theme_accent(),
@@ -504,6 +509,7 @@ mod tests {
             reasoning_effort: "high".into(),
             preserve_reasoning: true,
             context_keep_turns: 5,
+            attachment_context_keep_turns: 4,
             ui_scale: 150,
             theme_mode: "dark".into(),
             theme_accent: "purple".into(),

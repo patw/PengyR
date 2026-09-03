@@ -9,6 +9,7 @@
 #include <QMap>
 #include <QMutex>
 #include <QThread>
+#include <QImage>
 
 class ChatView : public QTextBrowser {
     Q_OBJECT
