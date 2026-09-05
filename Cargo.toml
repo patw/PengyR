@@ -1,13 +1,24 @@
 [workspace]
 members = [".", "cli", "web"]
 
-[package]
-name = "pengy_core"
+# Single source of truth for the version shared by pengy_core, pengy-cli, and
+# pengy-web (see cli/Cargo.toml and web/Cargo.toml's `version.workspace = true`).
+# Bump only here on release so About screens and --version flags never drift
+# apart. The Qt GUI's version comes from a separate CMake-generated version.h
+# (gui/CMakeLists.txt), which reads this same value at configure time.
+[workspace.package]
 version = "1.8.1"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
-description = "Pengy core library — config, chat, tools, LLM client"
 repository = "https://github.com/patw/PengyR"
+
+[package]
+name = "pengy_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Pengy core library — config, chat, tools, LLM client"
+repository.workspace = true
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]

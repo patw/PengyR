@@ -1,10 +1,10 @@
 [package]
 name = "pengy-web"
-version = "1.8.1"
-edition = "2021"
-authors = ["Pat Wendorf <dungeons@gmail.com>"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 description = "Pengy Web UI — browser-based interface"
-repository = "https://github.com/patw/PengyR"
+repository.workspace = true
 
 [[bin]]
 name = "pengy-web"

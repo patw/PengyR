@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
-project(Pengy VERSION 1.8.1 LANGUAGES CXX)
+
+# Read the version from the root Cargo.toml's [workspace.package] section
+# instead of hardcoding it here, so pengy_core/pengy-cli/pengy-web and this
+# GUI never drift apart — bump the version in one place (Cargo.toml).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../Cargo.toml" PENGY_CARGO_VERSION_LINE REGEX "^version = ")
+string(REGEX REPLACE "^version = \"([^\"]+)\".*" "\\1" PENGY_VERSION_FULL "${PENGY_CARGO_VERSION_LINE}")
+# CMake's project(VERSION) only accepts plain dotted-numeric versions (no
+# semver pre-release/build suffixes like "-beta"), so strip any such suffix
+# here; Cargo itself still sees the full string for pengy_core/cli/web.
+string(REGEX MATCH "^[0-9]+\\.[0-9]+\\.[0-9]+" PENGY_VERSION_STRING "${PENGY_VERSION_FULL}")
+
+project(Pengy VERSION ${PENGY_VERSION_STRING} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
