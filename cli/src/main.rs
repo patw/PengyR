@@ -779,8 +779,8 @@ impl PengyCli {
 
         println!();
         print_box(
-            &format!("🔧 Tool: {}", name),
-            &[name.to_string(), args_str],
+            &format!("🔧 Tool: {}", sanitize_display(name)),
+            &[sanitize_display(name), sanitize_display(&args_str)],
             None,
         );
     }
@@ -797,7 +797,7 @@ impl PengyCli {
             content.to_string()
         };
 
-        print_box("Tool output", &[display], None);
+        print_box("Tool output", &[sanitize_display(&display)], None);
     }
 
     /// Show the narration the model wrote alongside its tool calls.  It is
@@ -1310,7 +1310,7 @@ impl PengyCli {
                 out_path.display(),
                 RESET
             ),
-            Err(e) => println!("{}Error exporting:{} {}", RED, RESET, e),
+            Err(e) => println!("{}Error exporting:{} {}", RED, RESET, sanitize_display(&e.to_string())),
         }
     }
 
@@ -1419,7 +1419,7 @@ impl PengyCli {
                     println!("  {}{}{}{}", CYAN, mid, RESET, marker);
                 }
             }
-            Err(e) => println!("{}Error fetching models:{} {}", RED, RESET, e),
+            Err(e) => println!("{}Error fetching models:{} {}", RED, RESET, sanitize_display(&e.to_string())),
         }
     }
 
@@ -2065,6 +2065,64 @@ fn take_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Sanitize untrusted text for terminal display: strip ANSI escape sequences
+/// (CSI, OSC, DCS, and single-byte escapes) and C0/DEL control characters,
+/// keeping newline/tab. This keeps injected tool/compiler output from moving
+/// the cursor, clearing the screen, or skewing the box width math (visual_width
+/// counts raw chars, so stray escape bytes misalign the panel). Display-only:
+/// the raw bytes sent to the model are untouched.
+fn sanitize_display(s: &str) -> String {
+    fn is_csi_final(c: char) -> bool {
+        ('\u{40}'..='\u{7e}').contains(&c)
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            let u = c as u32;
+            if c == '\n' || c == '\t' {
+                out.push(c);
+            } else if !(u < 0x20 || u == 0x7f) {
+                out.push(c);
+            }
+            continue;
+        }
+        // c == ESC: skip the entire escape sequence.
+        match chars.peek().copied() {
+            // CSI: ESC [ parameter/private bytes then a final 0x40..0x7e byte.
+            Some('[') => {
+                chars.next();
+                for cc in chars.by_ref() {
+                    if is_csi_final(cc) {
+                        break;
+                    }
+                }
+            }
+            // OSC/DCS/APC/PM/SOS run until ST (ESC \) or BEL (OSC).
+            Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
+                chars.next();
+                loop {
+                    match chars.next() {
+                        None | Some('\u{07}') => break,
+                        Some('\u{1b}') => {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() {
         return vec![String::new()];
@@ -2447,4 +2505,45 @@ fn find_double(chars: &[char], from: usize, ch: char) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_display;
+
+    #[test]
+    fn strips_csi_color_codes() {
+        assert_eq!(sanitize_display("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn strips_other_control_chars_but_keeps_newline_tab() {
+        // C0 control bytes (other than \n, \t) and DEL are dropped.
+        assert_eq!(sanitize_display("a\x00b\x07c\x1fd"), "abcd");
+        assert_eq!(sanitize_display("line1\nline2\tend"), "line1\nline2\tend");
+    }
+
+    #[test]
+    fn leaves_plain_text_alone() {
+        let s = "FAIL: [tests/test_mediainfo.cpp(125)] did not parse";
+        assert_eq!(sanitize_display(s), s);
+    }
+
+    #[test]
+    fn keeps_emoji_and_multibyte() {
+        // Emoji (surrogate/full-width) must pass through untouched.
+        assert_eq!(sanitize_display("🔧 Tool 🐧"), "🔧 Tool 🐧");
+        assert_eq!(sanitize_display("line\n☀️ done"), "line\n☀️ done");
+    }
+
+    #[test]
+    fn strips_osc_title_sequence() {
+        // OSC sets a window title; it must be dropped, not echoed to the tty.
+        assert_eq!(sanitize_display("a\x1b]0;evil-title\x07b"), "ab");
+    }
+
+    #[test]
+    fn strips_multiple_consecutive_escapes() {
+        assert_eq!(sanitize_display("\x1b[1m\x1b[35mhi\x1b[0m"), "hi");
+    }
 }
