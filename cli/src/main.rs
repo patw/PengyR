@@ -1,3 +1,4 @@
+use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
@@ -59,6 +60,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/redact",
     "/tasks",
     "/task",
+    "/about",
     "/quit",
     "/exit",
     "/q",
@@ -944,6 +946,7 @@ impl PengyCli {
             "/redact" => self.cmd_redact(args),
             "/tasks" => self.cmd_tasks(),
             "/task" => self.cmd_task(args),
+            "/about" => self.cmd_about(),
             _ => println!("{}Unknown command:{} {}  (try /help)", RED, RESET, cmd),
         }
         true
@@ -997,6 +1000,7 @@ impl PengyCli {
             ("/delete <index>", "Delete a chat by its /list index"),
             ("/attach", "Show file attachment help"),
             ("/attachments", "Show durable attachment storage usage (read-only)"),
+            ("/about", "Show version, repo link, and license info"),
             ("/quit, /exit", "Exit Pengy CLI"),
         ];
         for (cmd, desc) in &cmds {
@@ -1351,6 +1355,20 @@ impl PengyCli {
             CYAN, RESET, self.config.tool_timeout
         );
         println!("  {}User Agent:{} {}", CYAN, RESET, self.config.user_agent);
+    }
+
+    fn cmd_about(&self) {
+        println!();
+        println!("{}{}{}", BOLD, about::edition_line("Rust"), RESET);
+        println!("{}{}{}", CYAN, about::GITHUB_URL, RESET);
+        println!("{}{}{}", CYAN, about::WEBSITE_URL, RESET);
+        println!();
+        println!("{}", about::DESCRIPTION);
+        println!();
+        println!("{} {}{}{}", about::CATBEE_BLURB, CYAN, about::CATBEE_URL, RESET);
+        println!();
+        println!("{}", about::copyright_line());
+        println!("{}{}{}", CYAN, about::license_url(), RESET);
     }
 
     fn cmd_model(&mut self, args: &[&str]) {

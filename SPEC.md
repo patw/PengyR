@@ -37,7 +37,7 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 │  ┌─ Qt6 GUI (C++17) ─────────────┐  ┌─ CLI (Rust) ──────────────┐ │
 │  │ ChatHistory / ChatView /       │  │ Interactive REPL           │ │
 │  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
-│  │ ChatWorker (QThread → FFI)     │  │ 28 slash commands          │ │
+│  │ ChatWorker (QThread → FFI)     │  │ 29 slash commands          │ │
 │  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
 │               │ C FFI (25 extern "C")             │ direct Rust    │
 │               │                                    │                │
@@ -654,7 +654,7 @@ build_windows.bat
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
 | 16 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
-| CLI (interactive REPL + single-shot) | ✅ | 28 slash commands, @path attachments |
+| CLI (interactive REPL + single-shot) | ✅ | 29 slash commands, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |
 | File attachments (GUI) | ✅ | Image + text file support |
 | Image paste from clipboard | ✅ | |

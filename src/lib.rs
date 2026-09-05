@@ -4,6 +4,7 @@
 //! Events are reported via callback. Tool confirmations block
 //! on a condition variable that the Qt main thread signals.
 
+pub mod about;
 pub mod attachments;
 pub mod chat_manager;
 pub mod config;
@@ -62,6 +63,14 @@ pub extern "C" fn pengy_config_save(json: *const c_char) -> bool {
 #[no_mangle]
 pub extern "C" fn pengy_config_render(template: *const c_char) -> *mut c_char {
     to_c(&config::render_system_message(&unsafe { cstr(template) }))
+}
+
+// ── About ─────────────────────────────────────────────────────────
+
+/// Return the About tab payload (version, links, blurbs) as a JSON object.
+#[no_mangle]
+pub extern "C" fn pengy_about_json() -> *mut c_char {
+    to_c(&serde_json::to_string(&about::about_info("Rust")).unwrap_or_default())
 }
 
 // ── Model cache ──────────────────────────────────────────────────

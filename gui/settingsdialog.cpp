@@ -16,6 +16,7 @@
 #include <QPointer>
 #include <QAbstractItemView>
 #include <QTabWidget>
+#include <QFont>
 #include "themehelper.h"
 #include "iconhelper.h"
 
@@ -230,6 +231,52 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     toolsForm->addRow(labelWithTip("User Agent:", "HTTP User-Agent header sent with LLM API requests and any HTTP-based tool calls."), m_userAgent);
 
     tabs->addTab(toolsTab, "Tools");
+
+    // ── About tab ───────────────────────────────────────────────
+    auto* aboutTab = new QWidget;
+    auto* aboutLayout = new QVBoxLayout(aboutTab);
+    aboutLayout->setSpacing(8);
+
+    char* aboutJson = pengy_about_json();
+    QJsonObject about = QJsonDocument::fromJson(QByteArray(aboutJson)).object();
+    pengy_free(aboutJson);
+
+    auto* versionLabel = new QLabel(about["edition_line"].toString());
+    QFont versionFont = versionLabel->font();
+    versionFont.setBold(true);
+    versionFont.setPointSize(versionFont.pointSize() + 2);
+    versionLabel->setFont(versionFont);
+    aboutLayout->addWidget(versionLabel);
+
+    QString githubUrl = about["github_url"].toString();
+    auto* repoLabel = new QLabel(QString("<a href=\"%1\">%1</a>").arg(githubUrl));
+    repoLabel->setOpenExternalLinks(true);
+    aboutLayout->addWidget(repoLabel);
+
+    QString websiteUrl = about["website_url"].toString();
+    auto* websiteLabel = new QLabel(QString("<a href=\"%1\">%1</a>").arg(websiteUrl));
+    websiteLabel->setOpenExternalLinks(true);
+    aboutLayout->addWidget(websiteLabel);
+
+    auto* descriptionLabel = new QLabel(about["description"].toString());
+    descriptionLabel->setWordWrap(true);
+    aboutLayout->addWidget(descriptionLabel);
+
+    QString catbeeUrl = about["catbee_url"].toString();
+    auto* catbeeLabel = new QLabel(
+        QString("%1 <a href=\"%2\">%2</a>").arg(about["catbee_blurb"].toString(), catbeeUrl));
+    catbeeLabel->setWordWrap(true);
+    catbeeLabel->setOpenExternalLinks(true);
+    aboutLayout->addWidget(catbeeLabel);
+
+    QString licenseUrl = about["license_url"].toString();
+    auto* copyrightLabel = new QLabel(QString("%1<br><a href=\"%2\">%3</a>")
+        .arg(about["copyright"].toString(), licenseUrl, about["license_name"].toString()));
+    copyrightLabel->setOpenExternalLinks(true);
+    aboutLayout->addWidget(copyrightLabel);
+
+    aboutLayout->addStretch();
+    tabs->addTab(aboutTab, "About");
 
     layout->addWidget(tabs);
     layout->addStretch();

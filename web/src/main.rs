@@ -1,3 +1,4 @@
+use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage, ChatSummary};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
@@ -128,6 +129,7 @@ async fn main() {
         .route("/tasks", get(list_tasks))
         .route("/tasks/render", post(render_task))
         .route("/settings", get(settings_get).post(settings_post))
+        .route("/about", get(about_get))
         .route("/models", get(models_api))
         .route("/files", get(serve_file))
         .route("/attachments/:digest/:derivative", get(serve_attachment))
@@ -1910,6 +1912,11 @@ async fn settings_get() -> impl IntoResponse {
     Html(templates::settings_page(&config, &chats, false))
 }
 
+async fn about_get() -> impl IntoResponse {
+    let chats = chat_manager::load_index();
+    Html(templates::about_page(&chats))
+}
+
 #[derive(Deserialize)]
 struct SettingsForm {
     base_url: Option<String>,
@@ -2644,7 +2651,7 @@ mod templates {
       <div class="chat-list px-2 pb-2">
         {sidebar_chats}
       </div>
-      <div class="mt-auto border-top p-2">
+      <div class="mt-auto border-top p-2 d-md-none">
         <a href="/settings" class="btn btn-outline-secondary w-100"
            onclick="dismissSidebar(event)">
           <i class="bi bi-gear me-1"></i> Settings
@@ -2757,15 +2764,27 @@ mod templates {
         let navbar_center = format!(
             r#"<span class="text-muted small d-none d-sm-inline" id="navModel">{}</span> {}
 {}
-<button class="btn btn-outline-secondary btn-sm ms-1" onclick="openTasks()" title="Run a saved prompt template">
-  <i class="bi bi-list-task"></i>
-</button>
-<button class="btn btn-outline-secondary btn-sm ms-1" onclick="exportChat()" title="Export chat as Markdown">
-  <i class="bi bi-download"></i>
-</button>
-<button class="btn btn-outline-secondary btn-sm ms-1" onclick="redactLast()" title="Redact last message — delete the last message from context (repeatable)">
-  <i class="bi bi-eraser"></i>
-</button>"#,
+<div class="d-none d-md-flex align-items-center gap-1">
+  <button class="btn btn-outline-secondary btn-sm" onclick="openTasks()" title="Run a saved prompt template">
+    <i class="bi bi-list-task"></i>
+  </button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="exportChat()" title="Export chat as Markdown">
+    <i class="bi bi-download"></i>
+  </button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="redactLast()" title="Redact last message — delete the last message from context (repeatable)">
+    <i class="bi bi-eraser"></i>
+  </button>
+</div>
+<div class="dropdown d-md-none">
+  <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="More actions">
+    <i class="bi bi-three-dots-vertical"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><a class="dropdown-item" href="javascript:void(0)" onclick="openTasks(); return false;"><i class="bi bi-list-task me-2"></i>Tasks</a></li>
+    <li><a class="dropdown-item" href="javascript:void(0)" onclick="exportChat(); return false;"><i class="bi bi-download me-2"></i>Export</a></li>
+    <li><a class="dropdown-item" href="javascript:void(0)" onclick="redactLast(); return false;"><i class="bi bi-eraser me-2"></i>Redact Last</a></li>
+  </ul>
+</div>"#,
             escape_html(&config.model),
             tc_badge,
             tokens_badge
@@ -4031,6 +4050,7 @@ function submitQuestion(override) {{
         <i class="bi bi-floppy me-1"></i>Save Settings
       </button>
       <a href="/" class="btn btn-outline-secondary ms-2">Cancel</a>
+      <a href="/about" class="btn btn-link ms-2">About Pengy</a>
     </form>
   </div>
 </div>
@@ -4099,6 +4119,52 @@ async function fetchModels() {{
         );
 
         base("Settings — Pengy", &sidebar, "", &main_content, "", "")
+    }
+
+    pub fn about_page(chats: &[ChatSummary]) -> String {
+        let sidebar = {
+            let mut html = String::new();
+            for c in chats {
+                html.push_str(&format!(
+                    r#"<a href="/chat/{}" class="chat-list-item" data-chat-id="{}">
+  <i class="bi bi-chat-left-text small text-muted flex-shrink-0"></i>
+  <span class="chat-title">{}</span>
+</a>"#,
+                    c.id,
+                    c.id,
+                    escape_html(&c.title)
+                ));
+            }
+            html
+        };
+
+        let info = about::about_info("Rust");
+
+        let main_content = format!(
+            r##"<div class="overflow-y-auto flex-grow-1 p-4">
+  <div class="mx-auto" style="max-width:640px">
+    <h5 class="fw-bold mb-1">{edition_line}</h5>
+    <p class="mb-1"><a href="{github_url}" target="_blank" rel="noopener">{github_url}</a></p>
+    <p class="mb-3"><a href="{website_url}" target="_blank" rel="noopener">{website_url}</a></p>
+    <p>{description}</p>
+    <p>{catbee_blurb} <a href="{catbee_url}" target="_blank" rel="noopener">{catbee_url}</a></p>
+    <p class="text-body-secondary mb-1">{copyright}</p>
+    <p><a href="{license_url}" target="_blank" rel="noopener">{license_name}</a></p>
+    <a href="/settings" class="btn btn-outline-secondary mt-2">Back to Settings</a>
+  </div>
+</div>"##,
+            edition_line = escape_html(&info.edition_line),
+            github_url = escape_html(&info.github_url),
+            website_url = escape_html(&info.website_url),
+            description = escape_html(&info.description),
+            catbee_blurb = escape_html(&info.catbee_blurb),
+            catbee_url = escape_html(&info.catbee_url),
+            copyright = escape_html(&info.copyright),
+            license_url = escape_html(&info.license_url),
+            license_name = escape_html(&info.license_name),
+        );
+
+        base("About — Pengy", &sidebar, "", &main_content, "", "")
     }
 }
 

@@ -10,6 +10,10 @@
   error-display paths. Display-only: raw bytes to the model are unchanged, and
   emoji/wide glyphs pass through untouched. Covered by `sanitize_display` unit
   tests in `cli/src/main.rs`.
+- **About window & page.** A new `About` tab (via the `pengy_about_json` FFI) and
+  an `/about` route — backed by a shared `src/about.rs` — show the edition name +
+  version, a short description, the project repo/website/license links, and a
+  Catbee attribution, consistent across the CLI, GUI, and web.
 
 ## v1.8.0
 
