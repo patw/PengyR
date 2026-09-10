@@ -35,7 +35,15 @@ pub fn preprocess(
     max_mb: f64,
     quality: u8,
 ) -> Result<Preprocessed, String> {
-    let img = image::open(path).map_err(|e| format!("Failed to open image: {e}"))?;
+    // Durable attachment objects are content-addressed filenames with no
+    // extension. Determine the format from their bytes rather than solely
+    // from the path extension so preprocessing works after an import.
+    let img = image::ImageReader::open(path)
+        .map_err(|e| format!("Failed to open image: {e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to determine image format: {e}"))?
+        .decode()
+        .map_err(|e| format!("Failed to decode image: {e}"))?;
     let (w, h) = img.dimensions();
     let max_bytes = (max_mb * 1_048_576.0) as usize;
 
@@ -183,6 +191,21 @@ mod tests {
         let result = preprocess(&path, 4096, 4.5, 85).unwrap();
         assert_eq!(result.mime, "image/jpeg");
         assert!(result.bytes.len() < 5000);
+    }
+
+    #[test]
+    fn extensionless_image_is_detected_from_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("source.png");
+        let object = dir.path().join("content-addressed-object");
+        RgbImage::from_pixel(32, 24, image::Rgb([20, 30, 40]))
+            .save(&png)
+            .unwrap();
+        std::fs::copy(&png, &object).unwrap();
+
+        let result = preprocess(&object, 4096, 4.5, 85).unwrap();
+        assert_eq!(result.mime, "image/jpeg");
+        assert!(!result.bytes.is_empty());
     }
 
     #[test]

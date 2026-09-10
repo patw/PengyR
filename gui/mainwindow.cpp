@@ -614,7 +614,15 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
         if (imported) {
             QJsonDocument refDoc = QJsonDocument::fromJson(QByteArray(imported));
             pengy_free(imported);
-            if (refDoc.isObject()) attachmentRefs.append(refDoc.object());
+            const QJsonObject result = refDoc.object();
+            if (result.contains("error")) {
+                QMessageBox::warning(this, "Image attachment",
+                    QString("Could not import %1: %2").arg(QFileInfo(img).fileName(), result.value("error").toString()));
+            } else if (!result.isEmpty()) {
+                attachmentRefs.append(result);
+            } else {
+                QMessageBox::warning(this, "Image attachment", "The image could not be imported and was not sent.");
+            }
         } else {
             QMessageBox::warning(this, "Image attachment", "The image could not be imported and was not sent.");
         }

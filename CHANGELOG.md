@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.8.3
+
+- **Fix: image attachment import on macOS and every other platform.** Durable
+  attachment objects use extensionless SHA-256 filenames; derivative generation
+  previously reopened those objects with filename-based format detection and
+  rejected valid PNGs as an unknown image type. Preprocessing now identifies the
+  format from image bytes, and the regression suite covers extensionless objects.
+- **More reliable macOS image paste.** The Qt input accepts both `QPixmap` and
+  `QImage` clipboard payloads, accommodating the native `NSImage` representation
+  commonly supplied by macOS. Image-import errors now include the underlying
+  reason instead of only a generic failure dialog.
+
 ## v1.8.2
 
 - **Fix: AppImage crashed on startup on Wayland-only compositors (niri/sway/Hyprland).**

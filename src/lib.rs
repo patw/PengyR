@@ -659,7 +659,10 @@ pub extern "C" fn pengy_image_preprocess(
 pub extern "C" fn pengy_attachment_import_image(path: *const c_char, name: *const c_char, max_dimension: u32, max_mb: f64, quality: u8) -> *mut c_char {
     let p = unsafe { cstr(path) }; let n = unsafe { cstr(name) };
     match attachments::import_image(std::path::Path::new(&p), &n, if max_dimension == 0 {4096} else {max_dimension}, if max_mb <= 0.0 {4.5} else {max_mb}, if quality == 0 {85} else {quality}) {
-        Ok(reference) => to_c(&serde_json::to_string(&reference).unwrap_or_default()), Err(_) => std::ptr::null_mut(),
+        Ok(reference) => to_c(&serde_json::to_string(&reference).unwrap_or_default()),
+        // Keep the FFI result structured so the desktop client can explain an
+        // import failure instead of presenting an opaque null-pointer error.
+        Err(error) => to_c(&serde_json::json!({"error": error}).to_string()),
     }
 }
 
