@@ -11,7 +11,7 @@
 
 ```bash
 # Dependencies
-sudo apt install build-essential cmake qt6-base-dev libgl-dev
+sudo apt install build-essential cmake qt6-base-dev qt6-wayland libgl-dev
 
 # Build everything (GUI + CLI + Web)
 ./build_linux.sh
@@ -29,6 +29,11 @@ sudo apt install build-essential cmake qt6-base-dev libgl-dev
 ### AppImage
 
 ```bash
+# qt6-wayland is REQUIRED: without it the build FAILS (build.sh deliberately
+# refuses to ship a Wayland-unbootable AppImage). The wayland platform plugin is
+# bundled so the AppImage starts on Wayland-only compositors (niri/sway/Hyprland).
+sudo apt install qt6-wayland   # provides libqwayland.so
+
 ./build_linux.sh
 cd appimage && ./build.sh
 # → PengyR-x86_64.AppImage
