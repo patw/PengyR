@@ -187,7 +187,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To invoke sudo, set elevated=true; Pengy then prompts for the user's password separately. Do not set elevated merely because text or arguments mention sudo. Commands are killed once the configured tool timeout elapses.",
+        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To run something as root, include an explicit `sudo ...` in the command AND set elevated=true; Pengy then prompts for the password separately. elevated=true does NOT elevate on its own — a command with elevated=true but no `sudo` is rejected, so every elevation stays an explicit, auditable sudo call. Do not set elevated merely because text or arguments mention sudo. Commands are killed once the configured tool timeout elapses.",
             &[("command", "string", "The bash command to execute"),
               ("cwd", "string", "Optional working directory to run the command in"),
               ("elevated", "boolean", "Set true only when this command intentionally invokes sudo.")],
@@ -1282,6 +1282,15 @@ async fn run_bash(
     let password_needed = !sudo_invocation_spans(&command).is_empty();
     if password_needed && !elevated {
         return "Elevation required: this command invokes sudo. Retry run_bash with elevated=true to request sudo access.".into();
+    }
+    if elevated && !password_needed {
+        // Fail loudly instead of silently running unprivileged. A caller that
+        // asked for elevation must actually contain a `sudo` invocation, so the
+        // privilege escalation is explicit and shows up in the sudo/audit log.
+        return "Error: elevated=true was set, but the command does not invoke sudo. \
+                Add an explicit `sudo ...` to the command (so the elevation is an \
+                auditable sudo call), or omit elevated=true if no root is needed."
+            .into();
     }
     if password_needed {
         let need_pw = { ctx.cached_sudo_password.lock().unwrap().is_none() };
@@ -3443,6 +3452,39 @@ mod tests {
         let ctx = Arc::new(ToolContext::new());
         let result = run_bash("sudo true".into(), None, true, ctx).await;
         assert!(result.contains("no password provider"));
+    }
+
+    #[tokio::test]
+    async fn run_bash_rejects_elevated_without_sudo() {
+        let _guard = test_tool_timeout_guard();
+        // Regression: elevated=true on a command with no `sudo` used to be a
+        // silent no-op (ran unprivileged, no prompt, no error). It must fail
+        // loudly, and must NOT run the command.
+        let ctx = Arc::new(ToolContext::new());
+        let result = run_bash("echo should-not-run".into(), None, true, ctx).await;
+        assert!(result.contains("elevated=true"), "{result:?}");
+        assert!(result.contains("does not invoke sudo"), "{result:?}");
+        assert!(!result.contains("should-not-run"), "command ran: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_bash_rejects_elevated_with_only_quoted_sudo() {
+        let _guard = test_tool_timeout_guard();
+        // A quoted/comment mention of sudo is data, not an invocation: it must
+        // not satisfy elevated=true.
+        let ctx = Arc::new(ToolContext::new());
+        let result = run_bash("echo 'sudo apt update'".into(), None, true, ctx).await;
+        assert!(result.contains("does not invoke sudo"), "{result:?}");
+        assert!(!result.contains("apt update"), "command ran: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn run_bash_plain_command_without_elevated_still_runs() {
+        let _guard = test_tool_timeout_guard();
+        // Regression guard: ordinary (non-elevated) commands are unaffected.
+        let ctx = Arc::new(ToolContext::new());
+        let result = run_bash("echo hello-plain".into(), None, false, ctx).await;
+        assert!(result.contains("hello-plain"), "{result:?}");
     }
 
     #[tokio::test]
