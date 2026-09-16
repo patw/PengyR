@@ -2257,23 +2257,72 @@ fn sanitize_display(s: &str) -> String {
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if line.is_empty() { return vec![String::new()]; }
 
-    // The old implementation counted every byte of SGR controls produced by
-    // render_markdown_terminal as visible text. That made a coloured response
-    // wrap early, while pad_to_width added too few spaces: its right border
-    // visibly wandered left. Work token-by-token so escapes remain atomic and
-    // have zero display width.
+    // Preserve ANSI sequences as zero-column tokens, but make wrapping
+    // word-aware. The earlier ANSI fix wrapped one printable character at a
+    // time, which kept borders flush but produced ugly `pro|jects` splits in
+    // ordinary prose. Long unbroken tokens still split as a last resort.
     let mut out = Vec::new();
     let mut current = String::new();
     let mut current_width = 0usize;
     let mut pending_space = String::new();
+    let mut word = String::new();
+    let mut word_width = 0usize;
     let mut active_style = String::new();
+
+    let append_long_word = |out: &mut Vec<String>, current: &mut String, current_width: &mut usize,
+                                word: &str, active_style: &str| {
+        for token in display_tokens(word) {
+            if ansi_token(&token) { current.push_str(&token); continue; }
+            let ch = token.chars().next().expect("printable token");
+            let ch_width = char_width(ch);
+            if *current_width > 0 && *current_width + ch_width > width {
+                if !active_style.is_empty() { current.push_str(RESET); }
+                out.push(current.trim_end().to_string());
+                *current = active_style.to_string();
+                *current_width = 0;
+            }
+            current.push_str(&token);
+            *current_width += ch_width;
+        }
+    };
+    let flush_word = |out: &mut Vec<String>, current: &mut String, current_width: &mut usize,
+                          pending_space: &mut String, word: &mut String, word_width: &mut usize,
+                          active_style: &str| {
+        if word.is_empty() { return; }
+        let space_width = visual_width(pending_space);
+        if *current_width > 0 && *current_width + space_width + *word_width > width {
+            if !active_style.is_empty() { current.push_str(RESET); }
+            out.push(current.trim_end().to_string());
+            *current = active_style.to_string();
+            *current_width = 0;
+            pending_space.clear();
+        }
+        if *word_width > width {
+            if *current_width > 0 {
+                if !active_style.is_empty() { current.push_str(RESET); }
+                out.push(current.trim_end().to_string());
+                *current = active_style.to_string();
+                *current_width = 0;
+            }
+            append_long_word(out, current, current_width, word, active_style);
+        } else {
+            if *current_width > 0 && !pending_space.is_empty() {
+                current.push_str(pending_space);
+                *current_width += space_width;
+            }
+            current.push_str(word);
+            *current_width += *word_width;
+        }
+        pending_space.clear();
+        word.clear();
+        *word_width = 0;
+    };
 
     for token in display_tokens(line) {
         if ansi_token(&token) {
-            // Preserve styling across a physical wrap, but terminate it before
-            // the border so an unclosed model-produced style cannot colour the
-            // padding or the box edge.
-            current.push_str(&token);
+            // An escape belongs to the current word unless it follows a
+            // boundary; in both cases it remains zero width and is retained.
+            word.push_str(&token);
             if token.ends_with('m') {
                 if token == "\x1b[0m" { active_style.clear(); }
                 else { active_style.push_str(&token); }
@@ -2281,42 +2330,21 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
             continue;
         }
         let ch = token.chars().next().expect("printable token");
-        if ch == '\t' {
-            // A literal tab's width depends on its starting column; turn it
-            // into explicit spaces before doing box-width arithmetic.
-            let spaces = 4 - (current_width % 4);
-            pending_space.push_str(&" ".repeat(spaces));
+        if ch == '\t' || ch.is_whitespace() {
+            flush_word(&mut out, &mut current, &mut current_width, &mut pending_space,
+                       &mut word, &mut word_width, &active_style);
+            if ch == '\t' {
+                pending_space.push_str(&" ".repeat(4 - (current_width % 4)));
+            } else {
+                pending_space.push(ch);
+            }
             continue;
         }
-        if ch.is_whitespace() {
-            pending_space.push(ch);
-            continue;
-        }
-
-        let ch_width = char_width(ch);
-        let pending_width = visual_width(&pending_space);
-        if current_width > 0 && current_width + pending_width + ch_width > width {
-            if !active_style.is_empty() { current.push_str(RESET); }
-            out.push(current.trim_end().to_string());
-            current = active_style.clone();
-            current_width = 0;
-            pending_space.clear(); // don't lead wrapped lines with whitespace
-        }
-        if current_width > 0 && !pending_space.is_empty() {
-            current.push_str(&pending_space);
-            current_width += pending_width;
-        }
-        pending_space.clear();
-
-        if current_width > 0 && current_width + ch_width > width {
-            if !active_style.is_empty() { current.push_str(RESET); }
-            out.push(current.trim_end().to_string());
-            current = active_style.clone();
-            current_width = 0;
-        }
-        current.push_str(&token);
-        current_width += ch_width;
+        word_width += char_width(ch);
+        word.push_str(&token);
     }
+    flush_word(&mut out, &mut current, &mut current_width, &mut pending_space,
+               &mut word, &mut word_width, &active_style);
 
     if !current.is_empty() { out.push(current.trim_end().to_string()); }
     if out.is_empty() { out.push(String::new()); }
@@ -2737,6 +2765,13 @@ mod tests {
         for line in wrap_line(content, inner) {
             assert!(visual_width(&line) + 4 <= panel_width, "line was {line:?}");
         }
+    }
+
+    #[test]
+    fn ordinary_prose_wraps_at_words_not_mid_word() {
+        let lines = wrap_line("the foundation layer emerging underneath projects", 20);
+        assert_eq!(lines, vec!["the foundation layer", "emerging underneath", "projects"]);
+        assert!(lines.iter().all(|line| !line.ends_with("pro") && !line.starts_with("jects")));
     }
 
     #[test]
