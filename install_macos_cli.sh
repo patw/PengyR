@@ -1,12 +1,22 @@
 #!/bin/bash
 # Install Pengy command-line tools from a macOS Pengy.app bundle.
 #
-# Default app path: /Applications/Pengy.app
+# With no APP_PATH, prefer a Pengy.app beside this script. That is the app
+# freshly created by `./build_macos.sh`, and it is also the bundle beside the
+# installer when launched from the mounted DMG. Fall back to /Applications for
+# users who copied only this script elsewhere.
 # Override with: APP_PATH=/path/to/Pengy.app ./install_macos_cli.sh
 # Override install dir with: INSTALL_DIR=/usr/local/bin ./install_macos_cli.sh
 set -euo pipefail
 
-APP_PATH="${APP_PATH:-/Applications/Pengy.app}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -n "${APP_PATH:-}" ]]; then
+    APP_PATH="$APP_PATH"
+elif [[ -d "$SCRIPT_DIR/Pengy.app" ]]; then
+    APP_PATH="$SCRIPT_DIR/Pengy.app"
+else
+    APP_PATH="/Applications/Pengy.app"
+fi
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -14,6 +24,9 @@ if [[ ! -d "$APP_PATH" ]]; then
     echo ""
     echo "If Pengy.app is somewhere else, run:"
     echo "  APP_PATH=/path/to/Pengy.app $0"
+    echo ""
+    echo "When installing after a source build, run from the checkout:"
+    echo "  ./build_macos.sh && ./install_macos_cli.sh"
     exit 1
 fi
 
