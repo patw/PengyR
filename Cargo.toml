@@ -7,7 +7,7 @@ members = [".", "cli", "web"]
 # apart. The Qt GUI's version comes from a separate CMake-generated version.h
 # (gui/CMakeLists.txt), which reads this same value at configure time.
 [workspace.package]
-version = "1.8.4"
+version = "1.8.5"
 edition = "2021"
 authors = ["Pat Wendorf <dungeons@gmail.com>"]
 repository = "https://github.com/patw/PengyR"

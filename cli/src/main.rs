@@ -2083,20 +2083,79 @@ fn panel_width(requested: Option<usize>) -> usize {
         .clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH)
 }
 
+/// Return terminal-display tokens: printable Unicode scalar values and whole
+/// ANSI escape sequences. Escape sequences are zero columns wide and must never
+/// be split while wrapping a panel line.
+fn display_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if ch != '\u{1b}' {
+            tokens.push(ch.to_string());
+            continue;
+        }
+
+        // Keep an entire ANSI sequence as one zero-width token. The renderer
+        // only emits CSI SGR sequences today, but accepting OSC/DCS too keeps
+        // this helper safe if future renderers add hyperlinks or titles.
+        let mut end = start + ch.len_utf8();
+        match chars.peek().map(|(_, c)| *c) {
+            Some('[') => {
+                while let Some((idx, c)) = chars.next() {
+                    end = idx + c.len_utf8();
+                    if ('\u{40}'..='\u{7e}').contains(&c) { break; }
+                }
+            }
+            Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
+                chars.next();
+                while let Some((idx, c)) = chars.next() {
+                    end = idx + c.len_utf8();
+                    if c == '\u{07}' { break; }
+                    if c == '\u{1b}' && chars.peek().map(|(_, next)| *next) == Some('\\') {
+                        let (idx, slash) = chars.next().unwrap();
+                        end = idx + slash.len_utf8();
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                if let Some((idx, c)) = chars.next() { end = idx + c.len_utf8(); }
+            }
+            None => {}
+        }
+        tokens.push(s[start..end].to_string());
+    }
+    tokens
+}
+
+fn ansi_token(token: &str) -> bool {
+    token.starts_with('\u{1b}')
+}
+
+fn char_width(ch: char) -> usize {
+    // Combining marks and zero-width joiners occupy no terminal columns.
+    if matches!(ch, '\u{0300}'..='\u{036f}' | '\u{200b}' | '\u{200d}' | '\u{fe00}'..='\u{fe0f}') {
+        return 0;
+    }
+    match ch {
+        '\u{1F300}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' => 2,
+        '\u{1100}'..='\u{115F}'
+        | '\u{2E80}'..='\u{A4CF}'
+        | '\u{AC00}'..='\u{D7A3}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{FE10}'..='\u{FE19}'
+        | '\u{FE30}'..='\u{FE6F}'
+        | '\u{FF00}'..='\u{FF60}'
+        | '\u{FFE0}'..='\u{FFE6}' => 2,
+        _ => 1,
+    }
+}
+
 fn visual_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| match c {
-            '\u{1F300}'..='\u{1FAFF}' | '\u{2600}'..='\u{27BF}' => 2,
-            '\u{1100}'..='\u{115F}'
-            | '\u{2E80}'..='\u{A4CF}'
-            | '\u{AC00}'..='\u{D7A3}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{FE10}'..='\u{FE19}'
-            | '\u{FE30}'..='\u{FE6F}'
-            | '\u{FF00}'..='\u{FF60}'
-            | '\u{FFE0}'..='\u{FFE6}' => 2,
-            _ => 1,
-        })
+    display_tokens(s)
+        .iter()
+        .filter(|token| !ansi_token(token))
+        .map(|token| token.chars().map(char_width).sum::<usize>())
         .sum()
 }
 
@@ -2176,45 +2235,71 @@ fn sanitize_display(s: &str) -> String {
 }
 
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
-    }
+    if line.is_empty() { return vec![String::new()]; }
 
+    // The old implementation counted every byte of SGR controls produced by
+    // render_markdown_terminal as visible text. That made a coloured response
+    // wrap early, while pad_to_width added too few spaces: its right border
+    // visibly wandered left. Work token-by-token so escapes remain atomic and
+    // have zero display width.
     let mut out = Vec::new();
     let mut current = String::new();
     let mut current_width = 0usize;
+    let mut pending_space = String::new();
+    let mut active_style = String::new();
 
-    for word in line.split_inclusive(' ') {
-        let word_width = visual_width(word);
-        if current_width > 0 && current_width + word_width > width {
+    for token in display_tokens(line) {
+        if ansi_token(&token) {
+            // Preserve styling across a physical wrap, but terminate it before
+            // the border so an unclosed model-produced style cannot colour the
+            // padding or the box edge.
+            current.push_str(&token);
+            if token.ends_with('m') {
+                if token == "\x1b[0m" { active_style.clear(); }
+                else { active_style.push_str(&token); }
+            }
+            continue;
+        }
+        let ch = token.chars().next().expect("printable token");
+        if ch == '\t' {
+            // A literal tab's width depends on its starting column; turn it
+            // into explicit spaces before doing box-width arithmetic.
+            let spaces = 4 - (current_width % 4);
+            pending_space.push_str(&" ".repeat(spaces));
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space.push(ch);
+            continue;
+        }
+
+        let ch_width = char_width(ch);
+        let pending_width = visual_width(&pending_space);
+        if current_width > 0 && current_width + pending_width + ch_width > width {
+            if !active_style.is_empty() { current.push_str(RESET); }
             out.push(current.trim_end().to_string());
-            current.clear();
+            current = active_style.clone();
+            current_width = 0;
+            pending_space.clear(); // don't lead wrapped lines with whitespace
+        }
+        if current_width > 0 && !pending_space.is_empty() {
+            current.push_str(&pending_space);
+            current_width += pending_width;
+        }
+        pending_space.clear();
+
+        if current_width > 0 && current_width + ch_width > width {
+            if !active_style.is_empty() { current.push_str(RESET); }
+            out.push(current.trim_end().to_string());
+            current = active_style.clone();
             current_width = 0;
         }
-
-        if word_width > width {
-            for ch in word.chars() {
-                let ch_width = visual_width(&ch.to_string());
-                if current_width > 0 && current_width + ch_width > width {
-                    out.push(current.trim_end().to_string());
-                    current.clear();
-                    current_width = 0;
-                }
-                current.push(ch);
-                current_width += ch_width;
-            }
-        } else {
-            current.push_str(word);
-            current_width += word_width;
-        }
+        current.push_str(&token);
+        current_width += ch_width;
     }
 
-    if !current.is_empty() {
-        out.push(current.trim_end().to_string());
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
+    if !current.is_empty() { out.push(current.trim_end().to_string()); }
+    if out.is_empty() { out.push(String::new()); }
     out
 }
 
@@ -2561,7 +2646,7 @@ fn find_double(chars: &[char], from: usize, ch: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_display;
+    use super::{pad_to_width, sanitize_display, visual_width, wrap_line};
 
     #[test]
     fn strips_csi_color_codes() {
@@ -2597,5 +2682,36 @@ mod tests {
     #[test]
     fn strips_multiple_consecutive_escapes() {
         assert_eq!(sanitize_display("\x1b[1m\x1b[35mhi\x1b[0m"), "hi");
+    }
+
+    #[test]
+    fn ansi_markdown_does_not_shift_panel_right_edge() {
+        // render_markdown_terminal emits SGR sequences around inline Markdown.
+        // They consume bytes but zero terminal columns, and must not affect
+        // wrapping or the padding used before a panel's right border.
+        let styled = "\x1b[1mA bold response with enough words to wrap cleanly\x1b[0m";
+        let lines = wrap_line(styled, 20);
+        assert!(lines.len() > 1);
+        for line in lines {
+            assert!(visual_width(&line) <= 20, "line was {line:?}");
+            assert_eq!(visual_width(&pad_to_width(&line, 20)), 20);
+        }
+    }
+
+    #[test]
+    fn tabs_expand_to_a_stable_box_width() {
+        for line in wrap_line("one\ttwo\tthree", 12) {
+            assert!(visual_width(&line) <= 12);
+            assert_eq!(visual_width(&pad_to_width(&line, 12)), 12);
+        }
+    }
+
+    #[test]
+    fn emoji_and_joined_emoji_keep_panel_edges_aligned() {
+        let emoji = "✨ Great work! 👨\u{200d}💻 🚀 ☕\u{fe0f} 🇨🇦 1\u{fe0f}\u{20e3} ❤️";
+        for line in wrap_line(emoji, 16) {
+            assert!(visual_width(&line) <= 16, "line was {line:?}");
+            assert_eq!(visual_width(&pad_to_width(&line, 16)), 16);
+        }
     }
 }

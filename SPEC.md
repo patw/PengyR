@@ -39,7 +39,7 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 │  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
 │  │ ChatWorker (QThread → FFI)     │  │ 29 slash commands          │ │
 │  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
-│               │ C FFI (25 extern "C")             │ direct Rust    │
+│               │ C FFI boundary                      │ direct Rust    │
 │               │                                    │                │
 │  ┌─ Web UI (Rust/Axum) ──────────┐                │                │
 │  │ Bootstrap 5 + SSE streaming    │                │                │
@@ -98,7 +98,7 @@ PengyR/
 
 ## FFI Design
 
-The Rust core exposes 25 C functions via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library.
+The Rust core exposes a C ABI via `extern "C"`. The C++ GUI includes `pengy_ffi.h` and links the static library. Treat the checked-in header as the authoritative symbol list: implementation evolution can add FFI helpers, so a hard-coded count is not a stable contract.
 
 ### Config Functions
 
@@ -256,7 +256,7 @@ Flags (shared with the Python and C++ CLIs): `--no-save`, `--model NAME`, `--sys
 ### Interactive Mode
 
 On startup:
-1. Loads the most recent chat from `chats.json` (or creates a new one if none exist)
+1. Loads the most recent per-chat record from `chats/` (or creates a new one if none exist)
 2. Shows a welcome banner with model name and tool confirmation status
 3. Enters the REPL loop: prompt → send → stream events → loop
 
@@ -474,6 +474,7 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
   "reasoning_effort": "",
   "preserve_reasoning": false,
   "context_keep_turns": 0,
+  "attachment_context_keep_turns": 4,
   "ui_scale": 100,
   "theme_mode": "system",
   "theme_accent": "default",
@@ -498,6 +499,7 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `reasoning_effort` | string | `""` | Passed as `reasoning_effort` on API calls when set (`none`…`max`; `""` = provider default) |
 | `preserve_reasoning` | bool | `false` | Keep reasoning fields on assistant messages sent back to the API |
 | `context_keep_turns` | int | `0` | Recent turns whose tool results are kept; older ones elided. 0 = keep all |
+| `attachment_context_keep_turns` | int | `4` | Recent turns whose durable image attachments are resolved into provider requests; `0` sends no historical attachments |
 | `ui_scale` | int | `100` | Sets `QT_SCALE_FACTOR` on next launch (75/100/125/200); CLI ignores |
 | `theme_mode` | string | `"system"` | Desktop theme: `"system"`, `"light"`, or `"dark"` |
 | `theme_accent` | string | `"default"` | Desktop accent color (`default`/`blue`/`teal`/`green`/`orange`/`red`/`pink`/`purple`) |
@@ -521,9 +523,20 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `{hostname}` | `hostname::get()` |
 | `{osinfo}` | `std::env::consts::OS` + `std::env::consts::ARCH` |
 
-### Chats File: `~/.config/pengy/chats.json`
+### Chat and attachment storage
 
-Array of chat session objects with `user`, `assistant` (including `tool_calls`), and `tool` messages. Format is identical to Python Pengy.
+**Conformance: required.** The current shared layout is defined in the canonical Python spec's
+**Data Storage** section and is not the old single `chats.json` layout: authoritative chats live
+one-per-file at `~/.config/pengy/chats/<uuid>.json`; `chats/index.json` is a rebuildable summary
+cache. Legacy `~/.config/pengy/chats.json` is imported as a compatibility seed only, and deletion
+must also remove its old entry so it cannot resurrect. Chat messages retain `user`, `assistant`
+(including `tool_calls`), and `tool` roles; optional `chat.usage` is cumulative token usage.
+
+Image attachments are durable content-addressed references in `message.attachments`, with source
+objects and display/thumbnail derivatives under `~/.config/pengy/attachments/`. Never persist
+base64 image payloads in chat JSON. Preserve unknown reference fields, validate `sha256:<digest>`
+paths before loading/serving, and resolve only bounded recent image turns into provider content
+parts. See the canonical attachment schema and path contract in `Pengy/spec.md`.
 
 ---
 
@@ -643,7 +656,7 @@ build_windows.bat
 
 **CLI with no TUI framework:** The CLI uses raw ANSI escape codes for colors instead of a TUI library. This keeps the binary small and avoids terminal compatibility issues.
 
-**Web with embedded templates:** The Web UI embeds all HTML as Rust string-building functions instead of using a template engine. This avoids a build-time dependency and keeps the entire web server in a single file.
+**Web with embedded templates:** The Web UI builds its HTML in Rust rather than using a template engine. Keep SSE delivery replayable: append every event to the per-chat event log before notifying clients, assign monotonic event ids, and replay from `Last-Event-ID`/the explicit cursor. A completed turn may finish before the browser creates its EventSource, so subscriber presence must never decide whether an event is retained.
 
 ---
 

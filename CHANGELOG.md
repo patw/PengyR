@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v1.8.5
+
+- **CLI panel layout and emoji handling are reliable.** ANSI styling is measured as zero-width and is kept intact across wraps, so Rust's Markdown/tool panels retain aligned right borders. Complex UTF-8 emoji (including joined emoji, flags, variation selectors, and keycaps) are preserved in all CLI editions.
+- **Fixed a critical fast-web-turn replay race.** The web event log is authoritative even before a browser subscribes: event counts are retained and SSE replay no longer loses a completed response when it finishes before `EventSource` attaches. The web UI also defines its wake-lock helpers before send-state code uses them.
+- **Skills and specs are current.** README and skills documentation now direct users to [BotSkills](https://skills.catbee.ca) for inspectable reusable skill packages. Cross-edition specs now document durable attachment storage, per-chat files/index, current Tasks surfaces, and SSE replay requirements.
+
 - **The defaults are local now, not OpenAI.** `base_url` is
   `http://127.0.0.1:11434/v1` — Ollama's OpenAI-compatible port, which needs no
   API key — and `model` is **empty**, because a local server ships no model of
