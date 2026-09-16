@@ -783,6 +783,9 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
     if (type == "final_response") {
         handleFinalResponse(session, event);
 
+    } else if (type == "error") {
+        handleTurnError(session, event);
+
     } else if (type == "retrying") {
         // 429/529 backoff: surface it instead of hanging silently.
         if (session == tabForChat(m_activeChatId)) {
@@ -891,6 +894,43 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
 
     if (session == tabForChat(m_activeChatId))
         updateQuickSettingsFor(session);
+}
+
+// A failed turn.  The text is Pengy's own (credential failures are translated
+// to /apikey instructions, because the endpoint's advice -- "provide your API
+// key in an Authorization header" -- is not something a Pengy user can act on)
+// or the endpoint's, but never the model's.  So it is shown as an error and
+// deliberately *not* appended to the chat: persisting it made a 401 a permanent
+// assistant turn that /show, /export and the Web UI read back as something the
+// model had said.  Mirrors the Python edition's MainWindow._on_worker_error.
+void MainWindow::handleTurnError(TabSession* session, const QJsonObject& event) {
+    const bool credential = event["kind"].toString() == "credentials";
+    session->chatView->appendMessageText(
+        "assistant",
+        (credential ? QString::fromUtf8("\u274c ") : QString("Error: "))
+            + event["message"].toString());
+
+    // The run died mid-turn: the last assistant message may hold tool_calls
+    // with no result behind them, which 400s on the next request -- the same
+    // repair the abort path does (stopWorker, below).
+    if (!session->chat.isEmpty()) {
+        QByteArray priorJson = QJsonDocument(session->chat["messages"].toArray())
+                                   .toJson(QJsonDocument::Compact);
+        char* cleaned = pengy_clean_messages(priorJson.constData());
+        session->chat["messages"] = QJsonDocument::fromJson(QByteArray(cleaned)).array();
+        pengy_free(cleaned);
+        QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+        pengy_chat_save(json.constData());
+    }
+
+    session->thinking = false;
+    session->toolRunning = false;
+    updateTabTitle(session);
+
+    if (session == tabForChat(m_activeChatId)) {
+        m_stopBtn->hide();
+        updateQuickSettingsFor(session);
+    }
 }
 
 void MainWindow::handleToolConfirm(TabSession* session, const QJsonObject& req) {

@@ -130,6 +130,15 @@ impl Harness {
     }
 
     fn run_timeout(&self, commands: &[&str], timeout: Duration) -> String {
+        self.run_capture(commands, timeout).0
+    }
+
+    /// Like `run_timeout`, but keeps stderr as well.
+    ///
+    /// A failed turn is reported on stderr now, so a test that captured only
+    /// stdout could not tell "explained on stderr" from "the explanation
+    /// vanished" -- and stdout being *clean* is half of what this asserts.
+    fn run_capture(&self, commands: &[&str], timeout: Duration) -> (String, String) {
         let mut child = Command::new(cli_bin())
             .env("PENGY_CONFIG_DIR", self.config_path())
             .env("HOME", self.home_dir.path())
@@ -163,7 +172,10 @@ impl Harness {
         }
 
         let output = child.wait_with_output().expect("collect child output");
-        String::from_utf8_lossy(&output.stdout).into_owned()
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 }
 
@@ -185,6 +197,18 @@ struct StubLlm {
 }
 
 fn spawn_stub_llm(responses: Vec<String>) -> StubLlm {
+    spawn_stub_llm_status(200, responses)
+}
+
+/// Same, but every response carries `status` -- the credential path needs a
+/// failing status, and this stub only ever answered 200.
+fn spawn_stub_llm_status(status: u16, responses: Vec<String>) -> StubLlm {
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        _ => "Internal Server Error",
+    };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub llm");
     let port = listener.local_addr().unwrap().port();
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
@@ -214,7 +238,7 @@ fn spawn_stub_llm(responses: Vec<String>) -> StubLlm {
                 .pop_front()
                 .unwrap_or_else(|| r#"{"error":{"message":"stub exhausted"}}"#.to_string());
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -267,6 +291,60 @@ fn quit_exits_cleanly() {
     let h = Harness::new();
     let out = h.run(&[]);
     assert!(out.contains("Goodbye"), "{out}");
+}
+
+// ── Failed turns ─────────────────────────────────────────────────────
+
+#[test]
+fn rejected_credentials_are_explained_and_never_stored_as_an_answer() {
+    // The starting point for this whole change: a fresh install with no usable
+    // credentials. The endpoint's 401 body used to be rendered as the
+    // assistant's answer (inside its box) *and* written into the chat file.
+    let h = Harness::new();
+    let chat = h.seed_chat("Fresh Install", vec![user_msg("earlier question")]);
+    let stub = spawn_stub_llm_status(
+        401,
+        vec![r#"{"error":{"message":"You didn't provide an API key. You need to provide your API key in an Authorization header using Bearer auth."}}"#.to_string()],
+    );
+    h.point_at(&stub.base_url);
+
+    let (out, err) = h.run_capture(&["hello there"], Duration::from_secs(10));
+
+    // The user gets Pengy's own controls...
+    assert!(
+        err.contains("No API credentials are configured"),
+        "stderr: {err}"
+    );
+    assert!(err.contains("/apikey"), "stderr: {err}");
+    assert!(err.contains("/baseurl"), "stderr: {err}");
+    // ...on stderr, where a script or cron log is not parsing...
+    assert!(!out.contains("No API credentials are configured"), "stdout: {out}");
+    assert!(!out.contains("API error"), "stdout: {out}");
+    // ...and none of the endpoint's own, unusable advice survives.
+    assert!(!out.contains("Authorization header"), "stdout: {out}");
+    assert!(!err.contains("Authorization header"), "stderr: {err}");
+
+    // Interactive mode keeps running after a failed turn (only single-shot
+    // exits), so the REPL reached /quit normally.
+    assert!(out.contains("Goodbye"), "stdout: {out}");
+
+    // The important half: the failed turn is NOT a stored assistant message.
+    // This is what made a 401 a permanent "answer" that /show, /export and the
+    // other editions' UIs read back as something the model had said.
+    let saved = h.read_chat(&chat.id);
+    let stored = serde_json::to_string(&saved.messages).unwrap();
+    assert!(
+        !stored.contains("API error") && !stored.contains("No API credentials"),
+        "a failed turn must not be persisted as a message: {stored}"
+    );
+    assert!(
+        saved.messages.iter().any(|m| m.role == "user"),
+        "the user's own message is still theirs to keep: {stored}"
+    );
+    assert!(
+        !saved.messages.iter().any(|m| m.role == "assistant"),
+        "no assistant turn should exist after a failed one: {stored}"
+    );
 }
 
 // ── Chat lifecycle ───────────────────────────────────────────────────

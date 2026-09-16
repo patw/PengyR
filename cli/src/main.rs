@@ -12,7 +12,7 @@ use rustyline::validate::Validator;
 use rustyline::{history::FileHistory, Editor};
 use rustyline::{Context, Helper};
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -737,6 +737,13 @@ impl PengyCli {
                         }));
                     break;
                 }
+                Some(LlmEvent::Error { kind, message }) => {
+                    if expecting_api {
+                        eprint!("\r{}\r", " ".repeat(40));
+                    }
+                    self.report_turn_error(&kind, &message);
+                    break;
+                }
                 None => {
                     eprint!("\r{}\r", " ".repeat(40));
                     if !aborted {
@@ -756,6 +763,33 @@ impl PengyCli {
                 chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
                 chat_manager::save_chat(chat).ok();
             }
+        }
+    }
+
+    /// Report a failed turn on stderr -- never as the assistant's answer.
+    ///
+    /// This text is Pengy's own (credential failures are translated to
+    /// `/apikey` instructions) or the endpoint's, never the model's, so it must
+    /// not go to stdout -- scripts and `--output json` parse stdout -- and must
+    /// not be pushed into the chat.  Before this, a 401 was drawn inside the
+    /// assistant's own box and written into `chats.json` as an assistant turn,
+    /// where `/show`, `/export`, the GUI and the Web UI read it back as
+    /// something the model had said.
+    ///
+    /// Interactive mode is otherwise unchanged: the REPL keeps running, only
+    /// this turn is abandoned.
+    fn report_turn_error(&self, kind: &str, message: &str) {
+        // Colour only when stderr is a terminal, so a cron log or a captured
+        // stream stays readable (matches the Python edition's `_print_stderr`).
+        let (red, reset) = if io::stderr().is_terminal() {
+            (RED, RESET)
+        } else {
+            ("", "")
+        };
+        if kind == llm_client::ERROR_KIND_CREDENTIALS {
+            eprintln!("\n{red}\u{274c} {message}{reset}");
+        } else {
+            eprintln!("\n{red}Error: {message}{reset}");
         }
     }
 

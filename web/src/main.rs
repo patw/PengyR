@@ -880,6 +880,18 @@ impl WebWorker {
                         done.store(true, Ordering::Relaxed);
                         break;
                     }
+                    Some(LlmEvent::Error { kind: _, message }) => {
+                        // The turn failed: this text is Pengy's own (credential
+                        // failures are translated to /apikey instructions) or the
+                        // endpoint's, never the model's.  It goes to the browser
+                        // as an error and *nothing* is appended to the chat -- a
+                        // 401 must not become a stored assistant turn.
+                        push_event(SseEvent::Error {
+                            message: message.clone(),
+                        });
+                        done.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     None => {
                         push_event(SseEvent::Error {
                             message: "Chat ended unexpectedly".into(),

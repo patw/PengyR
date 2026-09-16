@@ -158,6 +158,102 @@ pub enum LlmEvent {
         status_code: u16,
         message: String,
     },
+    /// A turn that failed for a reason the user has to act on.
+    ///
+    /// Deliberately *not* a [`LlmEvent::FinalResponse`]: this text is Pengy's or
+    /// the endpoint's, never the model's, so frontends must not render it as the
+    /// assistant's answer -- and must not persist it as one.  Before this
+    /// existed, a 401 arrived as a final response, so it was drawn inside the
+    /// "Assistant" box, written into `chats.json` as an assistant message, and
+    /// read back by `/show`, the GUI and the Web UI as if the model had said it.
+    ///
+    /// `kind` is [`ERROR_KIND_CREDENTIALS`] when the endpoint rejected our
+    /// credentials (in which case `message` is already the user-facing
+    /// instructions), or [`ERROR_KIND_ERROR`] otherwise.
+    #[serde(rename = "error")]
+    Error {
+        kind: String,
+        message: String,
+    },
+}
+
+/// `kind` for an error the user fixes by configuring credentials.
+pub const ERROR_KIND_CREDENTIALS: &str = "credentials";
+
+/// `kind` for every other failed turn.
+pub const ERROR_KIND_ERROR: &str = "error";
+
+/// Phrases OpenAI-compatible endpoints use when a request cannot be
+/// authenticated.  Checked in addition to the status code because several
+/// compatible servers answer `400` with "api key is required" rather than a
+/// `401` -- the same reason the Python edition matches text as well as types.
+const CREDENTIAL_PHRASES: [&str; 14] = [
+    "missing credentials",
+    "no api key",
+    "api key is required",
+    "api_key is required",
+    "api key must be set",
+    "api_key client option must be set",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "invalid authentication",
+    "authentication failed",
+    "unauthorized",
+    "credentials not found",
+    "you didn't provide an api key",
+];
+
+/// Does this failed request look like a credentials problem?
+pub fn looks_like_credential_problem(status: Option<u16>, detail: &str) -> bool {
+    if matches!(status, Some(401) | Some(403)) {
+        return true;
+    }
+    let text = detail.to_lowercase();
+    CREDENTIAL_PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+/// The instructions a user actually needs when credentials are missing.
+///
+/// The endpoint's own text is not actionable here: OpenAI answers a fresh
+/// install with "provide your API key in an Authorization header using Bearer
+/// auth", and the Python SDK's client-side error told users to set
+/// `OPENAI_API_KEY` -- an environment variable no edition of Pengy reads.
+/// Wording is shared with the Python and C++ editions.
+pub fn credential_help(base_url: &str) -> String {
+    let settings = crate::config::pengy_config_dir().join("settings.json");
+    format!(
+        "No API credentials are configured for {base_url}.\n\nConfigure Pengy (the CLI, Web UI and GUI all share {settings}):\n    pengy-cli /apikey <your-key>    set the API key\n    pengy-cli /baseurl <url>        change the endpoint (a local Ollama/vLLM needs no key)\n    pengy-cli /model <name>         choose a model\n    pengy-cli /config               review the current settings\n  Or run pengy-web and open Settings (http://127.0.0.1:5000/settings).\n\nNote: Pengy reads credentials from its own settings file. OPENAI_API_KEY\nand similar environment variables are NOT used, whatever the API error says.",
+        settings = settings.display()
+    )
+}
+
+/// Emit a failed turn instead of a final response.
+///
+/// Credential failures are replaced by [`credential_help`]; everything else
+/// keeps the provider's detail but still travels as an *error*, so no frontend
+/// can mistake it for something the model said.
+fn emit_turn_error(
+    event_tx: &mpsc::UnboundedSender<LlmEvent>,
+    status: Option<u16>,
+    detail: String,
+    base_url: &str,
+) {
+    let credentials = looks_like_credential_problem(status, &detail);
+    let kind = if credentials {
+        ERROR_KIND_CREDENTIALS
+    } else {
+        ERROR_KIND_ERROR
+    };
+    let message = if credentials {
+        credential_help(base_url)
+    } else {
+        detail
+    };
+    let _ = event_tx.send(LlmEvent::Error {
+        kind: kind.to_string(),
+        message,
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,11 +502,7 @@ pub async fn chat(
                         }
                     }
                     Err(e) => {
-                        let _ = event_tx.send(LlmEvent::FinalResponse {
-                            content: format!("API error: {e}"),
-                            message: None,
-                            usage: accumulated_usage,
-                        });
+                        emit_turn_error(&event_tx, None, format!("API error: {e}"), base_url);
                         return;
                     }
                 }
@@ -427,11 +519,12 @@ pub async fn chat(
                     .or_else(|| body["error"].as_str())
                     .or_else(|| body["message"].as_str())
                     .unwrap_or(body_text.as_str());
-                let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: format!("API error (HTTP {status}): {detail}"),
-                    message: None,
-                    usage: accumulated_usage,
-                });
+                emit_turn_error(
+                    &event_tx,
+                    Some(status.as_u16()),
+                    format!("API error (HTTP {status}): {detail}"),
+                    base_url,
+                );
                 return;
             }
         };
@@ -444,14 +537,15 @@ pub async fn chat(
         let choice = match body["choices"].as_array().and_then(|a| a.first()) {
             Some(c) => c,
             None => {
-                let _ = event_tx.send(LlmEvent::FinalResponse {
-                    content: format!(
+                emit_turn_error(
+                    &event_tx,
+                    None,
+                    format!(
                         "No choices in API response: {}",
                         serde_json::to_string_pretty(&body).unwrap_or_default()
                     ),
-                    message: None,
-                    usage: accumulated_usage,
-                });
+                    base_url,
+                );
                 return;
             }
         };
@@ -854,6 +948,60 @@ mod tests {
     }
 
     #[test]
+    fn credential_detection_covers_status_and_wording() {
+        // 401/403 are unambiguous.
+        assert!(looks_like_credential_problem(Some(401), ""));
+        assert!(looks_like_credential_problem(Some(403), "nope"));
+        // Compatible servers answer 400 with their own wording.
+        assert!(looks_like_credential_problem(Some(400), "api key is required"));
+        assert!(looks_like_credential_problem(
+            None,
+            "Incorrect API key provided: sk-xxx"
+        ));
+        assert!(looks_like_credential_problem(None, "Unauthorized"));
+        // ...and ordinary failures are not credential failures, or every error
+        // would tell the user to configure a key they already have.
+        assert!(!looks_like_credential_problem(Some(500), "boom"));
+        assert!(!looks_like_credential_problem(Some(404), "model not found"));
+        assert!(!looks_like_credential_problem(None, "connection refused"));
+    }
+
+    #[test]
+    fn credential_help_names_the_real_controls_not_env_vars() {
+        let help = credential_help("https://api.openai.com/v1");
+        assert!(help.contains("https://api.openai.com/v1"), "{help}");
+        for expected in [
+            "/apikey",
+            "/baseurl",
+            "/model",
+            "/config",
+            "settings.json",
+            "pengy-web",
+            "NOT used",
+        ] {
+            assert!(help.contains(expected), "missing {expected} in {help}");
+        }
+    }
+
+    #[test]
+    fn llm_event_error_serde() {
+        // The FFI (GUI) and SSE (web) contracts are this JSON, so pin it.
+        let event = LlmEvent::Error {
+            kind: ERROR_KIND_CREDENTIALS.into(),
+            message: "no key".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"error\""), "{json}");
+        match serde_json::from_str::<LlmEvent>(&json).unwrap() {
+            LlmEvent::Error { kind, message } => {
+                assert_eq!(kind, ERROR_KIND_CREDENTIALS);
+                assert_eq!(message, "no key");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn usage_default_values() {
         let u = Usage {
             prompt_tokens: 0,
@@ -955,6 +1103,23 @@ mod loop_tests {
     fn stub_server(
         responses: Vec<serde_json::Value>,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        stub_server_status(200, responses)
+    }
+
+    /// Same, but every response is served with `status`.
+    ///
+    /// The original stub only ever answered 200, so neither a rejected
+    /// credential nor a server error could be exercised end to end.
+    fn stub_server_status(
+        status: u16,
+        responses: Vec<serde_json::Value>,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let reason = match status {
+            200 => "OK",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            _ => "Internal Server Error",
+        };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![]));
@@ -998,7 +1163,7 @@ mod loop_tests {
 
                 let payload = response.to_string();
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                     payload.len(),
                     payload
@@ -1051,6 +1216,46 @@ mod loop_tests {
             confirm_tx,
             handle,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_credentials_become_pengy_instructions() {
+        // A fresh install: no key, default base_url. The endpoint answers 401
+        // with advice a Pengy user cannot act on ("provide your API key in an
+        // Authorization header"), so the turn must be reported as a credentials
+        // error carrying Pengy's own controls instead.
+        let (base, requests) = stub_server_status(
+            401,
+            vec![serde_json::json!({
+                "error": {"message": "You didn't provide an API key."}
+            })],
+        );
+        let mut d = start_chat(
+            &base,
+            vec![user_msg("hi")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
+
+        match d.rx.recv().await.expect("an event") {
+            LlmEvent::Error { kind, message } => {
+                assert_eq!(kind, ERROR_KIND_CREDENTIALS);
+                assert!(
+                    message.contains("No API credentials are configured"),
+                    "{message}"
+                );
+                assert!(message.contains("/apikey"), "{message}");
+                // The endpoint's advice is replaced, not merely prefixed.
+                assert!(!message.contains("Authorization header"), "{message}");
+            }
+            other => panic!("expected an error event, got {other:?}"),
+        }
+
+        // Nothing follows it. A trailing final response is exactly what made a
+        // 401 render (and persist) as the assistant's answer.
+        assert!(d.rx.try_recv().is_err(), "no event may follow the error");
+        assert_eq!(requests.lock().unwrap().len(), 1, "one attempt, no retries");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1473,24 +1678,16 @@ mod loop_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn http_error_produces_api_error_final_response() {
-        // Server that always answers 500 with an error body
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut tmp = [0u8; 65536];
-                let _ = sock.read(&mut tmp);
-                let body = r#"{"error": {"message": "boom"}}"#;
-                let resp = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes());
-            }
-        });
+    async fn http_error_produces_an_error_event_not_a_final_response() {
+        // Renamed from `http_error_produces_api_error_final_response`: a 500 used
+        // to arrive as a *final response*, which every frontend then drew in the
+        // assistant's own box and wrote into chats.json as an assistant message --
+        // a server fault became a permanent thing the model had "said". It is an
+        // error event now, and it stays an error event.
+        let (base, _requests) = stub_server_status(
+            500,
+            vec![serde_json::json!({"error": {"message": "boom"}})],
+        );
 
         let mut d = start_chat(
             &base,
@@ -1500,12 +1697,14 @@ mod loop_tests {
             false,
         );
         match d.rx.recv().await.unwrap() {
-            LlmEvent::FinalResponse { content, .. } => {
-                assert!(content.contains("API error"), "got: {content}");
-                assert!(content.contains("boom"), "got: {content}");
+            LlmEvent::Error { kind, message } => {
+                assert_eq!(kind, ERROR_KIND_ERROR);
+                assert!(message.contains("API error"), "got: {message}");
+                assert!(message.contains("boom"), "got: {message}");
             }
-            other => panic!("expected FinalResponse, got {other:?}"),
+            other => panic!("expected Error, got {other:?}"),
         }
+        assert!(d.rx.try_recv().is_err(), "no final response may follow");
         d.handle.await.unwrap();
     }
 }

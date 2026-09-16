@@ -534,6 +534,15 @@ pub extern "C" fn pengy_llm_chat_run(
                     llm_client::LlmEvent::FinalResponse { .. } => {
                         break true;
                     }
+                    // A failed turn is terminal for this run -- the error event
+                    // has already been handed to the frontend above.  Breaking
+                    // here stops the `None` arm below from following it with a
+                    // "Chat ended unexpectedly" *final response*, which the GUI
+                    // would append as a second, bogus assistant message right
+                    // after the real error.
+                    llm_client::LlmEvent::Error { .. } => {
+                        break true;
+                    }
                     _ => {}
                 }
             }

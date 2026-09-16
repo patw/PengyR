@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- **A failed API call is no longer shown — or stored — as the model's answer.**
+  A non-2xx response (a fresh install's `401`, a `500`, a transport failure, an
+  unparseable body) used to be delivered as a `FinalResponse` whose `content`
+  was the error text. Every frontend treats a final response as the assistant's
+  reply, so the CLI drew it inside the assistant's own box, the GUI rendered it
+  as a message from the model, and all three **wrote it into the chat file as an
+  assistant turn** — where `/show`, `/export` and the other editions' UIs read
+  it back later as something the model had said. Failures now travel as a
+  dedicated `LlmEvent::Error { kind, message }`, are reported on **stderr**, and
+  are persisted as nothing. Interactive mode still keeps running.
+- **Missing or rejected credentials explain Pengy's own configuration.** The
+  endpoint's message is not actionable for a Pengy user: a fresh install gets
+  "You didn't provide an API key. You need to provide your API key in an
+  Authorization header using Bearer auth" (and the Python SDK's client-side
+  error told users to set `OPENAI_API_KEY`, an environment variable no edition
+  of Pengy reads). `401`/`403`, or any credential wording in the body, is now
+  translated into instructions naming `pengy-cli /apikey`, `/baseurl`, `/model`,
+  `/config`, the shared `settings.json` and the Web UI Settings page, plus an
+  explicit note that environment variables are not used. The translation lives
+  in `llm_client`, so the CLI, GUI and Web UI all get it. Wording is shared with
+  the Python and C++ editions.
+- Token usage is no longer reported for a turn that failed. Accumulated usage
+  used to ride along on the error's final response; it does not now, which
+  matches the Python edition (an error raises there, so no usage is recorded
+  either).
+
+Tests: `cargo test --workspace` — 277 passing (5 new in `llm_client`,
+`tests/ffi_event_contract.rs` for the GUI's FFI path, and a black-box CLI case
+covering a rejected credential), plus the two GUI `ctest` suites.
+
 ## v1.8.4
 
 - **Fix: `run_bash` `elevated=true` without a `sudo` invocation no longer runs
