@@ -1747,6 +1747,7 @@ name = "pengy-cli"
 version = "1.8.6"
 dependencies = [
  "chrono",
+ "libc",
  "pengy_core",
  "regex",
  "reqwest",

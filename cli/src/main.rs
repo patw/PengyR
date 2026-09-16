@@ -2044,6 +2044,26 @@ fn dirs_next() -> Option<std::path::PathBuf> {
 }
 
 fn terminal_width() -> usize {
+    // `$COLUMNS` is optional and commonly stale: terminal multiplexers and
+    // GUI terminal apps resize the PTY without updating it. A panel sized from
+    // that stale value is physically soft-wrapped by the terminal before its
+    // right border, producing the ragged boxes users see. Query stdout's PTY
+    // first; only non-terminal/Windows fall back to COLUMNS and then 120.
+    #[cfg(unix)]
+    {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::ioctl(
+                libc::STDOUT_FILENO,
+                libc::TIOCGWINSZ,
+                &mut size as *mut libc::winsize,
+            )
+        };
+        if result == 0 && usize::from(size.ws_col) >= MIN_PANEL_WIDTH {
+            return usize::from(size.ws_col);
+        }
+    }
+
     std::env::var("COLUMNS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -2703,6 +2723,19 @@ mod tests {
         for line in wrap_line("one\ttwo\tthree", 12) {
             assert!(visual_width(&line) <= 12);
             assert_eq!(visual_width(&pad_to_width(&line, 12)), 12);
+        }
+    }
+
+    #[test]
+    fn wrapping_at_panel_width_never_needs_terminal_soft_wrap() {
+        // If every rendered content line plus its `│ ` / ` │` framing is at
+        // most the panel width, a terminal with that exact PTY width cannot
+        // wrap the right edge onto a second physical row.
+        let panel_width = 80;
+        let inner = panel_width - 4;
+        let content = "A detailed response should wrap at spaces before the right border.";
+        for line in wrap_line(content, inner) {
+            assert!(visual_width(&line) + 4 <= panel_width, "line was {line:?}");
         }
     }
 
