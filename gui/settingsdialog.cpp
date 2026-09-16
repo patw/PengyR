@@ -92,9 +92,10 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     auto* llmForm = new QFormLayout(llmTab);
     llmForm->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
 
-    m_baseUrl = new QLineEdit(config["base_url"].toString("https://api.openai.com/v1"));
-    m_baseUrl->setToolTip("OpenAI-compatible API endpoint, e.g. https://api.openai.com/v1 or a local llama.cpp server.");
-    llmForm->addRow(labelWithTip("Base URL:", "OpenAI-compatible API endpoint, e.g. https://api.openai.com/v1 or a local llama.cpp server."), m_baseUrl);
+    m_baseUrl = new QLineEdit(config["base_url"].toString());
+    const QString baseUrlTip = QString::fromUtf8("OpenAI-compatible API endpoint. The default is a local Ollama server, which needs no API key \u2014 e.g. http://127.0.0.1:11434/v1 (Ollama) or http://127.0.0.1:8080/v1 (llama.cpp).");
+    m_baseUrl->setToolTip(baseUrlTip);
+    llmForm->addRow(labelWithTip("Base URL:", baseUrlTip), m_baseUrl);
 
     m_apiKey = new QLineEdit(config["api_key"].toString());
     m_apiKey->setEchoMode(QLineEdit::Password);
@@ -106,12 +107,14 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_model = new QComboBox;
     m_model->setEditable(true);
     m_model->setInsertPolicy(QComboBox::NoInsert);
-    QString currentModel = config["model"].toString("gpt-4o");
-    m_model->addItem(currentModel);
-    m_model->setCurrentText(currentModel);
+    QString currentModel = config["model"].toString();
+    if (!currentModel.isEmpty()) {
+        m_model->addItem(currentModel);
+        m_model->setCurrentText(currentModel);
+    }
     // Pre-populate from the persistent model cache (possibly stale, but populated).
     {
-        QByteArray cachedBase = config["base_url"].toString("https://api.openai.com/v1").toUtf8();
+        QByteArray cachedBase = config["base_url"].toString().toUtf8();
         char* cachedRaw = pengy_models_cached_for(cachedBase.constData());
         QJsonArray cachedArr = QJsonDocument::fromJson(QByteArray(cachedRaw)).array();
         pengy_free(cachedRaw);
@@ -122,9 +125,15 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         }
         if (!cachedModels.isEmpty()) {
             m_model->addItems(cachedModels);
-            m_model->setCurrentText(currentModel);
+            // With no model configured, offer the first fetched one instead of
+            // leaving an empty entry at the top of the list.
+            m_model->setCurrentText(currentModel.isEmpty() ? cachedModels.first() : currentModel);
         }
     }
+    // The default model is deliberately empty (a local endpoint ships no model of
+    // its own), so on a fresh install there is nothing to pre-select -- say what
+    // to do about it instead of showing a blank field.
+    m_model->setPlaceholderText(QString::fromUtf8("Pick a model \u2014 press Fetch"));
     m_model->setToolTip("Model name sent in chat completion requests. Use Fetch to list available models from the endpoint.");
     modelRow->addWidget(m_model, 1);
 

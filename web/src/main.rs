@@ -652,7 +652,18 @@ impl WebWorker {
 
             let bu = config.base_url.clone();
             let ak = config.api_key.clone();
-            let md = config.model.clone();
+            // No model configured (a local endpoint ships none): fall back to the
+            // first one this endpoint last offered, so a chat that shows a model
+            // in the navbar can actually be sent.  With no cache either,
+            // llm_client's guard explains how to choose one.
+            let md = if config.model.trim().is_empty() {
+                pengy_core::model_cache::cached_models_for(&config.base_url)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+            } else {
+                config.model.clone()
+            };
             let re = config.reasoning_effort.clone();
             let pr = config.preserve_reasoning;
             let lt = config.llm_timeout;
@@ -4044,7 +4055,7 @@ function submitQuestion(override) {{
       <div class="mb-3">
         <label class="form-label fw-semibold">Model</label>
         <div class="input-group">
-          <input type="text" name="model" id="modelInput" class="form-control" value="{model}" placeholder="gpt-4o">
+          <input type="text" name="model" id="modelInput" class="form-control" value="{model}" placeholder="llama3.2">
           <button type="button" id="fetchModelsBtn" class="btn btn-outline-secondary" onclick="fetchModels()">
             <i class="bi bi-cloud-download me-1"></i>Fetch
           </button>

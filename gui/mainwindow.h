@@ -87,6 +87,10 @@ private:
     void abandonWorkerFor(TabSession* session);
     void reapAbandonedWorkers();
 
+    // Cached model list for the configured endpoint, kept so modelForSession can
+    // fall back to a real model name when none is configured.
+    QStringList m_cachedModels;
+
     int m_runtimeUiScale = 100;
 
     QJsonObject m_config;

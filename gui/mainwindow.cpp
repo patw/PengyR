@@ -208,10 +208,11 @@ void MainWindow::refreshModelCombo() {
         QString id = v.toString();
         if (!id.isEmpty()) models << id;
     }
+    m_cachedModels = models;  // modelForSession falls back to the first of these
 
     TabSession* session = tabForChat(m_activeChatId);
     QString current = session ? modelForSession(session)
-                              : m_config["model"].toString("gpt-4o");
+                              : m_config["model"].toString();
     m_chatHistory->setModels(models, current);
 }
 
@@ -221,7 +222,16 @@ QString MainWindow::modelForSession(TabSession* session) const {
         if (!overrideModel.isEmpty())
             return overrideModel;
     }
-    return m_config["model"].toString("gpt-4o");
+    QString configured = m_config["model"].toString();
+    if (!configured.isEmpty())
+        return configured;
+    // Nothing is configured: the default model is deliberately empty because a
+    // local endpoint ships no model of its own.  Use the first model it last
+    // advertised rather than sending an empty name -- llm_client refuses that
+    // with "pick a model" instructions, and the sidebar must not disagree with
+    // what a send would do.  With no cache either, that message is the honest
+    // answer.
+    return m_cachedModels.isEmpty() ? QString() : m_cachedModels.first();
 }
 
 void MainWindow::onModelChanged(const QString& model) {

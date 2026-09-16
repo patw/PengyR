@@ -169,7 +169,8 @@ pub enum LlmEvent {
     ///
     /// `kind` is [`ERROR_KIND_CREDENTIALS`] when the endpoint rejected our
     /// credentials (in which case `message` is already the user-facing
-    /// instructions), or [`ERROR_KIND_ERROR`] otherwise.
+    /// instructions), [`ERROR_KIND_CONFIG`] when the turn could not be attempted
+    /// at all (no model selected), or [`ERROR_KIND_ERROR`] otherwise.
     #[serde(rename = "error")]
     Error {
         kind: String,
@@ -182,6 +183,98 @@ pub const ERROR_KIND_CREDENTIALS: &str = "credentials";
 
 /// `kind` for every other failed turn.
 pub const ERROR_KIND_ERROR: &str = "error";
+
+/// `kind` for a turn that cannot even be attempted until the user chooses
+/// something.  Today that means one case: no model is selected.
+pub const ERROR_KIND_CONFIG: &str = "config";
+
+/// True when `base_url` points at this machine.
+pub fn is_local_endpoint(base_url: &str) -> bool {
+    let rest = base_url.split("//").nth(1).unwrap_or(base_url);
+    let authority = rest.split('/').next().unwrap_or("");
+    // Strip any userinfo, then the port, taking IPv6 brackets into account.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or("").to_string(),
+        None => host.split(':').next().unwrap_or("").to_string(),
+    };
+    let host = host.to_lowercase();
+    matches!(host.as_str(), "localhost" | "::1" | "0.0.0.0") || host.starts_with("127.")
+}
+
+/// The instructions a user needs when no model is selected.
+///
+/// A local endpoint ships no model of its own (a fresh Ollama has an empty model
+/// list), so the useful answer is how to choose one -- not the endpoint's
+/// complaint about an empty model field.  Wording is shared with the Python and
+/// C++ editions.
+pub fn no_model_help(base_url: &str) -> String {
+    format!(
+        "No model is selected for {base_url}.\n\nPengy's default endpoint is a local server, which has no model of its own:\n    pengy-cli /models               list the models this endpoint offers\n    pengy-cli /model <name>         select one\n    ollama pull <name>              (Ollama) download one first, if the list is empty\n  Or open Settings in the GUI / Web UI and use Fetch Models."
+    )
+}
+
+/// What to say when the endpoint did not answer at all.
+///
+/// With a local default this is the likeliest first-run failure, and a bare
+/// transport error ("error sending request for url …") does not tell a new user
+/// that the fix is to start their own server.  Wording is shared with the Python
+/// and C++ editions.
+pub fn unreachable_help(base_url: &str, detail: &str) -> String {
+    let suffix = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    };
+    if is_local_endpoint(base_url) {
+        format!(
+            "Nothing answered at {base_url}{suffix}.\n\nIs your local model server running?\n    ollama serve                    (Ollama) start the server, then: ollama pull <name>\n    pengy-cli /models               list the models it offers\n    pengy-cli /baseurl <url>        point Pengy at a different endpoint\n    pengy-cli /config               review the current settings"
+        )
+    } else {
+        format!(
+            "Could not reach {base_url}{suffix}. Check the endpoint with pengy-cli /baseurl <url>."
+        )
+    }
+}
+
+/// A short description of a transport failure, for [`unreachable_help`].
+fn transport_detail(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "timed out".into()
+    } else if error.is_connect() {
+        "connection refused".into()
+    } else {
+        error.to_string().chars().take(120).collect()
+    }
+}
+
+/// Emit \"no model is selected\" — a configuration problem, not a failure of the
+/// request, since no request is made.
+fn emit_config_error(event_tx: &mpsc::UnboundedSender<LlmEvent>, message: String) {
+    let _ = event_tx.send(LlmEvent::Error {
+        kind: ERROR_KIND_CONFIG.to_string(),
+        message,
+    });
+}
+
+/// Emit an endpoint that never answered.
+fn emit_unreachable_error(
+    event_tx: &mpsc::UnboundedSender<LlmEvent>,
+    error: &reqwest::Error,
+    base_url: &str,
+) {
+    // A proxy or tunnel in front of a hosted API can fail the transport while
+    // still speaking credential language, so that classification stays first.
+    let detail = transport_detail(error);
+    if looks_like_credential_problem(None, &detail) {
+        emit_turn_error(event_tx, None, format!("API error: {error}"), base_url);
+        return;
+    }
+    let _ = event_tx.send(LlmEvent::Error {
+        kind: ERROR_KIND_ERROR.to_string(),
+        message: unreachable_help(base_url, &detail),
+    });
+}
 
 /// Phrases OpenAI-compatible endpoints use when a request cannot be
 /// authenticated.  Checked in addition to the status code because several
@@ -376,6 +469,15 @@ pub async fn chat(
         .timeout(std::time::Duration::from_secs(llm_timeout))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+
+    // Checked here rather than in each frontend so the CLI, GUI and Web UI cannot
+    // disagree -- and because an empty model name would otherwise be sent to the
+    // endpoint, whose complaint about it is not an instruction.  No request is
+    // made, so nothing is charged or logged anywhere.
+    if model.trim().is_empty() {
+        emit_config_error(&event_tx, no_model_help(base_url));
+        return;
+    }
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/chat/completions");
 
@@ -502,7 +604,7 @@ pub async fn chat(
                         }
                     }
                     Err(e) => {
-                        emit_turn_error(&event_tx, None, format!("API error: {e}"), base_url);
+                        emit_unreachable_error(&event_tx, &e, base_url);
                         return;
                     }
                 }
@@ -1188,16 +1290,33 @@ mod loop_tests {
         reasoning_effort: &str,
         preserve_reasoning: bool,
     ) -> Driver {
+        start_chat_full(base_url, "stub-model", messages, mode, reasoning_effort, preserve_reasoning)
+    }
+
+    /// Same, with an explicit model name (the default is deliberately empty).
+    fn start_chat_with_model(base_url: &str, model: &str, messages: Vec<ChatMessage>) -> Driver {
+        start_chat_full(base_url, model, messages, ToolConfirmation::None, "", false)
+    }
+
+    fn start_chat_full(
+        base_url: &str,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        mode: ToolConfirmation,
+        reasoning_effort: &str,
+        preserve_reasoning: bool,
+    ) -> Driver {
         let (event_tx, rx) = mpsc::unbounded_channel();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let base_url = base_url.to_string();
+        let model = model.to_string();
         let effort = reasoning_effort.to_string();
         let handle = tokio::spawn(async move {
             chat(
                 &base_url,
                 "test-key",
-                "stub-model",
+                &model,
                 messages,
                 mode,
                 &effort,
@@ -1256,6 +1375,106 @@ mod loop_tests {
         // 401 render (and persist) as the assistant's answer.
         assert!(d.rx.try_recv().is_err(), "no event may follow the error");
         assert_eq!(requests.lock().unwrap().len(), 1, "one attempt, no retries");
+    }
+
+    #[test]
+    fn local_endpoints_are_recognised() {
+        for url in [
+            "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:11434/v1",
+            "http://0.0.0.0:11434/v1",
+            "http://[::1]:11434/v1",
+            "127.0.0.1:11434",
+        ] {
+            assert!(is_local_endpoint(url), "{url} should be local");
+        }
+        for url in [
+            "https://api.openai.com/v1",
+            "https://api.groq.com/openai/v1",
+            "http://192.168.1.50:11434/v1",
+            "",
+        ] {
+            assert!(!is_local_endpoint(url), "{url} should not be local");
+        }
+    }
+
+    #[test]
+    fn no_model_help_says_how_to_choose_one() {
+        let help = no_model_help("http://127.0.0.1:11434/v1");
+        for expected in [
+            "No model is selected",
+            "http://127.0.0.1:11434/v1",
+            "/models",
+            "/model ",
+            "ollama pull",
+            "Fetch Models",
+        ] {
+            assert!(help.contains(expected), "missing {expected} in {help}");
+        }
+    }
+
+    #[test]
+    fn unreachable_help_adapts_to_the_endpoint() {
+        let local = unreachable_help("http://127.0.0.1:11434/v1", "connection refused");
+        assert!(local.contains("Nothing answered at http://127.0.0.1:11434/v1"));
+        assert!(local.contains("connection refused"));
+        assert!(local.contains("ollama serve"));
+        assert!(local.contains("/baseurl"));
+
+        let remote = unreachable_help("https://api.example.com/v1", "timed out");
+        assert!(remote.contains("Could not reach https://api.example.com/v1"));
+        assert!(!remote.to_lowercase().contains("ollama"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_model_is_reported_without_touching_the_endpoint() {
+        // The shipped default: a local endpoint and no model, because a local
+        // server ships none of its own.  The turn must not become a request that
+        // asks the endpoint what it thinks of an empty model name.
+        let (base, requests) = stub_server(vec![]);
+        let mut d = start_chat_with_model(&base, "   ", vec![user_msg("hi")]);
+
+        match d.rx.recv().await.expect("an event") {
+            LlmEvent::Error { kind, message } => {
+                assert_eq!(kind, ERROR_KIND_CONFIG);
+                assert!(message.contains("No model is selected"), "{message}");
+                assert!(message.contains("/models"), "{message}");
+            }
+            other => panic!("expected a config error, got {other:?}"),
+        }
+        assert!(d.rx.try_recv().is_err());
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no request may reach the endpoint"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_endpoint_that_never_answers_explains_itself() {
+        // Loopback port 1: nothing listens.  With a local default this is the
+        // likeliest first-run failure, so it must name the URL and point at the
+        // server the user has to start, not just relay a transport error.
+        let mut d = start_chat(
+            "http://127.0.0.1:1",
+            vec![user_msg("hi")],
+            ToolConfirmation::None,
+            "",
+            false,
+        );
+
+        match d.rx.recv().await.expect("an event") {
+            LlmEvent::Error { kind, message } => {
+                assert_eq!(kind, ERROR_KIND_ERROR);
+                assert!(
+                    message.contains("Nothing answered at http://127.0.0.1:1"),
+                    "{message}"
+                );
+                assert!(message.contains("ollama serve"), "{message}");
+                assert!(message.contains("/baseurl"), "{message}");
+            }
+            other => panic!("expected an error event, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

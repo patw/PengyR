@@ -114,10 +114,14 @@ impl Harness {
 
     fn point_at(&self, base_url: &str) {
         let settings = self.config_path().join("settings.json");
+        // A model is set here on purpose: these tests are about what happens at
+        // request time (a completed turn, a rejected credential, a 5xx), and the
+        // shipped default has no model at all -- a local server ships none --
+        // which would make Pengy answer before it ever reached the endpoint.
         std::fs::write(
             &settings,
             format!(
-                r#"{{"base_url": "{base_url}", "api_key": "test", "tool_confirmation": "all"}}"#
+                r#"{{"base_url": "{base_url}", "api_key": "test", "model": "stub-model", "tool_confirmation": "all"}}"#
             ),
         )
         .unwrap();
@@ -348,6 +352,46 @@ fn rejected_credentials_are_explained_and_never_stored_as_an_answer() {
 }
 
 // ── Chat lifecycle ───────────────────────────────────────────────────
+#[test]
+fn a_fresh_install_asks_for_a_model_instead_of_sending_an_empty_one() {
+    // No settings.json at all: the shipped defaults. Local, so no API key is
+    // asked for -- and deliberately model-less, because a local server ships no
+    // model of its own. A new user must be told what to do about that rather
+    // than getting the endpoint's opinion of `model: ""`.
+    let h = Harness::new();
+    let (out, err) = h.run_capture(&["hello there"], Duration::from_secs(10));
+
+    assert!(err.contains("No model is selected"), "stderr: {err}");
+    assert!(err.contains("/models"), "stderr: {err}");
+    assert!(err.contains("ollama pull"), "stderr: {err}");
+    assert!(!err.contains("api.openai.com"), "stderr: {err}");
+    // Nothing on stdout, and the REPL carried on to /quit.
+    assert!(!out.contains("API error"), "stdout: {out}");
+    assert!(!out.contains("No model is selected"), "stdout: {out}");
+    assert!(out.contains("Goodbye"), "stdout: {out}");
+
+    // The user's own message is kept; the explanation is not invented as an
+    // assistant turn anywhere.
+    let mut found_user_message = false;
+    if let Ok(entries) = std::fs::read_dir(h.chats_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().map(|n| n == "index.json").unwrap_or(true) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            assert!(
+                !text.contains("No model is selected"),
+                "a config error must not be stored: {text}"
+            );
+            if text.contains("hello there") {
+                found_user_message = true;
+            }
+        }
+    }
+    assert!(found_user_message, "the user's message should still be stored");
+}
+
 
 #[test]
 fn new_chat_and_list() {

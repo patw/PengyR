@@ -13,7 +13,7 @@ pub const LICENSE_NAME: &str = "MIT License";
 pub const CATBEE_URL: &str = "https://catbee.ca";
 pub const CATBEE_BLURB: &str = "Pengy is part of Catbee — a collection of open-source, self-hosted AI tools for hyper-personal computing, designed to be self-hosted, fully controllable, and yours to own.";
 
-pub const DESCRIPTION: &str = "Pengy is a local-first AI agent that connects to any OpenAI-compatible API (OpenAI, Ollama, vLLM, Groq, OpenRouter, or a local endpoint) and gives the model tools to operate on your filesystem, run code, search the web, and more — all with your approval.";
+pub const DESCRIPTION: &str = "Pengy is a local-first AI agent that defaults to a local model server (Ollama; also llama.cpp, vLLM, LM Studio) and connects to any OpenAI-compatible API, including hosted ones. It gives the model tools to operate on your filesystem, run code, search the web, and more — all with your approval.";
 
 /// The year Pengy was first published — kept in sync with LICENSE's copyright year.
 const FOUNDING_YEAR: i32 = 2026;

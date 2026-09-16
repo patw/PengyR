@@ -100,10 +100,17 @@ pub struct Config {
 }
 
 fn default_base_url() -> String {
-    "https://api.openai.com/v1".into()
+    // A local server, not a hosted API.  Pengy's audience runs Ollama or
+    // llama.cpp on their own machine, so the default endpoint is the one those
+    // users already have: Ollama's OpenAI-compatible port.  It needs no API key.
+    "http://127.0.0.1:11434/v1".into()
 }
 fn default_model() -> String {
-    "gpt-4o".into()
+    // Deliberately empty: a local server ships no model of its own (a fresh
+    // `ollama list` is empty), so naming one would be a lie that fails on the
+    // user's first message.  An empty model produces Pengy's own "pick a model"
+    // instructions instead -- see llm_client::no_model_help.
+    String::new()
 }
 fn default_system_message() -> String {
     "You are a helpful assistant named Pengy. \
@@ -479,8 +486,12 @@ mod tests {
     #[test]
     fn config_default_has_expected_values() {
         let c = Config::default();
-        assert_eq!(c.base_url, "https://api.openai.com/v1");
-        assert_eq!(c.model, "gpt-4o");
+        // The defaults are local-first on purpose: Ollama's port, no key, and no
+        // model (a local server ships none).
+        assert_eq!(c.base_url, "http://127.0.0.1:11434/v1");
+        assert!(!c.base_url.contains("openai"));
+        assert_eq!(c.api_key, "");
+        assert_eq!(c.model, "");
         assert_eq!(c.tool_confirmation, "none");
         assert_eq!(c.reasoning_effort, "");
         assert!(!c.preserve_reasoning);
@@ -549,7 +560,7 @@ mod tests {
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.api_key, "sk-test");
         assert_eq!(c.model, "custom-model");
-        assert_eq!(c.base_url, "https://api.openai.com/v1");
+        assert_eq!(c.base_url, "http://127.0.0.1:11434/v1");
         assert_eq!(c.tool_confirmation, "none");
         assert_eq!(c.reasoning_effort, "");
         assert!(!c.preserve_reasoning);
