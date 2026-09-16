@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v1.8.7
+
+- **Fixed native-web sudo password prompts.** Rust's SSE stream now sends a buffering prelude before interactive events, so Chrome and Firefox immediately dispatch `sudo_request` instead of leaving the web UI spinning. A regression test covers the prelude and sudo event ordering.
+
 ## v1.8.6
 
 - **CLI panel layout and emoji handling are reliable.** ANSI styling is measured as zero-width and is kept intact across wraps, so Rust's Markdown/tool panels retain aligned right borders. Complex UTF-8 emoji (including joined emoji, flags, variation selectors, and keycaps) are preserved in all CLI editions.

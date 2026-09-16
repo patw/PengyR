@@ -1221,7 +1221,17 @@ fn async_stream(
     event_count_rx: tokio::sync::watch::Receiver<usize>,
     done: Arc<AtomicBool>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    // Send retry:1000 first so browsers reconnect in 1s instead of default 3s
+    // Some native HTTP stacks (and intermediaries) coalesce a tiny first SSE
+    // write.  Browsers then keep EventSource CONNECTING/OPEN but do not dispatch
+    // the first interactive event — notably `sudo_request` — until enough later
+    // output arrives. Flask's streaming response happens to flush a larger
+    // initial body, which is why Python Pengy did not show the bug. Send a
+    // harmless comment prelude large enough to force the response through the
+    // buffering threshold before any application event.
+    let padding_event = Ok(Event::default().comment(" ".repeat(2048)));
+    let padding_stream = futures_util::stream::once(async move { padding_event });
+
+    // Send retry:1000 so browsers reconnect in 1s instead of default 3s.
     let retry_event = Ok(Event::default().retry(std::time::Duration::from_millis(1000)));
     let retry_stream = futures_util::stream::once(async move { retry_event });
 
@@ -1266,7 +1276,7 @@ fn async_stream(
             }
         });
 
-    retry_stream.chain(main_stream)
+    padding_stream.chain(retry_stream).chain(main_stream)
 }
 
 #[derive(Deserialize)]
@@ -4314,6 +4324,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn async_stream_primes_native_browser_sse_buffer_before_sudo() {
+        let events = Arc::new(Mutex::new(vec![SseEvent::SudoRequest]));
+        let (_tx, rx) = tokio::sync::watch::channel(1usize);
+        let done = Arc::new(AtomicBool::new(true));
+
+        let items: Vec<_> = async_stream(0, events, rx, done).collect().await;
+        assert_eq!(items.len(), 3); // padding + retry + sudo_request
+
+        let padding = format!("{:?}", items[0].as_ref().unwrap());
+        let sudo = format!("{:?}", items[2].as_ref().unwrap());
+        assert!(padding.len() >= 2048, "padding was too small: {padding:?}");
+        assert!(sudo.contains("sudo_request"), "missing sudo event: {sudo:?}");
+    }
+
+    #[tokio::test]
     async fn async_stream_replays_from_start_index_and_ends_when_done() {
         let events = Arc::new(Mutex::new(vec![
             SseEvent::SudoRequest,
@@ -4335,8 +4360,8 @@ mod tests {
         let done = Arc::new(AtomicBool::new(true));
         let stream = async_stream(1, events, rx, done);
         let items: Vec<_> = stream.collect().await;
-        // retry directive + the FinalResponse event starting at index 1
-        assert_eq!(items.len(), 2);
+        // buffering prelude + retry directive + FinalResponse at index 1
+        assert_eq!(items.len(), 3);
     }
 
     #[tokio::test]
@@ -4355,7 +4380,7 @@ mod tests {
         });
         let stream = async_stream(0, events, rx, done);
         let items: Vec<_> = stream.collect().await;
-        assert_eq!(items.len(), 2); // retry + SudoRequest
+        assert_eq!(items.len(), 3); // prelude + retry + SudoRequest
     }
 
     /// The whole turn can finish before the browser's EventSource connects.
@@ -4393,7 +4418,7 @@ mod tests {
         // Now the browser connects.
         let stream = async_stream(0, events, tx.subscribe(), done);
         let items: Vec<_> = stream.collect().await;
-        assert_eq!(items.len(), 2); // retry + FinalResponse
+        assert_eq!(items.len(), 3); // prelude + retry + FinalResponse
     }
 
     fn event_log(
@@ -4442,8 +4467,8 @@ mod tests {
             },
         ]);
         let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
-        // retry directive plus result and final; event 0/tool request is not replayed.
-        assert_eq!(items.len(), 3);
+        // prelude + retry + result + final; event 0/tool request is not replayed.
+        assert_eq!(items.len(), 4);
     }
 
     #[tokio::test]
@@ -4485,8 +4510,8 @@ mod tests {
         let _ = tx.send(3);
 
         let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
-        // retry + exactly the missed result and final response.
-        assert_eq!(items.len(), 3);
+        // prelude + retry + exactly the missed result and final response.
+        assert_eq!(items.len(), 4);
     }
 
     /// Every function the page's inline script calls must actually be defined
