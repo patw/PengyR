@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v1.8.5
+## v1.8.6
 
 - **CLI panel layout and emoji handling are reliable.** ANSI styling is measured as zero-width and is kept intact across wraps, so Rust's Markdown/tool panels retain aligned right borders. Complex UTF-8 emoji (including joined emoji, flags, variation selectors, and keycaps) are preserved in all CLI editions.
 - **Fixed a critical fast-web-turn replay race.** The web event log is authoritative even before a browser subscribes: event counts are retained and SSE replay no longer loses a completed response when it finishes before `EventSource` attaches. The web UI also defines its wake-lock helpers before send-state code uses them.
