@@ -2121,13 +2121,20 @@ fn display_tokens(s: &str) -> Vec<String> {
         let mut end = start + ch.len_utf8();
         match chars.peek().map(|(_, c)| *c) {
             Some('[') => {
+                // Consume the `[` introducer before looking for a CSI final.
+                // Without this, `[` itself (0x5b) is mistaken for the final
+                // byte, tokenizing `ESC [` separately and leaking the remaining
+                // SGR parameters (`1m`, `36m`, ...) into visible panel text.
+                let (idx, bracket) = chars.next().expect("peeked CSI introducer");
+                end = idx + bracket.len_utf8();
                 while let Some((idx, c)) = chars.next() {
                     end = idx + c.len_utf8();
                     if ('\u{40}'..='\u{7e}').contains(&c) { break; }
                 }
             }
             Some(']') | Some('P') | Some('_') | Some('^') | Some('X') => {
-                chars.next();
+                let (idx, introducer) = chars.next().expect("peeked string introducer");
+                end = idx + introducer.len_utf8();
                 while let Some((idx, c)) = chars.next() {
                     end = idx + c.len_utf8();
                     if c == '\u{07}' { break; }
@@ -2699,6 +2706,27 @@ mod tests {
     #[test]
     fn strips_csi_color_codes() {
         assert_eq!(sanitize_display("\x1b[31mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn csi_sgr_is_one_zero_width_display_token() {
+        // ESC [ is an introducer, not a complete sequence. A split here used
+        // to print `1m` / `36m` into assistant panels and let styling absorb
+        // following box-drawing characters.
+        let styled = "\x1b[1;36mcyan bold\x1b[0m";
+        assert_eq!(visual_width(styled), visual_width("cyan bold"));
+        assert_eq!(wrap_line(styled, 80), vec![styled]);
+    }
+
+    #[test]
+    fn styled_markdown_wraps_without_leaking_sgr_parameters() {
+        let styled = "\x1b[36m•\x1b[0m \x1b[1mMost interesting:\x1b[0m Pengy";
+        let rendered = wrap_line(styled, 24).join("\n");
+        assert!(rendered.contains("\x1b[1mMost interesting:"));
+        assert!(!rendered.contains("\x1b[1m\x1b[0mMost"));
+        for line in wrap_line(styled, 24) {
+            assert!(visual_width(&line) <= 24, "line was {line:?}");
+        }
     }
 
     #[test]
