@@ -591,6 +591,13 @@ impl WebWorker {
         // Append-only event log shared by all SSE streams, with a watch channel
         // that notifies streams when new events are appended.
         let events = Arc::new(Mutex::new(Vec::new()));
+        // `watch::Sender::send` fails — and leaves the stored value untouched —
+        // when no receiver is alive, and SSE clients only subscribe once the
+        // browser opens the EventSource after POST /send returns.  A fast turn
+        // finishes first, so every `send` here would be a silent no-op and the
+        // count would stay 0 while the event log filled up.  Use `send_replace`,
+        // which always stores and notifies, so the count is correct whenever a
+        // client does subscribe.
         let (event_count_tx, _) = tokio::sync::watch::channel(0usize);
         let done = Arc::new(AtomicBool::new(false));
 
@@ -625,7 +632,7 @@ impl WebWorker {
                     ev.push(SseEvent::SudoRequest);
                     count = ev.len();
                 }
-                let _ = event_count_tx_sudo.send(count);
+                event_count_tx_sudo.send_replace(count);
                 let (lock, cvar) = &*sudo_state_provider;
                 let mut guard = lock.lock().unwrap();
                 while guard.is_none() {
@@ -680,7 +687,7 @@ impl WebWorker {
                     ev.push(event);
                     count = ev.len();
                 }
-                let _ = event_count_tx.send(count);
+                event_count_tx.send_replace(count);
             };
 
             loop {
@@ -1201,10 +1208,12 @@ fn async_stream(
             let done = done.clone();
             async move {
                 loop {
-                    let current_count = *rx.borrow();
-                    {
+                    // The mutex-guarded log is authoritative: an event is
+                    // pushed before its count is published, so gating on the
+                    // watch value too could only ever lose an event.
+                    let len = {
                         let events = events.lock().unwrap();
-                        if index < events.len() && index < current_count {
+                        if index < events.len() {
                             let ev = &events[index];
                             let json = sse_event_to_json(ev);
                             let event_id = index;
@@ -1214,8 +1223,9 @@ fn async_stream(
                                 (index, rx),
                             ));
                         }
-                    }
-                    if done.load(Ordering::Relaxed) && index >= current_count {
+                        events.len()
+                    };
+                    if done.load(Ordering::Relaxed) && index >= len {
                         return None;
                     }
                     // Wait for new events or emit a keepalive comment so
@@ -3156,6 +3166,36 @@ function toolSummary(name, args) {{
   return s.length <= 100 ? s : s.slice(0, 97).trimEnd() + '…';
 }}
 
+// ── Screen wake lock ─────────────────────────────────────────
+// A turn can run for minutes with no user input, and a phone that sleeps
+// mid-turn suspends the SSE connection.  These are called from
+// setProcessing() on every send, so they must never throw: an undefined
+// acquireWakeLock() used to abort doSend() right after the Stop button was
+// shown, leaving the UI processing forever with the message never posted.
+
+async function acquireWakeLock() {{
+  // Undefined on non-secure origins (http://<lan-ip>) and unsupported browsers.
+  if (wakeLock || !navigator.wakeLock) return;
+  try {{
+    wakeLock = await navigator.wakeLock.request('screen');
+    // The browser drops the lock on its own when the page is hidden; clear
+    // our handle so the visibilitychange path can re-acquire it.
+    wakeLock.addEventListener('release', () => {{ wakeLock = null; }});
+  }} catch (err) {{
+    // NotAllowedError when the page is already hidden — not worth surfacing.
+    wakeLock = null;
+  }}
+}}
+
+function releaseWakeLock() {{
+  if (!wakeLock) return;
+  const lock = wakeLock;
+  wakeLock = null;
+  try {{
+    Promise.resolve(lock.release()).catch(() => {{}});
+  }} catch (err) {{ /* already released */ }}
+}}
+
 function setProcessing(val) {{
   isProcessing = val;
   document.getElementById('messageInput').disabled = val;
@@ -3556,6 +3596,17 @@ document.getElementById('messageInput').addEventListener('focus', () => {{
     }}
   }}, 50);
 }});
+
+// The live event stream is gone while a turn is still in flight.  Persisted
+// chat history is authoritative, so reload: the server re-renders everything
+// the turn committed and re-arms the stream if the worker is still running.
+// The cursor in sessionStorage is deliberately kept — that is what lets the
+// reloaded page resume the stream instead of replaying it from the start.
+function reloadToSync() {{
+  const draft = document.getElementById('messageInput').value;
+  if (draft) sessionStorage.setItem('pengy_draft_' + CHAT_ID, draft);
+  window.location.reload();
+}}
 
 function openSSE() {{
   // Preserve CONNECTING: it retains browser-managed Last-Event-ID.
@@ -4284,6 +4335,44 @@ mod tests {
         assert_eq!(items.len(), 2); // retry + SudoRequest
     }
 
+    /// The whole turn can finish before the browser's EventSource connects.
+    /// The event log must still replay to the first subscriber — regression
+    /// test for `watch::Sender::send` silently dropping the count (and with it
+    /// every event) while no receiver was alive.
+    #[tokio::test]
+    async fn events_pushed_before_any_subscriber_still_replay() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _) = tokio::sync::watch::channel(0usize);
+        let done = Arc::new(AtomicBool::new(false));
+
+        // A complete turn, with no SSE client attached yet.
+        {
+            let mut ev = events.lock().unwrap();
+            ev.push(SseEvent::FinalResponse {
+                html: "<p>hi</p>".into(),
+                usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+                cumulative_usage: llm_client::Usage {
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                },
+            });
+            // Exactly what the old code did: a `send` with no receiver alive,
+            // which fails and leaves the published count at 0.
+            let _ = tx.send(ev.len());
+        }
+        done.store(true, Ordering::Relaxed);
+
+        // Now the browser connects.
+        let stream = async_stream(0, events, tx.subscribe(), done);
+        let items: Vec<_> = stream.collect().await;
+        assert_eq!(items.len(), 2); // retry + FinalResponse
+    }
+
     fn event_log(
         events: Vec<SseEvent>,
     ) -> (
@@ -4375,6 +4464,89 @@ mod tests {
         let items: Vec<_> = async_stream(1, events, rx, done).collect().await;
         // retry + exactly the missed result and final response.
         assert_eq!(items.len(), 3);
+    }
+
+    /// Every function the page's inline script calls must actually be defined
+    /// in that script.  `acquireWakeLock`/`releaseWakeLock` were called from
+    /// `setProcessing()` but never defined, so the `ReferenceError` aborted
+    /// `doSend()` between showing the Stop button and issuing `POST /send` —
+    /// the message was never sent and the UI hung "processing" forever.
+    #[test]
+    fn chat_template_defines_every_function_it_calls() {
+        let chat = Chat::new("Template test");
+        let page = templates::chat_page(&chat, &[], &Config::default(), &[], true);
+
+        // Only the <script> bodies — CSS (`var(`, `env(`, `@media (`) and
+        // prose in comments would otherwise read as calls.
+        let mut html = String::new();
+        for chunk in page.split("<script>").skip(1) {
+            let body = chunk.split("</script>").next().unwrap_or("");
+            for line in body.lines() {
+                // Strip `//` line comments, keeping `://` inside URLs.
+                let code = match line.find("//") {
+                    Some(i) if !line[..i].ends_with(':') => &line[..i],
+                    _ => line,
+                };
+                html.push_str(code);
+                html.push('\n');
+            }
+        }
+
+        // Page-local definitions: `function f(`, and `const/let/var f = ` forms
+        // (arrow functions, `new bootstrap.Modal(...)`, cached elements, ...).
+        let def_fn = regex::Regex::new(r"function\s+([A-Za-z_$][\w$]*)\s*\(").unwrap();
+        let def_var =
+            regex::Regex::new(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*[=;,]").unwrap();
+        let mut defined: std::collections::HashSet<&str> = def_fn
+            .captures_iter(&html)
+            .chain(def_var.captures_iter(&html))
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+
+        // Globals supplied by the browser, Bootstrap, or JS syntax that merely
+        // looks like a call (`if (`, `catch (`, `new Foo(`, ...).
+        const AMBIENT: &[&str] = &[
+            "if", "for", "while", "switch", "catch", "return", "typeof", "function", "await",
+            "new", "else", "do", "delete", "void", "in", "of", "case", "yield",
+            "fetch", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+            "requestAnimationFrame", "alert", "confirm", "prompt", "parseInt", "parseFloat",
+            "isNaN", "encodeURIComponent", "decodeURIComponent", "escape", "unescape",
+            "Promise", "JSON", "Object", "Array", "String", "Number", "Boolean", "Set", "Map",
+            "Date", "Math", "Error", "RegExp", "Symbol", "BigInt", "Intl",
+            "EventSource", "FileReader", "FormData", "Blob", "URL", "URLSearchParams",
+            "AbortController", "Image", "Audio", "MutationObserver", "IntersectionObserver",
+            "TextEncoder", "TextDecoder", "CustomEvent", "Event",
+            "document", "window", "navigator", "location", "history", "console",
+            "sessionStorage", "localStorage", "bootstrap", "structuredClone", "queueMicrotask",
+        ];
+        defined.extend(AMBIENT);
+
+        // Call sites: `name(` on one line, not preceded by `.` (method call)
+        // or a word char (part of a longer identifier).  Requiring the paren
+        // on the same line keeps prose inside template literals ("… out\n(12
+        // total)") from reading as a call.
+        let call = regex::Regex::new(r"([A-Za-z_$][\w$]*)[ \t]*\(").unwrap();
+        let bytes = html.as_bytes();
+        let mut missing: Vec<&str> = Vec::new();
+        for m in call.captures_iter(&html) {
+            let name = m.get(1).unwrap();
+            let start = name.start();
+            if start > 0 {
+                let prev = bytes[start - 1];
+                if prev == b'.' || prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
+                    continue;
+                }
+            }
+            let name = name.as_str();
+            if !defined.contains(name) && !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "chat page script calls undefined function(s): {missing:?}"
+        );
     }
 
     #[test]
