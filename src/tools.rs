@@ -1298,9 +1298,23 @@ async fn run_bash(
             let provider = ctx.sudo_provider.lock().unwrap().take();
             let pw = match provider {
                 Some(cb) => {
-                    let result = cb();
-                    *ctx.sudo_provider.lock().unwrap() = Some(cb);
-                    result
+                    // Providers block until the user answers (the web one on a
+                    // Condvar). Doing that on a Tokio worker strands whatever
+                    // task the provider just woke — e.g. the SSE stream that
+                    // must deliver `sudo_request` — in that worker's
+                    // non-stealable LIFO slot, so the prompt never shows.
+                    match tokio::task::spawn_blocking(move || {
+                        let result = cb();
+                        (cb, result)
+                    })
+                    .await
+                    {
+                        Ok((cb, result)) => {
+                            *ctx.sudo_provider.lock().unwrap() = Some(cb);
+                            result
+                        }
+                        Err(_) => return "Error: sudo password provider failed.".into(),
+                    }
                 }
                 None => {
                     return "Error: sudo detected but no password provider is configured.".into()
@@ -3129,6 +3143,49 @@ mod tests {
         ctx.set_sudo_provider(Some(Box::new(|| panic!("must not prompt"))));
         let result = run_bash("sudo true".into(), None, false, ctx).await;
         assert!(result.contains("Elevation required"));
+    }
+
+    /// The web frontend's sudo provider publishes a `sudo_request` to its SSE
+    /// stream, then blocks until the browser answers.  Called straight from
+    /// this async fn, that block parks a Tokio worker thread — and the SSE
+    /// task the publish just woke sits in that same worker's non-stealable
+    /// LIFO slot, so the prompt never reaches the browser (reconnecting the
+    /// stream "fixed" it by replaying the log on another worker).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sudo_provider_block_does_not_starve_woken_tasks() {
+        let (notify_tx, mut notify_rx) = tokio::sync::watch::channel(0usize);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (woke_tx, woke_rx) = std::sync::mpsc::channel();
+        let woke_rx = std::sync::Mutex::new(woke_rx);
+        tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            if notify_rx.changed().await.is_ok() {
+                let _ = woke_tx.send(());
+            }
+        });
+
+        let saw_wake = Arc::new(AtomicBool::new(false));
+        let saw_wake_provider = saw_wake.clone();
+        tokio::spawn(async move {
+            ready_rx.await.unwrap();
+            tokio::task::yield_now().await;
+            let ctx = Arc::new(ToolContext::new());
+            ctx.set_sudo_provider(Some(Box::new(move || {
+                notify_tx.send_replace(1);
+                if woke_rx.lock().unwrap().recv_timeout(Duration::from_secs(3)).is_ok() {
+                    saw_wake_provider.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                None
+            })));
+            run_bash("sudo true".into(), None, true, ctx).await
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            saw_wake.load(std::sync::atomic::Ordering::SeqCst),
+            "task woken by the sudo provider never ran while it blocked"
+        );
     }
 
     /// offset/limit page through a file; the header states where you are so the

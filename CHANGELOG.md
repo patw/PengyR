@@ -2,9 +2,11 @@
 
 ## Unreleased
 
+- **Actually fixed web sudo password prompts hanging.** `run_bash` called the sudo password provider directly on a Tokio worker thread, and the web provider blocks that thread on a `Condvar` until the browser answers. Publishing `sudo_request` had just woken the SSE stream task, and a task woken from a worker thread goes into that worker's LIFO slot, which other workers cannot steal. The stream that should deliver the prompt was therefore stuck behind the blocked thread, and the UI spun forever. Reopening the chat "fixed" it only because the new stream ran on a free worker and replayed the event log. The provider now runs via `spawn_blocking`. `ask_user_question` was never affected because it waits with `.await`. A multi-thread regression test (`sudo_provider_block_does_not_starve_woken_tasks`) fails without the fix. The v1.8.7 SSE padding has been removed: it was not the cause, and the hang reproduces with plain `curl`.
+
 ## v1.8.7
 
-- **Fixed native-web sudo password prompts.** Rust's SSE stream now sends a buffering prelude before interactive events, so Chrome and Firefox immediately dispatch `sudo_request` instead of leaving the web UI spinning. A regression test covers the prelude and sudo event ordering.
+- **Attempted fix for web sudo password prompts; did not fix them.** Added a 2KB SSE comment prelude on the theory that browsers buffered the first small event. That theory was wrong, and the prelude was removed in the next release (see Unreleased).
 
 ## v1.8.6
 
