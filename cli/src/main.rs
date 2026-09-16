@@ -2701,7 +2701,7 @@ fn find_double(chars: &[char], from: usize, ch: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_to_width, sanitize_display, visual_width, wrap_line};
+    use super::{pad_to_width, render_markdown_terminal, sanitize_display, visual_width, wrap_line};
 
     #[test]
     fn strips_csi_color_codes() {
@@ -2726,6 +2726,26 @@ mod tests {
         assert!(!rendered.contains("\x1b[1m\x1b[0mMost"));
         for line in wrap_line(styled, 24) {
             assert!(visual_width(&line) <= 24, "line was {line:?}");
+        }
+    }
+
+    #[test]
+    fn rendered_markdown_stays_box_safe_with_bold_lists_and_quotes() {
+        let markdown = "**Potentially—but not proven.**\n\n> \"A quoted claim.\"\n\n- **Most interesting:** Pengy\n- BotTalk and BotSkills";
+        let rendered = render_markdown_terminal(markdown);
+        // The actual renderer emits ANSI, then wrap_line must retain complete
+        // escapes. No bare SGR final byte may be visible beside model text.
+        for raw in rendered.lines() {
+            for line in wrap_line(raw, 72) {
+                assert!(visual_width(&line) <= 72, "line was {line:?}");
+                // `mMost` is valid inside the full `ESC[1mMost` token, but
+                // must disappear once full ANSI controls are removed. If the
+                // tokenizer splits CSI at ESC[, sanitize_display leaves the
+                // bare `m` behind and this assertion fails.
+                let visible = sanitize_display(&line);
+                assert!(!visible.contains("mMost") && !visible.contains("mBotTalk"),
+                        "leaked ANSI final in {line:?} -> {visible:?}");
+            }
         }
     }
 
