@@ -813,9 +813,16 @@ impl PengyCli {
             args_str = format!("{}\n\n[... truncated ...]", take_chars(&args_str, 4000));
         }
 
+        // Lead with a remote target so it is visible before the argument dump.
+        let target = match args.get("host").and_then(|h| h.as_str()) {
+            Some(host) if name == "run_bash" && !host.is_empty() => {
+                format!(" on {}", sanitize_display(host))
+            }
+            _ => String::new(),
+        };
         println!();
         print_box(
-            &format!("🔧 Tool: {}", sanitize_display(name)),
+            &format!("🔧 Tool: {}{}", sanitize_display(name), target),
             &[sanitize_display(name), sanitize_display(&args_str)],
             None,
         );
@@ -923,17 +930,27 @@ impl PengyCli {
     // ── Sudo ─────────────────────────────────────────────────────
 
     fn set_sudo_provider(&self) {
-        self.tool_ctx.set_sudo_provider(Some(Box::new(|| {
+        self.tool_ctx.set_sudo_provider(Some(Box::new(|host: Option<&str>| {
             // Tool cards are written to stdout while this callback writes to
             // stderr. Flush the card before prompting so a terminal never
             // shows a bare password field followed by the command it belongs
             // to; this is especially visible when stdout is block-buffered.
             io::stdout().flush().ok();
             eprintln!();
-            eprint!(
-                "{}🔐 Sudo authentication required — enter your macOS password (input hidden): {}",
-                YELLOW, RESET
-            );
+            match host {
+                // A remote run (run_bash host=) needs that machine's password.
+                Some(host) => eprint!(
+                    "{}🔐 Sudo authentication required on {} — enter the sudo password for {} (input hidden): {}",
+                    YELLOW,
+                    sanitize_display(host),
+                    sanitize_display(host),
+                    RESET
+                ),
+                None => eprint!(
+                    "{}🔐 Sudo authentication required — enter your macOS password (input hidden): {}",
+                    YELLOW, RESET
+                ),
+            }
             io::stderr().flush().ok();
             rpassword::read_password().ok()
         })));

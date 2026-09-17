@@ -8,6 +8,7 @@ ChatWorker::ChatWorker(QObject* parent) : QObject(parent) {
     m_confirmState.yolo_turn = false;
     m_sudoState.status = 0;
     memset(m_sudoState.password, 0, sizeof(m_sudoState.password));
+    memset(m_sudoState.host, 0, sizeof(m_sudoState.host));
     m_questionState.status = 0;
     memset(m_questionState.questions_json, 0, sizeof(m_questionState.questions_json));
     memset(m_questionState.answers_json, 0, sizeof(m_questionState.answers_json));

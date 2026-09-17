@@ -49,6 +49,7 @@ extern "C" {
     struct SudoState {
         int status;           // 0=idle, 1=pending, 2=provided, 3=cancelled
         char password[256];
+        char host[256];       // target host, NUL-terminated; empty = local
     };
 
     struct QuestionState {

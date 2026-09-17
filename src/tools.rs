@@ -38,19 +38,22 @@ pub struct PendingImage {
 }
 
 /// A blocking callback that prompts the user for a sudo password.
-/// Returns the password, or `None` if the user cancels.
-pub type SudoProvider = Box<dyn Fn() -> Option<String> + Send + Sync>;
+/// Called with the target host (`None` for the local machine) so the prompt
+/// can name it.  Returns the password, or `None` if the user cancels.
+pub type SudoProvider = Box<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
-/// Per-run tool state: sudo provider, cached sudo password, and the set of
-/// active subprocess groups.
+/// Per-run tool state: sudo provider, cached sudo passwords (keyed by host,
+/// `None` = local), and the set of active subprocess groups.
 ///
 /// Each concurrent run (e.g. one per GUI tab) gets its own context so a sudo
 /// prompt is routed to the right run and pressing Stop on one run kills only
 /// that run's subprocesses — never another tab's.  Shared as `Arc<ToolContext>`
 /// so it can be cloned into `spawn_blocking` closures and across the FFI.
+///
+/// A password is never offered to a host it wasn't entered for.
 pub struct ToolContext {
     sudo_provider: Mutex<Option<SudoProvider>>,
-    cached_sudo_password: Mutex<Option<String>>,
+    cached_sudo_passwords: Mutex<HashMap<Option<String>, String>>,
     active_process_groups: Mutex<HashSet<u32>>,
     pending_images: Mutex<Vec<PendingImage>>,
     /// Set by `pengy_llm_cancel` so the LLM loop aborts at the next yield point.
@@ -61,21 +64,37 @@ impl ToolContext {
     pub fn new() -> Self {
         Self {
             sudo_provider: Mutex::new(None),
-            cached_sudo_password: Mutex::new(None),
+            cached_sudo_passwords: Mutex::new(HashMap::new()),
             active_process_groups: Mutex::new(HashSet::new()),
             pending_images: Mutex::new(Vec::new()),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Install (or clear) the sudo provider; clears any cached password.
+    /// Install (or clear) the sudo provider; clears any cached passwords.
     pub fn set_sudo_provider(&self, provider: Option<SudoProvider>) {
         *self.sudo_provider.lock().unwrap() = provider;
-        *self.cached_sudo_password.lock().unwrap() = None;
+        self.clear_sudo();
     }
 
     pub fn clear_sudo(&self) {
-        *self.cached_sudo_password.lock().unwrap() = None;
+        self.cached_sudo_passwords.lock().unwrap().clear();
+    }
+
+    fn cached_sudo_password(&self, host: Option<&str>) -> Option<String> {
+        self.cached_sudo_passwords
+            .lock()
+            .unwrap()
+            .get(&host.map(String::from))
+            .cloned()
+    }
+
+    /// Discard *host*'s cached password (after a failed sudo authentication).
+    pub fn forget_sudo_password(&self, host: Option<&str>) {
+        self.cached_sudo_passwords
+            .lock()
+            .unwrap()
+            .remove(&host.map(String::from));
     }
 
     /// Queue an image for attachment to the conversation.
@@ -187,9 +206,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
               ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To run something as root, include an explicit `sudo ...` in the command AND set elevated=true; Pengy then prompts for the password separately. elevated=true does NOT elevate on its own — a command with elevated=true but no `sudo` is rejected, so every elevation stays an explicit, auditable sudo call. Do not set elevated merely because text or arguments mention sudo. Commands are killed once the configured tool timeout elapses.",
+        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To run something as root, include an explicit `sudo ...` in the command AND set elevated=true; Pengy then prompts for the password separately. elevated=true does NOT elevate on its own — a command with elevated=true but no `sudo` is rejected, so every elevation stays an explicit, auditable sudo call. Do not set elevated merely because text or arguments mention sudo. To run on a remote machine, set host instead of writing `ssh host ...` yourself; only commands run via host can use sudo with a password prompt on that machine. Commands are killed once the configured tool timeout elapses.",
             &[("command", "string", "The bash command to execute"),
               ("cwd", "string", "Optional working directory to run the command in"),
+              ("host", "string", "Run the command on this remote host over ssh instead of locally. Use the ssh destination the user uses (an ~/.ssh/config alias, host, or user@host); key-based login must already work. cwd, if given, is a path on the remote host. For root on the remote host, include `sudo ...` in the command and set elevated=true exactly as for a local command; Pengy prompts for that host's sudo password. Do NOT wrap the command in ssh yourself."),
               ("elevated", "boolean", "Set true only when this command intentionally invokes sudo.")],
             &["command"]),
         td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
@@ -435,7 +455,16 @@ async fn execute_tool_inner(
             ).await
         }
         "apply_changes" => apply_changes(arguments).await,
-        "run_bash" => run_bash(a(arguments, "command", ""), aopt(arguments, "cwd"), abool(arguments, "elevated", false), ctx.clone()).await,
+        "run_bash" => {
+            run_bash(
+                a(arguments, "command", ""),
+                aopt(arguments, "cwd"),
+                abool(arguments, "elevated", false),
+                aopt(arguments, "host").filter(|h| !h.is_empty()),
+                ctx.clone(),
+            )
+            .await
+        }
         "web_search" => {
             web_search(a(arguments, "query", ""), aus(arguments, "max_results", 5)).await
         }
@@ -1267,16 +1296,262 @@ fn resolve_cwd(cwd: &Option<String>) -> Result<Option<PathBuf>, String> {
     }
 }
 
+// Remote-execution wrapper for run_bash(host=...).  Sent over ssh's stdin to
+// `sh -s`, so the only thing on the ssh command line is `sh -s` (independent of
+// the remote login shell) and the password never touches an argv.  The whole
+// script is one `{ ... }` compound command so the shell reads all of it before
+// running any of it; after that, stdin holds only the still-open channel.
+//
+//   - The askpass helper mirrors AskpassHelper: a 0600 password file in a 0700
+//     mktemp dir, read by a 0700 script.  `pw` is never exported and is unset
+//     before the command starts, so `env` inside the command can't leak it.
+//     The dir must be executable (sudo execs the helper), hence the candidate
+//     list — $XDG_RUNTIME_DIR is tmpfs, /tmp is often noexec.
+//   - Stop: the Pengy side holds ssh's stdin open for the whole run.  Killing
+//     the local ssh closes the channel; the watcher's `cat` sees EOF and
+//     SIGTERMs the command's process group (setsid).  `sudo` relays SIGTERM to
+//     its root child.  No pty, so there is no SIGHUP to rely on.
+//   - `exec 3<&0`: background jobs get /dev/null as stdin when job control is
+//     off, so the watcher must read the channel through a saved fd.
+//   - `trap ... PIPE`: after the client disconnects, dash writes a "Terminated"
+//     notice to the dead channel; without a handler it dies of SIGPIPE before
+//     the EXIT trap removes the password dir.  Handler traps (unlike ignored
+//     signals) reset to default in the child, so the command's own SIGPIPE
+//     semantics are unchanged.
+//
+// Keep byte-identical with the Python and C++ editions.
+const REMOTE_WRAPPER: &str = r#"{
+umask 077
+use_sudo=__USE_SUDO__
+pw=__PASSWORD__
+cmd=__COMMAND__
+cwd=__CWD__
+d=
+if [ "$use_sudo" = 1 ]; then
+  for base in "${XDG_RUNTIME_DIR:-}" "${HOME:-}/.cache" /tmp; do
+    [ -n "$base" ] && [ -d "$base" ] && [ -w "$base" ] || continue
+    t=$(mktemp -d "$base/pengy-askpass.XXXXXX" 2>/dev/null) || continue
+    printf '#!/bin/sh\ncat "%s/pw"\n' "$t" > "$t/askpass"
+    chmod 700 "$t/askpass"
+    : > "$t/pw"
+    if "$t/askpass" >/dev/null 2>&1; then d=$t; break; fi
+    rm -rf "$t"
+  done
+  if [ -z "$d" ]; then
+    unset pw
+    echo "pengy: no writable, executable private directory for SUDO_ASKPASS on the remote host" >&2
+    exit 125
+  fi
+  trap 'rm -rf "$d"' EXIT
+  printf '%s\n' "$pw" > "$d/pw"
+fi
+unset pw
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 141' PIPE
+if [ -n "$cwd" ]; then cd "$cwd" || exit 126; fi
+if command -v bash >/dev/null 2>&1; then run=bash; else run=sh; fi
+exec 3<&0
+if [ -n "$d" ]; then
+  SUDO_ASKPASS="$d/askpass" setsid "$run" -c "$cmd" </dev/null 3<&- &
+else
+  setsid "$run" -c "$cmd" </dev/null 3<&- &
+fi
+child=$!
+( cat >/dev/null; kill -TERM -"$child" 2>/dev/null ) <&3 >/dev/null 2>&1 &
+watcher=$!
+exec 3<&-
+wait "$child"; rc=$?
+kill "$watcher" 2>/dev/null
+exit "$rc"
+}
+"#;
+
+/// ssh destinations: hostnames, ~/.ssh/config aliases, user@host, IPv6
+/// literals.  No leading '-' (ssh option injection such as -oProxyCommand=...),
+/// no whitespace/quotes/shell metacharacters/slashes.
+static HOST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._@:%-]+$").unwrap());
+
+/// Failed-authentication messages from classic sudo and sudo-rs.  On a match
+/// the cached password for that host is discarded so the next elevated call
+/// prompts again instead of replaying a bad password until the account locks.
+static SUDO_AUTH_FAILURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)Sorry, try again\.|incorrect password attempt|Authentication failed, try again\.|incorrect authentication attempt",
+    )
+    .unwrap()
+});
+
+/// stderr shapes that mean ssh itself failed (exit 255 is ambiguous: a remote
+/// command can exit 255 too).
+static SSH_FAILURE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^ssh: |Permission denied \(|Host key verification failed").unwrap()
+});
+
+/// Return an error message if *host* is not a safe ssh destination.
+fn validate_host(host: &str) -> Option<String> {
+    if host.is_empty() || host.starts_with('-') || !HOST_RE.is_match(host) {
+        return Some(format!(
+            "Error: invalid host {host:?}. Use an ssh destination such as \
+             `web1`, `user@web1.example.com`, or an ~/.ssh/config alias."
+        ));
+    }
+    None
+}
+
+/// POSIX single-quote *s* for a shell (same rules as Python's `shlex.quote`).
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".into();
+    }
+    if s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c))
+    {
+        return s.into();
+    }
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+static REMOTE_PLACEHOLDER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"__(USE_SUDO|PASSWORD|COMMAND|CWD)__").unwrap());
+
+/// Fill REMOTE_WRAPPER's placeholders with POSIX single-quoted literals.
+///
+/// One pass over the template: substituting placeholders one after another
+/// would also rewrite placeholder text inside an already-inserted value (a
+/// password containing `__COMMAND__`), breaking out of its quoting.
+fn build_remote_script(command: &str, password: Option<&str>, cwd: Option<&str>) -> String {
+    REMOTE_PLACEHOLDER_RE
+        .replace_all(REMOTE_WRAPPER, |caps: &regex::Captures| match &caps[1] {
+            "USE_SUDO" => if password.is_some() { "1" } else { "0" }.to_string(),
+            "PASSWORD" => shell_quote(password.unwrap_or("")),
+            "COMMAND" => shell_quote(command),
+            _ => shell_quote(cwd.unwrap_or("")),
+        })
+        .into_owned()
+}
+
+/// ssh arguments for a remote run.  -T: no pty (separate stdout/stderr, no
+/// echo, and the stdin-EOF watcher works).  BatchMode: never block on a
+/// login/passphrase/host-key prompt.  `--` before the host as a second guard
+/// against option injection.
+fn remote_ssh_args(host: &str) -> Vec<String> {
+    [
+        "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=15", "--", host, "sh", "-s",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Locate an executable named *name* on a PATH-style list.
+fn find_in_path(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path = path?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(candidate)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file() || candidate.with_extension("exe").is_file()
+            }
+        })
+}
+
+/// Make a write to a dead pipe return EPIPE instead of killing the process.
+///
+/// Rust binaries (CLI, Web) already ignore SIGPIPE, but the Qt GUI links this
+/// crate into a C++ `main`, where writing the rest of the script to an ssh that
+/// has already exited would take the whole app down.  Only the default action
+/// is replaced — an installed handler is left alone.
+fn ignore_default_sigpipe() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            let old = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            if old != libc::SIG_DFL {
+                libc::signal(libc::SIGPIPE, old);
+            }
+        });
+    }
+}
+
+/// Forget *host*'s cached password after a failed sudo authentication.
+fn sudo_auth_failure_note(ctx: &ToolContext, host: Option<&str>, stderr: &str) -> String {
+    if !SUDO_AUTH_FAILURE_RE.is_match(stderr) {
+        return String::new();
+    }
+    ctx.forget_sudo_password(host);
+    let place = host.map(|h| format!(" on {h}")).unwrap_or_default();
+    format!("\n[sudo authentication failed{place}; the cached password was discarded]")
+}
+
+/// Return the cached password for *host*, prompting once if needed.
+async fn sudo_password_for(ctx: &Arc<ToolContext>, host: Option<&str>) -> Result<String, String> {
+    if let Some(pw) = ctx.cached_sudo_password(host) {
+        return Ok(pw);
+    }
+    let provider = ctx.sudo_provider.lock().unwrap().take();
+    let cb = match provider {
+        Some(cb) => cb,
+        None => return Err("Error: sudo detected but no password provider is configured.".into()),
+    };
+    // Providers block until the user answers (the web one on a Condvar). Doing
+    // that on a Tokio worker strands whatever task the provider just woke —
+    // e.g. the SSE stream that must deliver `sudo_request` — in that worker's
+    // non-stealable LIFO slot, so the prompt never shows.
+    let host_owned = host.map(String::from);
+    let pw = match tokio::task::spawn_blocking(move || {
+        let result = cb(host_owned.as_deref());
+        (cb, result)
+    })
+    .await
+    {
+        Ok((cb, result)) => {
+            *ctx.sudo_provider.lock().unwrap() = Some(cb);
+            result
+        }
+        Err(_) => return Err("Error: sudo password provider failed.".into()),
+    };
+    match pw {
+        Some(p) => {
+            ctx.cached_sudo_passwords
+                .lock()
+                .unwrap()
+                .insert(host.map(String::from), p.clone());
+            Ok(p)
+        }
+        None => Err("Cancelled: sudo password not provided.".into()),
+    }
+}
+
+/// Run a bash command, locally or on *host* over ssh.
 async fn run_bash(
     command: String,
     cwd: Option<String>,
     elevated: bool,
+    host: Option<String>,
     ctx: Arc<ToolContext>,
 ) -> String {
-    let timeout = timeout_secs();
-    let run_cwd = match resolve_cwd(&cwd) {
-        Ok(c) => c,
-        Err(e) => return e,
+    let local_cwd = match &host {
+        Some(h) => {
+            if let Some(e) = validate_host(h) {
+                return e;
+            }
+            None // a remote path; the wrapper cds into it
+        }
+        None => match resolve_cwd(&cwd) {
+            Ok(c) => c,
+            Err(e) => return e,
+        },
     };
 
     let password_needed = !sudo_invocation_spans(&command).is_empty();
@@ -1292,61 +1567,44 @@ async fn run_bash(
                 auditable sudo call), or omit elevated=true if no root is needed."
             .into();
     }
-    if password_needed {
-        let need_pw = { ctx.cached_sudo_password.lock().unwrap().is_none() };
-        if need_pw {
-            let provider = ctx.sudo_provider.lock().unwrap().take();
-            let pw = match provider {
-                Some(cb) => {
-                    // Providers block until the user answers (the web one on a
-                    // Condvar). Doing that on a Tokio worker strands whatever
-                    // task the provider just woke — e.g. the SSE stream that
-                    // must deliver `sudo_request` — in that worker's
-                    // non-stealable LIFO slot, so the prompt never shows.
-                    match tokio::task::spawn_blocking(move || {
-                        let result = cb();
-                        (cb, result)
-                    })
-                    .await
-                    {
-                        Ok((cb, result)) => {
-                            *ctx.sudo_provider.lock().unwrap() = Some(cb);
-                            result
-                        }
-                        Err(_) => return "Error: sudo password provider failed.".into(),
-                    }
-                }
-                None => {
-                    return "Error: sudo detected but no password provider is configured.".into()
-                }
-            };
-            match pw {
-                Some(p) => {
-                    *ctx.cached_sudo_password.lock().unwrap() = Some(p);
-                }
-                None => return "Cancelled: sudo password not provided.".into(),
-            }
-        }
-    }
 
     // Route privileged commands through SUDO_ASKPASS. The `regex` crate has no
-    // lookahead support, so the rewrite is a manual scan.
-    let mut askpass = None;
+    // lookahead support, so the rewrite is a manual scan.  Only parsed command
+    // words get -A — never a mention in data, a comment, or a quoted string.
+    let mut password = None;
     let command = if password_needed {
-        let password = ctx.cached_sudo_password.lock().unwrap().clone();
-        let password = match password {
-            Some(p) => p,
-            None => return "Error: sudo detected but no password provider is configured.".into(),
-        };
-        match AskpassHelper::new(&password) {
-            Ok(helper) => {
-                askpass = Some(helper);
-                rewrite_sudo_for_askpass(&command)
-            }
-            Err(e) => return format!("Error preparing sudo askpass helper: {e}"),
+        match sudo_password_for(&ctx, host.as_deref()).await {
+            Ok(p) => password = Some(p),
+            Err(e) => return e,
         }
+        rewrite_sudo_for_askpass(&command)
     } else {
         command
+    };
+
+    match host {
+        Some(h) => {
+            let remote_cwd = cwd.filter(|c| !c.is_empty());
+            run_bash_remote(command, remote_cwd, password, h, ctx).await
+        }
+        None => run_bash_local(command, local_cwd, password, ctx).await,
+    }
+}
+
+async fn run_bash_local(
+    command: String,
+    run_cwd: Option<PathBuf>,
+    password: Option<String>,
+    ctx: Arc<ToolContext>,
+) -> String {
+    let timeout = timeout_secs();
+    let used_sudo = password.is_some();
+    let askpass = match password {
+        Some(ref pw) => match AskpassHelper::new(pw) {
+            Ok(helper) => Some(helper),
+            Err(e) => return format!("Error preparing sudo askpass helper: {e}"),
+        },
+        None => None,
     };
 
     let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("bash") {
@@ -1389,41 +1647,118 @@ async fn run_bash(
     // than an OS pipe buffer can otherwise block forever before it exits.
     let ctx_blocking = ctx.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let wait_result = if timeout > 0 {
-            match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
-                Ok(Some(status)) => Ok(status),
-                Ok(None) => {
-                    // Timed out — kill the process group
-                    terminate_process_group(pid);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    Err(format!("Error: Command timed out after {timeout} seconds"))
-                }
-                Err(e) => Err(format!("Error running command: {e}")),
-            }
-        } else {
-            child
-                .wait()
-                .map_err(|e| format!("Error running command: {e}"))
-        };
+        let wait_result = wait_child(&mut child, pid, timeout);
         ctx_blocking.unregister_process(pid);
 
-        let mut out = read_and_remove(&stdout_path);
+        let out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
-            let err = SUDO_PROMPT_RE.replace_all(&err, "").to_string();
-            if !err.is_empty() {
-                out.push('\n');
-                out.push_str(&err);
+            let mut out = join_command_output(out, &err, status);
+            if used_sudo {
+                out.push_str(&sudo_auth_failure_note(&ctx_blocking, None, &err));
             }
-            if !status.success() {
-                out.push_str(&format!("\n[Exit code: {}]", status.code().unwrap_or(-1)));
+            finish_command_output(out)
+        })
+    })
+    .await;
+    drop(askpass);
+
+    match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => e,
+        Err(join_err) => format!("Error: Task panicked: {join_err}"),
+    }
+}
+
+/// Run *command* on *host* through REMOTE_WRAPPER over ssh.
+async fn run_bash_remote(
+    command: String,
+    cwd: Option<String>,
+    password: Option<String>,
+    host: String,
+    ctx: Arc<ToolContext>,
+) -> String {
+    let timeout = timeout_secs();
+    let ssh = match find_in_path("ssh", std::env::var_os("PATH")) {
+        Some(p) => p,
+        None => {
+            return "Error: run_bash host= requires the `ssh` client, which was not found on PATH."
+                .into()
+        }
+    };
+    ignore_default_sigpipe();
+    let used_sudo = password.is_some();
+    let script = build_remote_script(&command, password.as_deref(), cwd.as_deref());
+    drop(password);
+
+    let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("bash") {
+        Ok(files) => files,
+        Err(e) => return format!("Error creating output files: {e}"),
+    };
+
+    let mut cmd = std::process::Command::new(&ssh);
+    cmd.args(remote_ssh_args(&host));
+    // stdin stays open for the whole run: its EOF is what tells the remote
+    // watcher to kill the command, so it is closed only once ssh has exited.
+    cmd.stdin(Stdio::piped());
+    // Output goes to files, and we wait on ssh itself rather than on output
+    // EOF: if some other process inherited the output (a ProxyCommand helper),
+    // EOF never comes while the channel stays open — a deadlock on Stop.
+    cmd.stdout(Stdio::from(stdout_file));
+    cmd.stderr(Stdio::from(stderr_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            remove_output_files(&stdout_path, &stderr_path);
+            return format!("Error running command on {host}: {e}");
+        }
+    };
+    let pid = child.id();
+    ctx.register_process(pid);
+
+    // Feed the script from a thread: a large command can exceed the pipe
+    // buffer.  The writer hands stdin back when done so it stays open until
+    // ssh exits; if ssh dies first the write just fails with EPIPE.
+    let (stdin_tx, stdin_rx) = std::sync::mpsc::channel();
+    if let Some(mut stdin) = child.stdin.take() {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(script.as_bytes());
+            let _ = stdin.flush();
+            let _ = stdin_tx.send(stdin);
+        });
+    }
+
+    let ctx_blocking = ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let wait_result = wait_child(&mut child, pid, timeout);
+        ctx_blocking.unregister_process(pid);
+        // Closing stdin ends the remote channel's input: the wrapper's watcher
+        // then kills the remote command if it is still running.  A writer
+        // still stuck after ssh exited keeps (and later drops) it itself.
+        if let Ok(stdin) = stdin_rx.recv_timeout(Duration::from_secs(5)) {
+            drop(stdin);
+        }
+
+        let out = read_and_remove(&stdout_path);
+        let err = read_and_remove(&stderr_path);
+        wait_result.map(|status| {
+            let mut out = join_command_output(out, &err, status);
+            if status.code() == Some(255) && SSH_FAILURE_RE.is_match(&err) {
+                out.push_str(&format!(
+                    "\n[ssh to {host} failed. run_bash host= requires key-based \
+                     login and an existing known_hosts entry]"
+                ));
             }
-            if out.is_empty() {
-                "(No output)".into()
-            } else {
-                snip_tool_output(out)
+            if used_sudo {
+                out.push_str(&sudo_auth_failure_note(&ctx_blocking, Some(&host), &err));
             }
+            finish_command_output(out)
         })
     })
     .await;
@@ -1432,6 +1767,52 @@ async fn run_bash(
         Ok(Ok(out)) => out,
         Ok(Err(e)) => e,
         Err(join_err) => format!("Error: Task panicked: {join_err}"),
+    }
+}
+
+/// Wait for a command's process group leader, killing the group on timeout.
+fn wait_child(
+    child: &mut std::process::Child,
+    pid: u32,
+    timeout: u64,
+) -> Result<std::process::ExitStatus, String> {
+    if timeout > 0 {
+        match wait_timeout_status(child, Duration::from_secs(timeout)) {
+            Ok(Some(status)) => Ok(status),
+            Ok(None) => {
+                // Timed out — kill the process group
+                terminate_process_group(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(format!("Error: Command timed out after {timeout} seconds"))
+            }
+            Err(e) => Err(format!("Error running command: {e}")),
+        }
+    } else {
+        child
+            .wait()
+            .map_err(|e| format!("Error running command: {e}"))
+    }
+}
+
+/// Append stderr (minus sudo prompt lines) and a non-zero exit code to stdout.
+fn join_command_output(mut out: String, err: &str, status: std::process::ExitStatus) -> String {
+    let err = SUDO_PROMPT_RE.replace_all(err, "");
+    if !err.is_empty() {
+        out.push('\n');
+        out.push_str(&err);
+    }
+    if !status.success() {
+        out.push_str(&format!("\n[Exit code: {}]", status.code().unwrap_or(-1)));
+    }
+    out
+}
+
+fn finish_command_output(out: String) -> String {
+    if out.is_empty() {
+        "(No output)".into()
+    } else {
+        snip_tool_output(out)
     }
 }
 
@@ -3058,7 +3439,7 @@ mod tests {
 
     static TEST_TOOL_TIMEOUT_LOCK: Lazy<TestMutex<()>> = Lazy::new(|| TestMutex::new(()));
 
-    fn test_tool_timeout_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn test_tool_timeout_guard() -> std::sync::MutexGuard<'static, ()> {
         TEST_TOOL_TIMEOUT_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3140,8 +3521,8 @@ mod tests {
     #[tokio::test]
     async fn sudo_requires_explicit_elevation_without_prompting() {
         let ctx = Arc::new(ToolContext::new());
-        ctx.set_sudo_provider(Some(Box::new(|| panic!("must not prompt"))));
-        let result = run_bash("sudo true".into(), None, false, ctx).await;
+        ctx.set_sudo_provider(Some(Box::new(|_| panic!("must not prompt"))));
+        let result = run_bash("sudo true".into(), None, false, None, ctx).await;
         assert!(result.contains("Elevation required"));
     }
 
@@ -3170,14 +3551,14 @@ mod tests {
             ready_rx.await.unwrap();
             tokio::task::yield_now().await;
             let ctx = Arc::new(ToolContext::new());
-            ctx.set_sudo_provider(Some(Box::new(move || {
+            ctx.set_sudo_provider(Some(Box::new(move |_| {
                 notify_tx.send_replace(1);
                 if woke_rx.lock().unwrap().recv_timeout(Duration::from_secs(3)).is_ok() {
                     saw_wake_provider.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 None
             })));
-            run_bash("sudo true".into(), None, true, ctx).await
+            run_bash("sudo true".into(), None, true, None, ctx).await
         })
         .await
         .unwrap();
@@ -3353,7 +3734,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         let old = *TOOL_TIMEOUT.lock().unwrap();
         *TOOL_TIMEOUT.lock().unwrap() = 1;
-        let result = run_bash("sleep 5".into(), None, false, Arc::new(ToolContext::new())).await;
+        let result = run_bash("sleep 5".into(), None, false, None, Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Command timed out after 1 seconds"));
     }
@@ -3365,6 +3746,7 @@ mod tests {
             "touch marker.txt && ls".into(),
             Some(dir.path().to_str().unwrap().to_string()),
             false,
+            None,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3378,6 +3760,7 @@ mod tests {
             "head -c 4000 /dev/urandom".into(),
             None,
             false,
+            None,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3394,6 +3777,7 @@ mod tests {
             r"printf '\xff\xfe\xfd\xfc'".into(),
             None,
             false,
+            None,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3406,6 +3790,7 @@ mod tests {
             "pwd".into(),
             Some("/nonexistent_dir_xyz".into()),
             false,
+            None,
             Arc::new(ToolContext::new()),
         )
         .await;
@@ -3485,9 +3870,9 @@ mod tests {
     fn tool_context_sudo_provider_is_per_context() {
         let ctx_a = ToolContext::new();
         let ctx_b = ToolContext::new();
-        ctx_a.set_sudo_provider(Some(Box::new(|| Some("pw-a".into()))));
-        ctx_b.set_sudo_provider(Some(Box::new(|| Some("pw-b".into()))));
-        let call = |c: &ToolContext| c.sudo_provider.lock().unwrap().as_ref().unwrap()();
+        ctx_a.set_sudo_provider(Some(Box::new(|_| Some("pw-a".into()))));
+        ctx_b.set_sudo_provider(Some(Box::new(|_| Some("pw-b".into()))));
+        let call = |c: &ToolContext| c.sudo_provider.lock().unwrap().as_ref().unwrap()(None);
         assert_eq!(call(&ctx_a), Some("pw-a".to_string()));
         assert_eq!(call(&ctx_b), Some("pw-b".to_string()));
     }
@@ -3496,10 +3881,14 @@ mod tests {
     fn cached_sudo_password_not_shared() {
         let ctx_a = ToolContext::new();
         let ctx_b = ToolContext::new();
-        *ctx_a.cached_sudo_password.lock().unwrap() = Some("secret".into());
-        assert!(ctx_b.cached_sudo_password.lock().unwrap().is_none());
+        ctx_a
+            .cached_sudo_passwords
+            .lock()
+            .unwrap()
+            .insert(None, "secret".into());
+        assert!(ctx_b.cached_sudo_passwords.lock().unwrap().is_empty());
         ctx_a.clear_sudo();
-        assert!(ctx_a.cached_sudo_password.lock().unwrap().is_none());
+        assert!(ctx_a.cached_sudo_passwords.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3507,7 +3896,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         // A context with no provider must refuse sudo regardless of any other.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("sudo true".into(), None, true, ctx).await;
+        let result = run_bash("sudo true".into(), None, true, None, ctx).await;
         assert!(result.contains("no password provider"));
     }
 
@@ -3518,7 +3907,7 @@ mod tests {
         // silent no-op (ran unprivileged, no prompt, no error). It must fail
         // loudly, and must NOT run the command.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("echo should-not-run".into(), None, true, ctx).await;
+        let result = run_bash("echo should-not-run".into(), None, true, None, ctx).await;
         assert!(result.contains("elevated=true"), "{result:?}");
         assert!(result.contains("does not invoke sudo"), "{result:?}");
         assert!(!result.contains("should-not-run"), "command ran: {result:?}");
@@ -3530,7 +3919,7 @@ mod tests {
         // A quoted/comment mention of sudo is data, not an invocation: it must
         // not satisfy elevated=true.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("echo 'sudo apt update'".into(), None, true, ctx).await;
+        let result = run_bash("echo 'sudo apt update'".into(), None, true, None, ctx).await;
         assert!(result.contains("does not invoke sudo"), "{result:?}");
         assert!(!result.contains("apt update"), "command ran: {result:?}");
     }
@@ -3540,7 +3929,7 @@ mod tests {
         let _guard = test_tool_timeout_guard();
         // Regression guard: ordinary (non-elevated) commands are unaffected.
         let ctx = Arc::new(ToolContext::new());
-        let result = run_bash("echo hello-plain".into(), None, false, ctx).await;
+        let result = run_bash("echo hello-plain".into(), None, false, None, ctx).await;
         assert!(result.contains("hello-plain"), "{result:?}");
     }
 
@@ -3572,7 +3961,7 @@ mod tests {
         std::env::set_var("PATH", format!("{}:{old_path}", dir.path().display()));
 
         let ctx = Arc::new(ToolContext::new());
-        ctx.set_sudo_provider(Some(Box::new(|| Some("s3cret".to_string()))));
+        ctx.set_sudo_provider(Some(Box::new(|_| Some("s3cret".to_string()))));
 
         // Shapes the old stdin-piped `sudo -S` broke on.
         for command in [
@@ -3582,7 +3971,7 @@ mod tests {
             "sudo echo hi < /dev/null",
             "sudo -S echo hi",
         ] {
-            let result = run_bash(command.into(), None, true, ctx.clone()).await;
+            let result = run_bash(command.into(), None, true, None, ctx.clone()).await;
             assert!(result.contains("pw=s3cret"), "{command:?} -> {result:?}");
             assert!(
                 !result.contains("no tty present"),
@@ -5103,4 +5492,448 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
         .collect();
 
     lines.join("\n")
+}
+
+/// run_bash(host=...) — remote execution and remote sudo escalation.
+///
+/// A stub `ssh` on PATH stands in for the real client: it records its argv and
+/// runs the `sh -s` wrapper locally in a separate session.  That mirrors the
+/// real process topology — killing the local "ssh" (Stop/timeout) does not
+/// signal the "remote" shell directly; only the closed stdin channel reaches
+/// it — so the wrapper's cleanup and kill paths are exercised honestly.
+/// Mirrors Python's TestRemoteRunBash — keep in sync.
+#[cfg(all(test, unix))]
+mod remote_tests {
+    use super::tests::test_tool_timeout_guard;
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Remote {
+        dir: tempfile::TempDir,
+        argv_log: PathBuf,
+        runtime: PathBuf,
+        old_path: String,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Remote {
+        fn drop(&mut self) {
+            std::env::set_var("PATH", &self.old_path);
+        }
+    }
+
+    fn write_exec(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn remote() -> Remote {
+        let guard = test_tool_timeout_guard();
+        let dir = tempfile::Builder::new()
+            .prefix("pengy-remote-test-")
+            .tempdir()
+            .unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let argv_log = dir.path().join("ssh-argv");
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_exec(
+            &bin.join("ssh"),
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$@\" > '{}'\n\
+                 export XDG_RUNTIME_DIR='{}'\n\
+                 while [ \"$1\" != \"--\" ]; do shift; done\n\
+                 shift 2\n\
+                 exec 3<&0\n\
+                 setsid \"$@\" <&3 3<&- &\n\
+                 exec 3<&-\n\
+                 wait \"$!\"\n",
+                argv_log.display(),
+                runtime.display()
+            ),
+        );
+        // Stub sudo: succeeds only via -A with a working askpass; a password
+        // of "wrong" reproduces classic sudo's failed-auth output.
+        write_exec(
+            &bin.join("sudo"),
+            "#!/bin/bash\n\
+             if [ \"$1\" != \"-A\" ]; then echo \"sudo: a terminal is required\" >&2; exit 1; fi\n\
+             shift\n\
+             pw=\"$(\"$SUDO_ASKPASS\")\"\n\
+             if [ \"$pw\" = wrong ]; then echo \"Sorry, try again.\" >&2; \
+             echo \"sudo: 3 incorrect password attempts\" >&2; exit 1; fi\n\
+             echo \"pw=$pw\"\n\
+             exec \"$@\"\n",
+        );
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+        Remote {
+            dir,
+            argv_log,
+            runtime,
+            old_path,
+            _guard: guard,
+        }
+    }
+
+    fn runtime_entries(r: &Remote) -> usize {
+        std::fs::read_dir(&r.runtime).unwrap().count()
+    }
+
+    /// A context whose provider records each prompt's host and answers from
+    /// `passwords` (default "s3cret").
+    fn ctx_with(
+        passwords: &[(Option<&str>, &str)],
+    ) -> (Arc<ToolContext>, Arc<Mutex<Vec<Option<String>>>>) {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let map: HashMap<Option<String>, String> = passwords
+            .iter()
+            .map(|(h, p)| (h.map(String::from), p.to_string()))
+            .collect();
+        let ctx = Arc::new(ToolContext::new());
+        let log = prompts.clone();
+        ctx.set_sudo_provider(Some(Box::new(move |host| {
+            log.lock().unwrap().push(host.map(String::from));
+            Some(
+                map.get(&host.map(String::from))
+                    .cloned()
+                    .unwrap_or_else(|| "s3cret".into()),
+            )
+        })));
+        (ctx, prompts)
+    }
+
+    async fn run(ctx: &Arc<ToolContext>, args: serde_json::Value) -> String {
+        execute_tool("run_bash", &args, ctx).await
+    }
+
+    #[tokio::test]
+    async fn host_validation_rejects_injection() {
+        let r = remote();
+        let (ctx, prompts) = ctx_with(&[]);
+        for host in ["-oProxyCommand=touch /tmp/x", "a b", "a;b", "`id`", "$(id)", "a/b", "'q'"] {
+            let result = run(
+                &ctx,
+                serde_json::json!({"command": "sudo true", "elevated": true, "host": host}),
+            )
+            .await;
+            assert!(result.starts_with("Error: invalid host"), "{host} -> {result}");
+        }
+        assert!(prompts.lock().unwrap().is_empty());
+        assert!(!r.argv_log.exists());
+    }
+
+    #[test]
+    fn host_validation_accepts_ssh_destinations() {
+        for host in ["web1", "pat@web1.lan", "web-1.example.com", "::1", "fe80::1%eth0"] {
+            assert!(validate_host(host).is_none(), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_argv() {
+        let r = remote();
+        let ctx = Arc::new(ToolContext::new());
+        run(&ctx, serde_json::json!({"command": "true", "host": "web1"})).await;
+        let argv = std::fs::read_to_string(&r.argv_log).unwrap();
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(&argv[argv.len() - 4..], ["--", "web1", "sh", "-s"]);
+        assert!(argv.contains(&"-T") && argv.contains(&"BatchMode=yes"));
+    }
+
+    #[tokio::test]
+    async fn unelevated_remote_command() {
+        let r = remote();
+        let ctx = Arc::new(ToolContext::new());
+        let cwd = r.dir.path().to_str().unwrap();
+        let result = run(
+            &ctx,
+            serde_json::json!({
+                "command": "pwd; echo \"askpass=${SUDO_ASKPASS:-none}\"; cat; echo stdin-closed; exit 7",
+                "cwd": cwd, "host": "web1",
+            }),
+        )
+        .await;
+        assert!(result.contains(cwd), "{result}");
+        assert!(result.contains("askpass=none"), "{result}");
+        assert!(result.contains("stdin-closed"), "{result}");
+        assert!(result.contains("[Exit code: 7]"), "{result}");
+        assert_eq!(runtime_entries(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_cwd_failure() {
+        let _r = remote();
+        let ctx = Arc::new(ToolContext::new());
+        let result = run(
+            &ctx,
+            serde_json::json!({"command": "pwd", "cwd": "/nonexistent_dir_xyz", "host": "web1"}),
+        )
+        .await;
+        assert!(result.contains("[Exit code: 126]"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn elevation_rules_apply_to_remote() {
+        let _r = remote();
+        let (ctx, prompts) = ctx_with(&[]);
+        assert!(run(&ctx, serde_json::json!({"command": "sudo true", "host": "web1"}))
+            .await
+            .contains("Elevation required"));
+        assert!(run(
+            &ctx,
+            serde_json::json!({"command": "echo 'sudo true'", "elevated": true, "host": "web1"})
+        )
+        .await
+        .contains("does not invoke sudo"));
+        assert!(run(
+            &ctx,
+            serde_json::json!({"command": "ssh web1 sudo true", "elevated": true})
+        )
+        .await
+        .contains("does not invoke sudo"));
+        assert!(prompts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_sudo_delivers_password_without_leaking() {
+        let r = remote();
+        let password = "p'a$s w\"d\\x";
+        let (ctx, prompts) = ctx_with(&[(Some("web1"), password)]);
+        for command in [
+            "sudo echo hi",
+            "echo a; cat > /dev/null; sudo echo hi",
+            "sudo echo one; sudo echo two",
+            "echo x | sudo cat",
+            "sudo -S echo hi",
+        ] {
+            let result = run(
+                &ctx,
+                serde_json::json!({"command": command, "elevated": true, "host": "web1"}),
+            )
+            .await;
+            assert!(result.contains(&format!("pw={password}")), "{command} -> {result}");
+            assert!(!result.contains("terminal is required"), "{command} -> {result}");
+        }
+        let result = run(
+            &ctx,
+            serde_json::json!({"command": "sudo env", "elevated": true, "host": "web1"}),
+        )
+        .await;
+        // Only the stub's pw= line, never the environment.
+        assert_eq!(result.matches(password).count(), 1, "{result}");
+        assert_eq!(*prompts.lock().unwrap(), vec![Some("web1".to_string())]);
+        assert_eq!(runtime_entries(&r), 0);
+        assert!(!std::fs::read_to_string(&r.argv_log).unwrap().contains(password));
+    }
+
+    #[tokio::test]
+    async fn passwords_are_cached_per_host() {
+        let _r = remote();
+        let (ctx, prompts) = ctx_with(&[(Some("web1"), "pw-web1"), (Some("db2"), "pw-db2")]);
+        let args = |h: &str| serde_json::json!({"command": "sudo true", "elevated": true, "host": h});
+        let r1 = run(&ctx, args("web1")).await;
+        let r2 = run(&ctx, args("db2")).await;
+        let r3 = run(&ctx, args("web1")).await;
+        assert!(r1.contains("pw=pw-web1") && r2.contains("pw=pw-db2") && r3.contains("pw=pw-web1"));
+        assert_eq!(
+            *prompts.lock().unwrap(),
+            vec![Some("web1".to_string()), Some("db2".to_string())]
+        );
+        ctx.clear_sudo();
+        assert!(ctx.cached_sudo_passwords.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_prompt_is_keyed_separately() {
+        let _r = remote();
+        let (ctx, prompts) = ctx_with(&[(None, "local-pw"), (Some("web1"), "remote-pw")]);
+        assert!(run(&ctx, serde_json::json!({"command": "sudo true", "elevated": true}))
+            .await
+            .contains("pw=local-pw"));
+        assert!(run(
+            &ctx,
+            serde_json::json!({"command": "sudo true", "elevated": true, "host": "web1"})
+        )
+        .await
+        .contains("pw=remote-pw"));
+        assert_eq!(*prompts.lock().unwrap(), vec![None, Some("web1".to_string())]);
+    }
+
+    async fn auth_failure_evicts_only_that_host(host: Option<&str>) {
+        let _r = remote();
+        let (ctx, prompts) = ctx_with(&[(host, "wrong")]);
+        ctx.cached_sudo_passwords
+            .lock()
+            .unwrap()
+            .insert(Some("other".into()), "fine".into());
+        let mut args = serde_json::json!({"command": "sudo true", "elevated": true});
+        if let Some(h) = host {
+            args["host"] = h.into();
+        }
+        let result = run(&ctx, args.clone()).await;
+        assert!(result.contains("sudo authentication failed"), "{result}");
+        {
+            let cache = ctx.cached_sudo_passwords.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.get(&Some("other".to_string())).map(String::as_str), Some("fine"));
+        }
+        run(&ctx, args).await;
+        // Re-prompted, not replayed.
+        let want = vec![host.map(String::from), host.map(String::from)];
+        assert_eq!(*prompts.lock().unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn local_auth_failure_evicts_only_local() {
+        auth_failure_evicts_only_that_host(None).await;
+    }
+
+    #[tokio::test]
+    async fn remote_auth_failure_evicts_only_that_host() {
+        auth_failure_evicts_only_that_host(Some("web1")).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_kills_remote_command_and_cleans_up() {
+        let r = remote();
+        let (ctx, _prompts) = ctx_with(&[]);
+        let marker = r.dir.path().join("remote-pid");
+        let start = Instant::now();
+        let task = {
+            let ctx = ctx.clone();
+            let command = format!("sudo sh -c 'echo $$ > {}; exec sleep 30'", marker.display());
+            tokio::spawn(async move {
+                execute_tool(
+                    "run_bash",
+                    &serde_json::json!({"command": command, "elevated": true, "host": "web1"}),
+                    &ctx,
+                )
+                .await
+            })
+        };
+        for _ in 0..100 {
+            if std::fs::read_to_string(&marker).map(|s| !s.trim().is_empty()).unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(runtime_entries(&r) > 0, "askpass dir should exist mid-run");
+        ctx.kill_all();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run_bash did not return after Stop")
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10));
+        let pid: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+        let mut alive = true;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("remote command survived Stop");
+        }
+        for _ in 0..100 {
+            if runtime_entries(&r) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(runtime_entries(&r), 0, "askpass dir leaked after Stop");
+    }
+
+    #[test]
+    fn missing_ssh_client() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(find_in_path("ssh", Some(empty.path().as_os_str().to_owned())).is_none());
+        assert!(find_in_path("ssh", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_connection_failure_hint() {
+        let r = remote();
+        write_exec(
+            &r.dir.path().join("bin").join("ssh"),
+            "#!/bin/sh\necho 'user@web1: Permission denied (publickey).' >&2\nexit 255\n",
+        );
+        let ctx = Arc::new(ToolContext::new());
+        let result = run(&ctx, serde_json::json!({"command": "true", "host": "web1"})).await;
+        assert!(result.contains("ssh to web1 failed"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn large_command_does_not_deadlock() {
+        let _r = remote();
+        let ctx = Arc::new(ToolContext::new());
+        let payload = "x".repeat(100_000);
+        let result = run(
+            &ctx,
+            serde_json::json!({"command": format!("printf %s {payload} | wc -c"), "host": "web1"}),
+        )
+        .await;
+        assert!(result.contains("100000"), "{result}");
+    }
+
+    #[test]
+    fn wrapper_parses_under_sh() {
+        let script = build_remote_script("echo 'hi'\nsudo -A true", Some("a'b\"c$d\\e\nf"), Some("/tmp"));
+        let mut child = std::process::Command::new("sh")
+            .arg("-n")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn placeholder_text_in_values_is_not_substituted() {
+        let script = build_remote_script("echo __CWD__", Some("__COMMAND__ x"), Some("/a b"));
+        assert!(script.contains("\npw='__COMMAND__ x'\n"), "{script}");
+        assert!(script.contains("\ncmd='echo __CWD__'\n"), "{script}");
+        assert!(script.contains("\ncwd='/a b'\n"), "{script}");
+    }
+
+    #[test]
+    fn shell_quote_matches_shlex() {
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("/tmp/a-b_c.d"), "/tmp/a-b_c.d");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
+    }
+
+    /// The wrapper must stay byte-identical across the Python, Rust and C++
+    /// editions; this is the SHA-256 of Python's `_REMOTE_WRAPPER`.
+    #[test]
+    fn wrapper_matches_other_editions() {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(REMOTE_WRAPPER.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "75d7e71ce303efd968769a96b9eb433eb9841ba446a363b718b33d54b6ac0fca");
+    }
+
+    #[tokio::test]
+    async fn real_ssh_host() {
+        let Ok(host) = std::env::var("PENGY_TEST_SSH_HOST") else {
+            return; // set PENGY_TEST_SSH_HOST to a key-auth ssh host
+        };
+        let ctx = Arc::new(ToolContext::new());
+        let result = run(
+            &ctx,
+            serde_json::json!({
+                "command": "echo remote-ok; echo \"${SUDO_ASKPASS:-none}\"; yes | head -1",
+                "host": host,
+            }),
+        )
+        .await;
+        assert!(result.contains("remote-ok") && result.contains("none"), "{result}");
+    }
 }

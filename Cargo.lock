@@ -1785,6 +1785,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "image",
+ "libc",
  "once_cell",
  "primp",
  "rand 0.8.6",

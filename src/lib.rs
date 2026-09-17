@@ -305,6 +305,9 @@ pub struct SudoState {
     /// 0 = idle, 1 = pending, 2 = provided, 3 = cancelled
     pub status: i32,
     pub password: [u8; 256],
+    /// Host the prompt is for, NUL-terminated; empty = the local machine.
+    /// Written by the worker before it sets status=1.
+    pub host: [u8; 256],
 }
 
 /// Shared question state between QThread and Qt main thread.
@@ -361,9 +364,16 @@ pub extern "C" fn pengy_llm_chat_run(
     // another's provider or cached password.
     if !sudo_state.is_null() {
         let sudo_ptr = sudo_state as usize; // safe to send across threads
-        tool_ctx.set_sudo_provider(Some(Box::new(move || {
+        tool_ctx.set_sudo_provider(Some(Box::new(move |host: Option<&str>| {
             let state = sudo_ptr as *mut SudoState;
             unsafe {
+                // Host names are validated ssh destinations (plain ASCII);
+                // truncation only affects the prompt text.
+                let bytes = host.unwrap_or("").as_bytes();
+                let len = bytes.len().min((*state).host.len() - 1);
+                let buf = &mut (*state).host;
+                buf[..len].copy_from_slice(&bytes[..len]);
+                buf[len] = 0;
                 std::ptr::write_volatile(&mut (*state).status, 1);
             } // pending
               // Busy-wait for Qt main thread to respond

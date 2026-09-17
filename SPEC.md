@@ -367,7 +367,7 @@ The server prints its URL on startup; it does not auto-open a browser.
 | `tool_request` | `name`, `args`, `auto_approved` | Append tool card; if not auto-approved, show confirmation modal |
 | `tool_result` | `content`, `declined` | Update tool card body and badge |
 | `final_response` | `html`, `usage`, `cumulative_usage` | Append assistant bubble; `cumulative_usage` (running total across the chat, via `chat_manager::add_usage`) updates the navbar token badge |
-| `sudo_request` | — | Show sudo password modal |
+| `sudo_request` | `host` (string, or null for local) | Show sudo password modal naming the host |
 | `error` | `message` | Append error alert, re-enable input |
 | `keepalive` | — | SSE comment (`: keepalive`); browser ignores |
 
@@ -552,7 +552,7 @@ All 16 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 | `write_file` | ❌ | Write content to a file (creates parent dirs). |
 | `replace_in_file` | ❌ | Exact string replacement; must match exactly once. |
 | `apply_changes` | ❌ | Transactional multi-file exact-text edits; all-or-nothing, `dry_run` diff preview. |
-| `run_bash` | ❌ | Execute a bash command (optional `cwd`; sudo via `SUDO_ASKPASS` with cached password). |
+| `run_bash` | ❌ | Execute a bash command (optional `cwd`; optional `host` runs it over ssh; sudo via `SUDO_ASKPASS` with passwords cached per host). |
 | `run_python` | ❌ | Write code to temp file and execute with `python3` (optional `cwd`). |
 | `web_search` | ✅ | DuckDuckGo search via `primp` (browser-impersonating HTTP, 5s timeout). |
 | `download_file` | ❌ | Stream a file to a configurable directory (default `~/Downloads/`) with configurable size limits. |
@@ -649,6 +649,8 @@ build_windows.bat
 **Non-streaming API calls:** The LLM client uses non-streaming completions (no `stream: true`). Full responses render at once. This simplifies the architecture and is acceptable because tool call round-trips dominate latency for agentic workflows.
 
 **Sudo via `SUDO_ASKPASS`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, then rewrite every `sudo` to `sudo -A` and supply the password through a temp `SUDO_ASKPASS` script that echoes an environment variable. Password cached in memory for the duration of the LLM run. No PTY complexity. See Python Pengy's spec for why this replaced piping the password to stdin with a single `sudo -S` rewrite: that broke on pipelines, redirects, earlier stdin readers, and any second `sudo`.
+
+**Remote sudo (`run_bash` `host`):** Ported from Python Pengy (see its spec, "Remote sudo", for the full rationale). With `host` set, the command runs over `ssh -T -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -- <host> sh -s`, and the remote wrapper script (`REMOTE_WRAPPER` / `kRemoteWrapper`, byte-identical across editions — a test pins its SHA-256) is written to ssh's stdin with the password, command and cwd substituted as POSIX single-quoted literals in a single pass. Nothing sensitive is on any argv; the wrapper recreates the askpass helper on the remote side and removes it on exit. Pengy never infers a host from `ssh …` text; hosts must match `[A-Za-z0-9._@:%-]+` without a leading `-`. The elevation rules and `sudo -A` rewrite are unchanged. The sudo provider receives the host (`Option<&str>`, `None` = local; the GUI receives it through `SudoState.host`) so every frontend's prompt names the machine; passwords are cached per host and a failed sudo authentication (classic sudo or sudo-rs wording, local or remote) evicts that host's entry. Stop: ssh runs in its own process group registered with the `ToolContext`, and Rust waits on the ssh process (output goes to temp files, never pipes) rather than on output EOF. The script is fed from a writer thread that hands `ChildStdin` back when done; it is dropped only after ssh exits, which is what closes the remote channel and fires the wrapper's watcher. Because the Qt GUI links the core into a C++ `main` (where SIGPIPE is not ignored), `ignore_default_sigpipe()` replaces a *default* SIGPIPE action with `SIG_IGN` before the first remote run so a write to a dead ssh fails with EPIPE instead of killing the app. Exit 255 with ssh's own error text gets a key-auth/known_hosts hint appended.
 
 **System message templating at send time:** Templates are resolved fresh on every send so `{date}` is always accurate regardless of when the config was saved.
 

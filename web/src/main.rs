@@ -338,7 +338,10 @@ enum SseEvent {
         /// more useful signal than the last turn alone.
         cumulative_usage: llm_client::Usage,
     },
-    SudoRequest,
+    /// `host` is the remote machine the command runs on; `None` = local.
+    SudoRequest {
+        host: Option<String>,
+    },
     QuestionRequest {
         name: String,
         args: serde_json::Value,
@@ -433,7 +436,14 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
                 f
             }
         }
-        "run_bash" => val("command"),
+        "run_bash" => {
+            let host = val("host");
+            if host.is_empty() {
+                val("command")
+            } else {
+                format!("{host}: {}", val("command"))
+            }
+        }
         "run_python" => val("code"),
         "search_content" | "glob" => {
             let p = val("pattern");
@@ -531,7 +541,9 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             },
         })
         .to_string(),
-        SseEvent::SudoRequest => r#"{"type":"sudo_request"}"#.to_string(),
+        SseEvent::SudoRequest { host } => {
+            serde_json::json!({"type": "sudo_request", "host": host}).to_string()
+        }
         SseEvent::QuestionRequest {
             name,
             args,
@@ -625,11 +637,13 @@ impl WebWorker {
             let events_sudo = events.clone();
             let event_count_tx_sudo = event_count_tx.clone();
             let sudo_state_provider = sudo_state.clone();
-            tool_ctx.set_sudo_provider(Some(Box::new(move || {
+            tool_ctx.set_sudo_provider(Some(Box::new(move |host: Option<&str>| {
                 let count;
                 {
                     let mut ev = events_sudo.lock().unwrap();
-                    ev.push(SseEvent::SudoRequest);
+                    ev.push(SseEvent::SudoRequest {
+                        host: host.map(String::from),
+                    });
                     count = ev.len();
                 }
                 event_count_tx_sudo.send_replace(count);
@@ -2982,7 +2996,7 @@ mod templates {
     <div class="modal-content">
       <div class="modal-header">
         <h6 class="modal-title">
-          <i class="bi bi-shield-lock text-warning me-2"></i>sudo password
+          <i class="bi bi-shield-lock text-warning me-2"></i>sudo password<span id="sudoHost"></span>
         </h6>
       </div>
       <div class="modal-body">
@@ -3182,7 +3196,7 @@ function toolSummary(name, args) {{
   if (['read_file','write_file','replace_in_file','directory_tree'].includes(name)) s = val('path');
   else if (name === 'read_multiple_files') s = Array.isArray(args.paths) ? `${{args.paths.length}} files` : '';
   else if (name === 'web_search') s = val('query'); else if (name === 'fetch_url') s = val('url');
-  else if (name === 'download_file') s = val('filename') || val('url'); else if (name === 'run_bash') s = val('command'); else if (name === 'run_python') s = val('code');
+  else if (name === 'download_file') s = val('filename') || val('url'); else if (name === 'run_bash') s = (val('host') ? `${{val('host')}}: ` : '') + val('command'); else if (name === 'run_python') s = val('code');
   else if (['search_content','glob'].includes(name)) s = val('pattern') + (val('path') ? ` in ${{val('path')}}` : '');
   else if (name === 'apply_changes') s = Array.isArray(args.changes) ? `${{args.changes.length}} files` : '';
   else if (name === 'ask_user_question') s = Array.isArray(args.questions) ? `${{args.questions.length}} questions` : '';
@@ -3710,6 +3724,8 @@ function handleEvent(data) {{
     case 'sudo_request':
       hideThinking();
       document.getElementById('sudoPasswordInput').value = '';
+      // textContent, never innerHTML: the host string comes from the model.
+      document.getElementById('sudoHost').textContent = data.host ? ` for ${{data.host}}` : '';
       sudoModal.show();
       setTimeout(() => document.getElementById('sudoPasswordInput').focus(), 300);
       break;
@@ -4316,7 +4332,7 @@ mod tests {
     #[tokio::test]
     async fn async_stream_replays_from_start_index_and_ends_when_done() {
         let events = Arc::new(Mutex::new(vec![
-            SseEvent::SudoRequest,
+            SseEvent::SudoRequest { host: None },
             SseEvent::FinalResponse {
                 html: "<p>hi</p>".into(),
                 usage: llm_client::Usage {
@@ -4349,7 +4365,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             {
                 let mut ev = events2.lock().unwrap();
-                ev.push(SseEvent::SudoRequest);
+                ev.push(SseEvent::SudoRequest { host: None });
             }
             let _ = tx.send(1);
         });
@@ -4643,6 +4659,21 @@ mod tests {
     }
 
     #[test]
+    fn sudo_request_event_names_host() {
+        let remote: serde_json::Value = serde_json::from_str(&sse_event_to_json(
+            &SseEvent::SudoRequest {
+                host: Some("web1".into()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(remote, serde_json::json!({"type": "sudo_request", "host": "web1"}));
+        let local: serde_json::Value =
+            serde_json::from_str(&sse_event_to_json(&SseEvent::SudoRequest { host: None }))
+                .unwrap();
+        assert_eq!(local, serde_json::json!({"type": "sudo_request", "host": null}));
+    }
+
+    #[test]
     fn tool_summary_redacts_and_bounds_arguments() {
         assert_eq!(
             tool_summary("read_file", &serde_json::json!({"path": "/tmp/x"})),
@@ -4651,6 +4682,10 @@ mod tests {
         assert_eq!(
             tool_summary("custom", &serde_json::json!({"api_key": "secret"})),
             ""
+        );
+        assert_eq!(
+            tool_summary("run_bash", &serde_json::json!({"command": "uptime", "host": "web1"})),
+            "web1: uptime"
         );
         assert!(
             tool_summary("run_bash", &serde_json::json!({"command": "x".repeat(200)}))

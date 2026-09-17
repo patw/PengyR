@@ -27,6 +27,10 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = "0.48"
 
+# SIGPIPE control for run_bash host= (see tools::ignore_default_sigpipe)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -26,6 +26,8 @@ public:
     void sendConfirmation(bool confirmed, bool yoloTurn);
 
     bool isSudoPending() const { return m_sudoState.status == 1; }
+    /// Host the pending sudo prompt is for; empty for the local machine.
+    QString sudoHost() const { return QString::fromUtf8(m_sudoState.host); }
     void sendSudoPassword(const QString& password);
     void cancelSudo();
 
