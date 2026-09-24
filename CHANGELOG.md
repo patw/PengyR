@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.9.2
+
+- **Restore Linux downloads.** The v1.9.1 Linux release job built the .deb but failed before uploading either Linux asset because linuxdeploy-plugin-qt could not find `qmlimportscanner`. Install `qt6-declarative-dev-tools` on the release runner, then rebuild and upload the AppImage and .deb together. The v1.9.1 tag remains unchanged.
+
 ## v1.9.1
 
 - **Recover from aggregate context-limit errors without rerunning tools.** Explicit provider context-overflow responses (HTTP 400/413/422 with recognized code or message) trigger at most four request-only tool-result reductions: retain head/tail previews first, then stub older results, protecting the latest tool result until necessary. Full tool events and saved history stay intact, including assistant calls and matching tool IDs. The CLI, GUI, and web surface `context_compacted` progress. Stub-server tests cover successful recovery, original history, no repeated tools, unrelated 400s, and failures with no eligible tool output. The per-tool output cap remains a separate safety limit; proactive aggregate budgeting is not part of this release.
@@ -11,7 +15,6 @@
   startup aborted. The package now patches the Wayland plugin RPATHs, bundles
   the complete Qt Wayland library family (including EGL hardware integration),
   and verifies both conditions during the build.
-- **Linux AppImage packaging:** install Qt's `qmlimportscanner` on the release runner; the Qt linuxdeploy plugin requires it after deploying the Wayland runtime.
 - **CI cache isolation.** Separate Cargo cache keys for check, tests, and GUI prevent jobs with different profiles from sharing build outputs. The tests job now caches dependencies only (not compiled `target/ci` objects); prior Rust test jobs had spent over 45 minutes in the build/test step and timed out. The release workflow is unchanged.
 
 ## v1.9.0
