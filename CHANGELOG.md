@@ -11,6 +11,7 @@
   startup aborted. The package now patches the Wayland plugin RPATHs, bundles
   the complete Qt Wayland library family (including EGL hardware integration),
   and verifies both conditions during the build.
+- **Linux AppImage packaging:** install Qt's `qmlimportscanner` on the release runner; the Qt linuxdeploy plugin requires it after deploying the Wayland runtime.
 - **CI cache isolation.** Separate Cargo cache keys for check, tests, and GUI prevent jobs with different profiles from sharing build outputs. The tests job now caches dependencies only (not compiled `target/ci` objects); prior Rust test jobs had spent over 45 minutes in the build/test step and timed out. The release workflow is unchanged.
 
 ## v1.9.0
