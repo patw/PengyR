@@ -158,6 +158,12 @@ if(PENGY_BUILD_TESTS)
   target_include_directories(pengy_chatview_markdown_test PRIVATE ${CMAKE_SOURCE_DIR})
   add_test(NAME pengy_chatview_markdown_test COMMAND pengy_chatview_markdown_test)
 
+  add_executable(pengy_chatinput_test tests/test_chatinput_drop.cpp chatinput.cpp)
+  target_compile_definitions(pengy_chatinput_test PRIVATE PENGY_UNIT_TEST)
+  target_include_directories(pengy_chatinput_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_chatinput_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
+  add_test(NAME pengy_chatinput_test COMMAND pengy_chatinput_test)
+
   # chathistory.cpp calls into the Rust core (pengy_ffi.h), so this test
   # target needs the same platform-specific link set as the main `pengy`
   # target above, not just Qt.
