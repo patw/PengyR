@@ -20,10 +20,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            target/debug
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-check-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,16 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Cargo build data
+      # Cache downloads, not compiled target/ci outputs: the previously shared
+      # target cache made test jobs spend ~46 minutes rebuilding and time out.
+      - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-tests-deps-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-tests-deps-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -68,10 +69,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            target/ci
+          key: ${{ runner.os }}-cargo-gui-ci-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-gui-ci-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

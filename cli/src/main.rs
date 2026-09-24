@@ -531,6 +531,14 @@ impl PengyCli {
                     self.current_chat.as_mut().unwrap().messages.push(message);
                     self.save_progress();
                 }
+                Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed }) => {
+                    if expecting_api {
+                        eprint!("\r{}\r", " ".repeat(40));
+                    }
+                    expecting_api = true;
+                    eprintln!("{}Context limit — retrying with {} fewer tool-output characters ({}/{}){}",
+                        YELLOW, chars_removed, attempt, max_attempts, RESET);
+                }
                 Some(LlmEvent::Retrying {
                     attempt,
                     max_attempts,

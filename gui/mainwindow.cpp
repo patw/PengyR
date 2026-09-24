@@ -796,6 +796,15 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
     } else if (type == "error") {
         handleTurnError(session, event);
 
+    } else if (type == "context_compacted") {
+        if (session == tabForChat(m_activeChatId)) {
+            m_chatHistory->setRetrying(
+                QString("Context limit — retrying with %1 fewer tool-output characters (%2/%3)")
+                    .arg(event["chars_removed"].toInt())
+                    .arg(event["attempt"].toInt())
+                    .arg(event["max_attempts"].toInt()));
+        }
+
     } else if (type == "retrying") {
         // 429/529 backoff: surface it instead of hanging silently.
         if (session == tabForChat(m_activeChatId)) {

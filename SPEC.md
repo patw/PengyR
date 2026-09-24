@@ -9,7 +9,7 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 > **Canonical contracts live in the Python Pengy spec.** This document describes how *this*
 > edition is built. The cross-edition rules every Pengy must satisfy — on-disk formats, tool
 > contracts, and especially the **LLM Loop Contract** (message-ordering invariants, dangling
-> tool-call repair, context elision, retry/backoff) — are specified once in `Pengy/spec.md` and
+> tool-call repair, context elision, context-overflow recovery, retry/backoff) — are specified once in `Pengy/spec.md` and
 > are not repeated here. Read that first if you are porting Pengy to a new language.
 
 ---
@@ -643,6 +643,8 @@ build_windows.bat
 **Blocking LLM call on QThread:** Instead of the Python generator pattern, the Rust `pengy_llm_chat_run()` blocks the calling QThread until the conversation ends. Events are pushed via a C callback. Tool confirmation uses a shared struct + busy-wait (5ms spin) rather than a condition variable, because tokio async and blocking condvars don't compose well. The 5ms spin is negligible for an app that's already waiting on network I/O.
 
 **Qt native markdown instead of a markdown library:** Qt's `QTextBrowser` supports a subset of Markdown natively (bold, italic, links, code). Custom regex transforms add fenced code blocks, tables, and paragraph breaks. This avoids pulling in a Rust or C++ markdown library that would need to match Python's `markdown` + `pygments` output.
+
+**Context-overflow recovery:** `llm_client::chat` retries only explicit provider context-limit errors by compacting a private provider-request copy of tool results (up to four reductions, first head/tail previews and then stubs). Original tool events, persisted chat, matching tool IDs, and assistant tool calls stay intact; tools are not rerun. CLI, GUI, and web show `context_compacted` progress. This is separate from the configured per-tool cap and `context_keep_turns` elision, and does not proactively budget total tokens. See `Pengy/spec.md` for the shared policy.
 
 **Message schema compatibility:** Chat messages use the same JSON schema as Python Pengy — `{"role": "user", "content": "..."}`, `{"role": "assistant", "content": "...", "tool_calls": [...]}`, `{"role": "tool", "tool_call_id": "...", "content": "..."}`. The internal ChatView representation uses unified `tool_block` messages (combining request + result) for rendering, but the persisted format matches the Python version exactly.
 

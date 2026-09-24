@@ -81,6 +81,72 @@ const MAX_DELAY_SECS: f64 = 60.0;
 const JITTER: f64 = 0.25;
 const RETRYABLE_STATUSES: &[u16] = &[429, 529];
 
+// Context errors get size-reduction retries, never generic bad requests.
+const MAX_CONTEXT_RETRIES: u32 = 4;
+const CONTEXT_PREVIEW: usize = 1500;
+const CONTEXT_STUB: &str = "[tool output omitted from provider request to fit context; original remains in chat history]";
+const CONTEXT_ERROR_CODES: &[&str] = &[
+    "context_length_exceeded", "context_window_exceeded", "prompt_too_long",
+    "input_too_long", "max_context_length_exceeded", "token_limit_exceeded",
+];
+const CONTEXT_ERROR_PHRASES: &[&str] = &[
+    "context length", "context window", "context limit", "maximum context",
+    "prompt too long", "input too long", "too many tokens", "token limit exceeded",
+    "exceeds the model's context", "exceeds the model context",
+    "exceeds the context", "context size", "context_length_exceeded",
+    "exceeds the maximum allowed number of tokens", "maximum number of tokens",
+];
+
+fn is_context_limit_error(status: u16, body: &serde_json::Value, detail: &str) -> bool {
+    if !matches!(status, 400 | 413 | 422) {
+        return false;
+    }
+    let error = body.get("error").unwrap_or(body);
+    let codes = [error.get("code"), error.get("type"), body.get("code")];
+    if codes.iter().flatten().filter_map(|v| v.as_str()).any(|s|
+        CONTEXT_ERROR_CODES.contains(&s.to_ascii_lowercase().as_str())) {
+        return true;
+    }
+    let text = error.get("message").and_then(|v| v.as_str())
+        .or_else(|| error.as_str()).unwrap_or(detail).to_lowercase();
+    CONTEXT_ERROR_PHRASES.iter().any(|phrase| text.contains(phrase))
+}
+
+/// Compact only the provider copy. Keep the latest tool result when older
+/// candidates exist; a second failure replaces previews with short stubs.
+fn compact_tool_results(messages: &mut [ChatMessage], stage: u32) -> usize {
+    let newest = messages.iter().rposition(|m| m.role == "tool");
+    let eligible = |msg: &ChatMessage| {
+        let Some(text) = msg.content.as_ref().and_then(|v| v.as_str()) else { return false; };
+        msg.role == "tool" && !text.starts_with(CONTEXT_STUB)
+            && !text.starts_with("Tool execution was declined")
+            && !text.starts_with("User cancelled")
+            && text.chars().count() >= if stage == 1 { 2 * CONTEXT_PREVIEW + 200 } else { 256 }
+    };
+    let protect_newest = messages.iter().enumerate()
+        .any(|(i, m)| Some(i) != newest && eligible(m));
+    let mut saved = 0;
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if (protect_newest && Some(i) == newest) || !eligible(msg) { continue; }
+        let text = msg.content.as_ref().and_then(|v| v.as_str()).unwrap();
+        let chars = text.chars().count();
+        let replacement = if stage == 1 {
+            format!("{}\n\n[... {} characters omitted from provider request; original remains in chat history ...]\n\n{}",
+                text.chars().take(CONTEXT_PREVIEW).collect::<String>(),
+                chars - 2 * CONTEXT_PREVIEW,
+                text.chars().skip(chars - CONTEXT_PREVIEW).collect::<String>())
+        } else {
+            CONTEXT_STUB.to_string()
+        };
+        let reduction = chars.saturating_sub(replacement.chars().count());
+        if reduction > 0 {
+            saved += reduction;
+            msg.content = Some(serde_json::Value::String(replacement));
+        }
+    }
+    saved
+}
+
 fn backoff_delay(attempt: u32, retry_after: Option<f64>) -> f64 {
     let base = match retry_after {
         Some(ra) => ra.min(MAX_DELAY_SECS),
@@ -157,6 +223,12 @@ pub enum LlmEvent {
         delay_secs: f64,
         status_code: u16,
         message: String,
+    },
+    #[serde(rename = "context_compacted")]
+    ContextCompacted {
+        attempt: u32,
+        max_attempts: u32,
+        chars_removed: usize,
     },
     /// A turn that failed for a reason the user has to act on.
     ///
@@ -498,10 +570,14 @@ pub async fn chat(
         // Attachment refs are local history only. Resolve image derivatives at
         // request time so provider payloads never leak back into chat JSON.
         let api_messages = provider_messages(&current_messages, attachment_context_keep_turns);
+        // Only this provider request is compacted. Events and persisted history
+        // continue to use the unmodified current_messages.
+        let mut request_messages = api_messages;
+        let mut context_retries = 0;
         // Build API request payload
         let mut payload = serde_json::json!({
             "model": model,
-            "messages": api_messages,
+            "messages": request_messages,
             "tools": tools::tool_definitions_json(),
             "tool_choice": "auto",
         });
@@ -514,7 +590,8 @@ pub async fn chat(
             let mut last_status: Option<reqwest::StatusCode> = None;
             let mut last_body: Option<serde_json::Value> = None;
             let mut success = None;
-            for attempt in 0..=MAX_RETRIES {
+            let mut rate_retries = 0;
+            loop {
                 if cancel.load(Ordering::Relaxed) {
                     // Cancelled during backoff — emit nothing, just return
                     return;
@@ -548,6 +625,7 @@ pub async fn chat(
                             .or_else(|| body["message"].as_str())
                             .unwrap_or(body_text.as_str());
                         if is_image_input_error(code, detail)
+                            && !is_context_limit_error(code, &body, detail)
                             && has_image_url_parts(&current_messages)
                         {
                             strip_image_url_parts(&mut current_messages);
@@ -569,9 +647,32 @@ pub async fn chat(
                             continue 'outer;
                         }
 
-                        if RETRYABLE_STATUSES.contains(&code) && attempt < MAX_RETRIES {
+                        if is_context_limit_error(code, &body, detail) {
+                            if context_retries < MAX_CONTEXT_RETRIES {
+                                let saved = compact_tool_results(
+                                    &mut request_messages, if context_retries == 0 { 1 } else { 2 });
+                                if saved > 0 {
+                                    context_retries += 1;
+                                    payload["messages"] = serde_json::to_value(&request_messages).unwrap();
+                                    let _ = event_tx.send(LlmEvent::ContextCompacted {
+                                        attempt: context_retries,
+                                        max_attempts: MAX_CONTEXT_RETRIES,
+                                        chars_removed: saved,
+                                    });
+                                    continue;
+                                }
+                            }
+                            let _ = event_tx.send(LlmEvent::Error {
+                                kind: ERROR_KIND_ERROR.into(),
+                                message: format!("Model context limit reached; could not fit this request after {context_retries} tool-output reductions. The full tool outputs remain in chat history. Try a shorter request or a larger-context model."),
+                            });
+                            return;
+                        }
+
+                        if RETRYABLE_STATUSES.contains(&code) && rate_retries < MAX_RETRIES {
                             let ra = extract_retry_after(&headers);
-                            let delay = backoff_delay(attempt, ra);
+                            let delay = backoff_delay(rate_retries, ra);
+                            rate_retries += 1;
                             let detail = body["error"]["message"]
                                 .as_str()
                                 .or_else(|| body["error"].as_str())
@@ -579,7 +680,7 @@ pub async fn chat(
                                 .unwrap_or(body_text.as_str())
                                 .to_string();
                             let _ = event_tx.send(LlmEvent::Retrying {
-                                attempt: attempt + 1,
+                                attempt: rate_retries,
                                 max_attempts: MAX_RETRIES,
                                 delay_secs: (delay * 10.0).round() / 10.0,
                                 status_code: code,
@@ -959,6 +1060,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn context_error_requires_explicit_signal() {
+        assert!(is_context_limit_error(400, &serde_json::json!({
+            "error": {"message": "This model's maximum context length is 1024 tokens"}
+        }), ""));
+        assert!(is_context_limit_error(413, &serde_json::json!({
+            "error": {"code": "context_length_exceeded", "message": "request rejected"}
+        }), ""));
+        assert!(!is_context_limit_error(400, &serde_json::json!({
+            "error": {"message": "Invalid model; images unsupported"}
+        }), ""));
+        assert!(!is_context_limit_error(500, &serde_json::json!({
+            "error": {"message": "context length exceeded"}
+        }), ""));
+    }
+
+    #[test]
+    fn context_compaction_only_changes_tool_body_and_protects_latest() {
+        let mut history = vec![
+            ChatMessage::new("user", Some(serde_json::json!("question"))),
+            ChatMessage::new("assistant", Some(serde_json::json!("answer"))),
+            ChatMessage::new("tool", Some(serde_json::json!("a".repeat(12000)))),
+            ChatMessage::new("tool", Some(serde_json::json!("b".repeat(12000)))),
+        ];
+        history[2].tool_call_id = Some("a".into());
+        history[3].tool_call_id = Some("b".into());
+        let original = history.clone();
+        let saved = compact_tool_results(&mut history, 1);
+        assert!(saved > 8000);
+        assert!(history[2].content.as_ref().unwrap().as_str().unwrap().len() < 4000);
+        assert_eq!(history[2].tool_call_id, original[2].tool_call_id);
+        assert_eq!(history[3].content, original[3].content);
+        let saved = compact_tool_results(&mut history, 2);
+        assert!(saved > 0);
+        assert_eq!(history[2].content.as_ref().unwrap(), CONTEXT_STUB);
+        assert_eq!(history[0].content, original[0].content);
+        assert_eq!(history[1].content, original[1].content);
+    }
+
+    #[test]
+    fn context_event_serde() {
+        let event = LlmEvent::ContextCompacted { attempt: 1, max_attempts: 4, chars_removed: 9000 };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"context_compacted","attempt":1,"max_attempts":4,"chars_removed":9000}"#);
+        assert!(matches!(serde_json::from_str::<LlmEvent>(&json).unwrap(), LlmEvent::ContextCompacted { .. }));
+    }
+
+    #[test]
     fn tool_confirmation_from_str_all() {
         assert_eq!(ToolConfirmation::from_str("all"), ToolConfirmation::All);
     }
@@ -1206,6 +1354,46 @@ mod loop_tests {
         responses: Vec<serde_json::Value>,
     ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         stub_server_status(200, responses)
+    }
+
+    /// Serve explicit success/error sequences to exercise retries end to end.
+    fn stub_server_sequence(
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        std::thread::spawn(move || {
+            for (status, response) in responses {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let (start, length) = loop {
+                    let count = sock.read(&mut tmp).unwrap();
+                    if count == 0 { return; }
+                    buf.extend_from_slice(&tmp[..count]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&buf[..pos]).to_lowercase();
+                        let len = headers.lines().find_map(|line|
+                            line.strip_prefix("content-length:").and_then(|v| v.trim().parse().ok())
+                        ).unwrap_or(0);
+                        break (pos + 4, len);
+                    }
+                };
+                while buf.len() < start + length {
+                    let count = sock.read(&mut tmp).unwrap();
+                    if count == 0 { return; }
+                    buf.extend_from_slice(&tmp[..count]);
+                }
+                recorded.lock().unwrap().push(
+                    serde_json::from_slice(&buf[start..start + length]).unwrap());
+                let data = response.to_string();
+                let wire = format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}", data.len());
+                sock.write_all(wire.as_bytes()).unwrap();
+            }
+        });
+        (base_url, requests)
     }
 
     /// Same, but every response is served with `status`.
@@ -1520,6 +1708,101 @@ mod loop_tests {
         d.rx.recv().await.unwrap();
         d.handle.await.unwrap();
         assert_eq!(requests.lock().unwrap()[0]["reasoning_effort"], "high");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_overflow_after_real_tool_keeps_full_event_and_does_not_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        let text = "source-data-".repeat(1000);
+        std::fs::write(&file, &text).unwrap();
+        let args = serde_json::json!({"path": file.to_str().unwrap()});
+        let (base, requests) = stub_server_sequence(vec![
+            (200, completion("", serde_json::json!([tool_call("tc1", "read_file", &args)]), (10, 5))),
+            (400, serde_json::json!({"error": {"message": "maximum context length exceeded"}})),
+            (200, completion("OK", serde_json::Value::Null, (10, 5))),
+        ]);
+        let mut d = start_chat(&base, vec![user_msg("read it")], ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::AssistantToolCalls { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolResult { content, .. }
+            if content == text));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. }
+            if content == "OK"));
+        d.handle.await.unwrap();
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[1]["messages"][2]["content"], text);
+        assert!(reqs[2]["messages"][2]["content"].as_str().unwrap().len() < 4000);
+        assert_eq!(reqs[2]["messages"][2]["tool_call_id"], "tc1");
+    }
+
+    fn tool_history() -> Vec<ChatMessage> {
+        let mut messages = vec![user_msg("Say OK")];
+        for (id, text) in [("a", "A".repeat(12000)), ("b", "B".repeat(12000))] {
+            let mut assistant = ChatMessage::new("assistant", Some(serde_json::json!("")));
+            assistant.tool_calls.push(crate::chat_manager::ToolCall {
+                id: id.into(), call_type: "function".into(),
+                function: crate::chat_manager::FunctionCall {
+                    name: "run_python".into(), arguments: "{\"code\":\"print(1)\"}".into(),
+                },
+            });
+            messages.push(assistant);
+            let mut tool = ChatMessage::new("tool", Some(serde_json::json!(text)));
+            tool.tool_call_id = Some(id.into());
+            messages.push(tool);
+        }
+        messages
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_overflow_retries_with_provider_only_compaction() {
+        let overflow = serde_json::json!({"error": {"code": "context_length_exceeded",
+            "message": "maximum context length exceeded"}});
+        let (base, requests) = stub_server_sequence(vec![
+            (400, overflow), (200, completion("OK", serde_json::Value::Null, (10, 5))),
+        ]);
+        let original = tool_history();
+        let mut d = start_chat(&base, original.clone(), ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(),
+            LlmEvent::ContextCompacted { attempt: 1, chars_removed, .. } if chars_removed > 8000));
+        assert!(matches!(d.rx.recv().await.unwrap(),
+            LlmEvent::FinalResponse { content, .. } if content == "OK"));
+        d.handle.await.unwrap();
+        let req = requests.lock().unwrap();
+        assert_eq!(req.len(), 2);
+        let before = req[0]["messages"].as_array().unwrap();
+        let after = req[1]["messages"].as_array().unwrap();
+        assert_eq!(before[2]["content"], original[2].content.as_ref().unwrap().clone());
+        assert!(after[2]["content"].as_str().unwrap().len() < 4000);
+        assert_eq!(after[4]["content"], before[4]["content"]);
+        assert_eq!(after[2]["tool_call_id"], "a");
+        assert_eq!(after[3]["tool_calls"], before[3]["tool_calls"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn context_overflow_without_tools_is_not_retried() {
+        let (base, requests) = stub_server_sequence(vec![
+            (400, serde_json::json!({"error": {"message": "context length exceeded"}})),
+        ]);
+        let mut d = start_chat(&base, vec![user_msg("hello")], ToolConfirmation::None, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(),
+            LlmEvent::Error { message, .. } if message.contains("Model context limit reached")));
+        d.handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unrelated_bad_request_is_not_retried() {
+        let (base, requests) = stub_server_sequence(vec![
+            (400, serde_json::json!({"error": {"message": "Invalid model; images unsupported"}})),
+        ]);
+        let mut d = start_chat(&base, vec![user_msg("hello")], ToolConfirmation::None, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::Error { message, .. }
+            if message.contains("Invalid model")));
+        d.handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

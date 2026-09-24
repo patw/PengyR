@@ -362,6 +362,11 @@ enum SseEvent {
         status_code: u16,
         message: String,
     },
+    ContextCompacted {
+        attempt: u32,
+        max_attempts: u32,
+        chars_removed: usize,
+    },
     Error {
         message: String,
     },
@@ -587,6 +592,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "message": message,
         })
         .to_string(),
+        SseEvent::ContextCompacted { attempt, max_attempts, chars_removed } =>
+            serde_json::json!({
+                "type": "context_compacted", "attempt": attempt,
+                "max_attempts": max_attempts, "chars_removed": chars_removed,
+            }).to_string(),
         SseEvent::Error { message } => {
             serde_json::json!({"type": "error", "message": message}).to_string()
         }
@@ -733,6 +743,9 @@ impl WebWorker {
                                 html: render_markdown(&preamble),
                             });
                         }
+                    }
+                    Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed }) => {
+                        push_event(SseEvent::ContextCompacted { attempt, max_attempts, chars_removed });
                     }
                     Some(LlmEvent::Retrying {
                         attempt,
@@ -3317,6 +3330,14 @@ function hideThinking() {{
   if (thinkingEl) {{ thinkingEl.remove(); thinkingEl = null; }}
 }}
 
+function showContextCompacted(data) {{
+  hideThinking();
+  thinkingEl = document.createElement('div');
+  thinkingEl.className = 'msg-thinking';
+  thinkingEl.textContent = `Context limit — retrying with ${{Number(data.chars_removed).toLocaleString()}} fewer tool-output characters; attempt ${{data.attempt}} of ${{data.max_attempts}}`;
+  appendToArea(thinkingEl);
+}}
+
 function showRetrying(data) {{
   hideThinking();
   thinkingEl = document.createElement('div');
@@ -3696,6 +3717,9 @@ function handleEvent(data) {{
       break;
     case 'retrying':
       showRetrying(data);
+      break;
+    case 'context_compacted':
+      showContextCompacted(data);
       break;
     case 'final_response':
       hideThinking();
