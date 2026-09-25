@@ -1,6 +1,7 @@
 //! Tool definitions and execution for Pengy.
 //!
-//! Defines 14 OpenAI function-calling tools and their implementations.
+//! Defines 16 OpenAI function-calling tools (17 on Windows, which adds
+//! run_powershell) and their implementations.
 
 use futures_util::StreamExt;
 use regex::Regex;
@@ -186,7 +187,18 @@ pub fn tool_definitions_json() -> serde_json::Value {
     TOOLS_JSON.clone()
 }
 
+/// The tool list the model sees on this platform (see `platform_tools`).
 pub fn tool_definitions() -> Vec<ToolDef> {
+    platform_tools(
+        base_tool_definitions(),
+        cfg!(windows),
+        powershell_label(POWERSHELL.as_deref()),
+        windows_is_admin(),
+    )
+}
+
+/// The POSIX tool list; Windows adapts it in `platform_tools`.
+fn base_tool_definitions() -> Vec<ToolDef> {
     vec![
         td("read_file", "Read the contents of a text file. Returns the whole file by default; very large files are truncated to the output limit, with a header telling you how to continue with offset/limit. Pass offset and limit to read one line range instead, which is how to page through a file too large to return at once. Use read_image for images — this tool cannot decode binary data.",
             &[("path", "string", "The file path to read"),
@@ -394,6 +406,143 @@ fn td(name: &str, desc: &str, props: &[(&str, &str, &str)], required: &[&str]) -
     }
 }
 
+// ── Platform-specific tool surface ──────────────────────────────────
+//
+// One local-shell tool per platform, named for the shell it really runs: the
+// tool name is the strongest hint a model gets about which syntax to write.
+// POSIX keeps run_bash exactly as defined above.  Windows gets run_powershell
+// for local commands, and run_bash survives only for remote hosts (host=),
+// since an ssh target really does run a POSIX shell.  No shell translation
+// either way.  Keep the wording identical to the Python and C++ editions.
+
+/// PowerShell used by run_powershell, resolved once (Windows only).
+static POWERSHELL: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| if cfg!(windows) { find_powershell() } else { None });
+
+/// PowerShell 7 (pwsh) is preferred when installed, but a clean Windows 11
+/// ships only Windows PowerShell 5.1, so that is the supported floor.  The
+/// absolute System32 path covers a PATH that has lost the v1.0 directory.
+/// Never falls back to cmd.exe.
+fn find_powershell() -> Option<PathBuf> {
+    for name in ["pwsh", "powershell"] {
+        if let Some(found) = find_in_path(name, std::env::var_os("PATH")) {
+            // find_in_path accepts a bare name whose .exe exists; spawn the
+            // real file.
+            if !found.is_file() {
+                return Some(found.with_extension("exe"));
+            }
+            return Some(found);
+        }
+    }
+    let builtin = system_root()
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    builtin.is_file().then_some(builtin)
+}
+
+fn system_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+/// Human/model-facing name for the resolved PowerShell.
+fn powershell_label(path: Option<&Path>) -> &'static str {
+    let full = path.map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+    let name = full.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    if name == "pwsh" || name == "pwsh.exe" {
+        "PowerShell 7"
+    } else {
+        "Windows PowerShell 5.1"
+    }
+}
+
+/// True when this process holds an elevated (Administrator) token.
+#[cfg(windows)]
+fn windows_is_admin() -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(windows))]
+fn windows_is_admin() -> bool {
+    false
+}
+
+fn run_powershell_definition(label: &str, is_admin: bool) -> ToolDef {
+    let privilege = if is_admin {
+        "Pengy is running as Administrator, so commands already have full administrative rights (HKLM registry, services, scheduled tasks, firewall, Windows features); no elevation step is needed."
+    } else {
+        "Pengy is NOT running as Administrator. Commands that need admin rights (writing HKLM, managing services, scheduled tasks that run as SYSTEM or with highest privileges, firewall rules, Windows features, machine-wide installs) fail with access denied. Do not try to self-elevate with Start-Process -Verb RunAs or sudo: the elevated process cannot be captured here. Instead tell the user the step needs admin rights: they can restart Pengy with Run as administrator, or run the command themselves."
+    };
+    let dialect = if label == "Windows PowerShell 5.1" {
+        " This is Windows PowerShell 5.1, not PowerShell 7: there are no && / || chain operators and no ternary operator, and curl/wget are aliases for Invoke-WebRequest (use curl.exe for real curl)."
+    } else {
+        ""
+    };
+    let desc = format!(
+        "Run a PowerShell script on this Windows machine with {label}. Use PowerShell syntax and cmdlets; this is not bash. The script may span multiple lines. It is non-interactive: stdin is closed, so anything that prompts (Read-Host, Get-Credential, confirmation prompts, an editor) fails rather than waits; pass -Force, -Confirm:$false or other non-interactive flags. Set cwd to run in a specific directory. Default table formatting is cut to a narrow width, so for wide or detailed objects pipe to Format-List, ConvertTo-Json, or Out-String -Width 4096. The exit code is the last native command's exit code, or 1 if the script throws or fails to parse; non-terminating errors are shown but do not change it. {privilege}{dialect} To run on a remote Linux or macOS machine, use run_bash with host. Commands are killed once the configured tool timeout elapses."
+    );
+    td(
+        "run_powershell",
+        &desc,
+        &[("command", "string", "The PowerShell script to execute"),
+          ("cwd", "string", "Optional working directory to run the script in")],
+        &["command"],
+    )
+}
+
+/// Windows variant of run_bash: same parameters, host required.
+fn remote_only_run_bash(mut def: ToolDef) -> ToolDef {
+    def.function.description = "Run a bash command on a remote Linux or macOS host over ssh. On this Windows machine run_bash is only for remote hosts: host is required, and local commands go through run_powershell. Use the ssh destination the user uses (an ~/.ssh/config alias, host, or user@host); key-based login must already work. The command is non-interactive: stdin is closed, so anything that prompts or waits for input fails rather than waits; pass non-interactive flags instead. cwd, if given, is a path on the remote host. To run something as root there, include an explicit `sudo ...` in the command AND set elevated=true; Pengy then prompts for that host's sudo password. elevated=true does NOT elevate on its own: a command with elevated=true but no `sudo` is rejected. Do not wrap the command in ssh yourself. Commands are killed once the configured tool timeout elapses.".into();
+    def.function.parameters.required = vec!["command".into(), "host".into()];
+    def
+}
+
+/// Other schemas that point the model at run_bash for local work.
+const WINDOWS_DESCRIPTION_SWAPS: &[(&str, &str, &str)] = &[
+    ("download_file", "use run_bash with curl or wget", "use run_powershell with curl.exe"),
+    ("fetch_url", "use run_bash with curl", "use run_powershell with curl.exe"),
+    ("glob", "run_bash('find ...') or run_bash('ls ...')", "run_powershell('Get-ChildItem ...')"),
+];
+
+/// Return the tool list the model sees on this platform.
+fn platform_tools(base: Vec<ToolDef>, windows: bool, powershell_label: &str, is_admin: bool) -> Vec<ToolDef> {
+    if !windows {
+        return base;
+    }
+    let mut tools = Vec::with_capacity(base.len() + 1);
+    for mut def in base {
+        if def.function.name == "run_bash" {
+            tools.push(run_powershell_definition(powershell_label, is_admin));
+            tools.push(remote_only_run_bash(def));
+            continue;
+        }
+        if let Some((_, from, to)) = WINDOWS_DESCRIPTION_SWAPS
+            .iter()
+            .find(|(name, _, _)| *name == def.function.name)
+        {
+            def.function.description = def.function.description.replace(from, to);
+        }
+        tools.push(def);
+    }
+    tools
+}
+
+/// On Windows run_bash is remote-only; a local call gets this pointer.
+fn windows_local_run_bash_error(windows: bool, host: Option<&str>) -> Option<String> {
+    if windows && host.is_none() {
+        Some("Error: on Windows, run_bash only runs on remote hosts (set host). Use run_powershell for commands on this machine.".into())
+    } else {
+        None
+    }
+}
+
 pub fn is_readonly_tool(name: &str) -> bool {
     matches!(
         name,
@@ -455,12 +604,19 @@ async fn execute_tool_inner(
             ).await
         }
         "apply_changes" => apply_changes(arguments).await,
+        "run_powershell" => {
+            run_powershell(a(arguments, "command", ""), aopt(arguments, "cwd"), ctx.clone()).await
+        }
         "run_bash" => {
+            let host = aopt(arguments, "host").filter(|h| !h.is_empty());
+            if let Some(e) = windows_local_run_bash_error(cfg!(windows), host.as_deref()) {
+                return e;
+            }
             run_bash(
                 a(arguments, "command", ""),
                 aopt(arguments, "cwd"),
                 abool(arguments, "elevated", false),
-                aopt(arguments, "host").filter(|h| !h.is_empty()),
+                host,
                 ctx.clone(),
             )
             .await
@@ -756,12 +912,35 @@ fn terminate_process_group(pid: u32) {
             .arg(format!("-{pid}"))
             .output();
     }
+    // taskkill /T walks the parent-PID tree (Windows has no process group to
+    // signal).  Invoked by absolute path so a taskkill.exe earlier on PATH
+    // can't stand in for it.
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
+        let mut cmd = std::process::Command::new(system_root().join("System32").join("taskkill.exe"));
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_console(&mut cmd);
+        let _ = cmd.status();
     }
+}
+
+/// Start a tool subprocess without a console window on Windows.
+///
+/// The GUI is a windowed app, so every powershell/ssh/python/taskkill child
+/// would otherwise flash a console.  CREATE_NO_WINDOW still gives the child a
+/// (hidden) console, so console APIs such as [Console]::OutputEncoding work.
+fn hide_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
 }
 
 // ── Argument helpers ────────────────────────────────────────────────
@@ -1698,6 +1877,7 @@ async fn run_bash_remote(
 
     let mut cmd = std::process::Command::new(&ssh);
     cmd.args(remote_ssh_args(&host));
+    hide_console(&mut cmd);
     // stdin stays open for the whole run: its EOF is what tells the remote
     // watcher to kill the command, so it is closed only once ssh has exited.
     cmd.stdin(Stdio::piped());
@@ -1762,6 +1942,136 @@ async fn run_bash_remote(
         })
     })
     .await;
+
+    match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => e,
+        Err(join_err) => format!("Error: Task panicked: {join_err}"),
+    }
+}
+
+// Fixed prelude for run_powershell.  The model's script is written to a UTF-8
+// temp file and compiled with [ScriptBlock]::Create rather than run via -File
+// (blocked by the default Restricted execution policy on Windows client SKUs,
+// and -ExecutionPolicy Bypass is a pattern EDR flags) or -EncodedCommand (a
+// classic malware IOC that corporate EDR blocks outright).  Reading the file
+// with an explicit UTF-8 encoding sidesteps 5.1's ANSI default for BOM-less
+// scripts, and nothing model-authored ever crosses the command line, so there
+// is no quoting to get wrong.
+//   - ProgressPreference: progress records otherwise leak onto redirected
+//     output (as CLIXML on 5.1).
+//   - PSStyle.OutputRendering (7.2+): pwsh emits ANSI colour even into a pipe.
+//   - OutputEncoding: UTF-8 both ways so non-ASCII output survives; the
+//     Console setter can throw without a console, hence the try.
+//   - A parse error surfaces from Create() and must exit non-zero, otherwise
+//     the run reports success.
+//   - Exit code: the last native exit code (LASTEXITCODE), or 1 when the
+//     script throws; `exit N` inside the script ends the process directly.
+// Must stay free of double quotes: it is one argv element, and Windows argv
+// quoting of embedded quotes is the fragile part.
+// Keep byte-identical with the Python and C++ editions.
+const POWERSHELL_PRELUDE: &str = concat!(
+    "$ProgressPreference = 'SilentlyContinue'; ",
+    "if ($PSStyle) { $PSStyle.OutputRendering = 'PlainText' }; ",
+    "try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}; ",
+    "$OutputEncoding = [Text.UTF8Encoding]::new($false); ",
+    "try { $__pengy = [ScriptBlock]::Create([IO.File]::ReadAllText('{path}', [Text.Encoding]::UTF8)) } ",
+    "catch { $e = $_.Exception; if ($e.InnerException) { $e = $e.InnerException }; ",
+    "[Console]::Error.WriteLine($e.Message); exit 1 }; ",
+    "$global:LASTEXITCODE = 0; ",
+    "& $__pengy; ",
+    "exit $LASTEXITCODE",
+);
+
+fn powershell_prelude(script_path: &str) -> String {
+    // PowerShell single-quoted strings escape ' by doubling it.
+    POWERSHELL_PRELUDE.replace("{path}", &script_path.replace('\'', "''"))
+}
+
+/// Run a PowerShell script locally (Windows' run_powershell tool).
+async fn run_powershell(command: String, cwd: Option<String>, ctx: Arc<ToolContext>) -> String {
+    run_powershell_with(POWERSHELL.clone(), command, cwd, ctx).await
+}
+
+async fn run_powershell_with(
+    exe: Option<PathBuf>,
+    command: String,
+    cwd: Option<String>,
+    ctx: Arc<ToolContext>,
+) -> String {
+    let exe = match exe {
+        Some(p) => p,
+        None => {
+            return "Error: PowerShell was not found (looked for pwsh and powershell on PATH and Windows PowerShell under System32).".into()
+        }
+    };
+    let run_cwd = match resolve_cwd(&cwd) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let timeout = timeout_secs();
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let script = std::env::temp_dir().join(format!("pengy-{}-{}.ps1", std::process::id(), nanos));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script)
+        .and_then(|mut f| f.write_all(command.as_bytes()));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&script);
+        return format!("Error writing temp file: {e}");
+    }
+
+    let (stdout_path, stderr_path, stdout_file, stderr_file) = match create_output_files("powershell") {
+        Ok(files) => files,
+        Err(e) => {
+            let _ = std::fs::remove_file(&script);
+            return format!("Error creating output files: {e}");
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(powershell_prelude(&script.to_string_lossy()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    if let Some(dir) = &run_cwd {
+        cmd.current_dir(dir);
+    }
+    // POSIX pwsh (tests): own group so a timeout's group kill can't reach us.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    hide_console(&mut cmd);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&script);
+            remove_output_files(&stdout_path, &stderr_path);
+            return format!("Error running PowerShell: {e}");
+        }
+    };
+    let pid = child.id();
+    ctx.register_process(pid);
+
+    let ctx_blocking = ctx.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let wait_result = wait_child(&mut child, pid, timeout);
+        ctx_blocking.unregister_process(pid);
+        let out = read_and_remove(&stdout_path);
+        let err = read_and_remove(&stderr_path);
+        wait_result.map(|status| finish_command_output(join_command_output(out, &err, status)))
+    })
+    .await;
+    let _ = std::fs::remove_file(&script);
 
     match result {
         Ok(Ok(out)) => out,
@@ -2774,6 +3084,7 @@ async fn run_python(code: String, cwd: Option<String>, ctx: Arc<ToolContext>) ->
     };
 
     let mut cmd = std::process::Command::new(python_interpreter());
+    hide_console(&mut cmd);
     cmd.arg(&tmp)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
@@ -3650,14 +3961,15 @@ mod tests {
 
     #[test]
     fn tool_definitions_has_sixteen_tools() {
-        assert_eq!(tool_definitions().len(), 16);
+        // Windows adds run_powershell.
+        assert_eq!(tool_definitions().len(), 16 + usize::from(cfg!(windows)));
     }
 
     #[test]
     fn tool_definitions_json_has_sixteen_tools() {
         let json = tool_definitions_json();
         assert!(json.is_array());
-        assert_eq!(json.as_array().unwrap().len(), 16);
+        assert_eq!(json.as_array().unwrap().len(), 16 + usize::from(cfg!(windows)));
     }
 
     #[test]
@@ -5935,5 +6247,151 @@ mod remote_tests {
         )
         .await;
         assert!(result.contains("remote-ok") && result.contains("none"), "{result}");
+    }
+}
+
+
+#[cfg(test)]
+mod powershell_tests {
+    use super::tests::test_tool_timeout_guard;
+    use super::*;
+
+    fn by_name(defs: &[ToolDef], name: &str) -> FunctionDef {
+        defs.iter()
+            .find(|d| d.function.name == name)
+            .map(|d| d.function.clone())
+            .unwrap_or_else(|| panic!("no {name}"))
+    }
+
+    #[test]
+    fn posix_surface_unchanged() {
+        let base = serde_json::to_value(base_tool_definitions()).unwrap();
+        let posix = serde_json::to_value(platform_tools(base_tool_definitions(), false, "", false)).unwrap();
+        assert_eq!(base, posix);
+        assert!(!base_tool_definitions().iter().any(|d| d.function.name == "run_powershell"));
+        assert_eq!(by_name(&base_tool_definitions(), "run_bash").parameters.required, vec!["command"]);
+    }
+
+    #[test]
+    fn windows_surface() {
+        let base = base_tool_definitions();
+        let win = platform_tools(base_tool_definitions(), true, "PowerShell 7", false);
+        let names: Vec<&str> = win.iter().map(|d| d.function.name.as_str()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "run_powershell").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "run_bash").count(), 1);
+        let ps = names.iter().position(|n| *n == "run_powershell").unwrap();
+        assert_eq!(names[ps + 1], "run_bash");
+        assert_eq!(win.len(), base.len() + 1);
+        let bash = by_name(&win, "run_bash");
+        assert_eq!(bash.parameters.required, vec!["command", "host"]);
+        assert!(bash.description.contains("remote"));
+        for name in ["download_file", "fetch_url", "glob"] {
+            let d = by_name(&win, name).description;
+            assert!(!d.contains("run_bash"), "{name}: {d}");
+            assert!(d.contains("run_powershell"), "{name}: {d}");
+        }
+    }
+
+    #[test]
+    fn privilege_and_dialect_wording() {
+        let admin = run_powershell_definition("PowerShell 7", true).function.description;
+        let user = run_powershell_definition("Windows PowerShell 5.1", false).function.description;
+        assert!(admin.contains("running as Administrator") && !admin.contains("NOT running"));
+        assert!(user.contains("NOT running as Administrator"));
+        assert!(user.contains("Start-Process -Verb RunAs"));
+        assert!(user.contains("5.1") && user.contains("&&"));
+        assert!(!admin.contains("&&"));
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(powershell_label(Some(Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe"))), "PowerShell 7");
+        assert_eq!(powershell_label(Some(Path::new("/usr/bin/pwsh"))), "PowerShell 7");
+        assert_eq!(
+            powershell_label(Some(Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"))),
+            "Windows PowerShell 5.1"
+        );
+    }
+
+    #[test]
+    fn local_run_bash_rejected_on_windows() {
+        let e = windows_local_run_bash_error(true, None).unwrap();
+        assert!(e.starts_with("Error") && e.contains("run_powershell"));
+        assert!(windows_local_run_bash_error(true, Some("web1")).is_none());
+        assert!(windows_local_run_bash_error(false, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_executable() {
+        let r = run_powershell_with(None, "Get-Date".into(), None, Arc::new(ToolContext::new())).await;
+        assert!(r.contains("PowerShell was not found"), "{r}");
+    }
+
+    #[test]
+    fn prelude_quoting() {
+        // One argv element on Windows: embedded double quotes are the fragile part.
+        assert!(!POWERSHELL_PRELUDE.contains('"'));
+        assert!(powershell_prelude(r"C:\Users\o'brien\x.ps1").contains(r"'C:\Users\o''brien\x.ps1'"));
+    }
+
+    // ── Live: drive the real prelude through pwsh when it is installed ──
+
+    fn pwsh() -> Option<PathBuf> {
+        find_in_path("pwsh", std::env::var_os("PATH"))
+    }
+
+    async fn run(command: &str, cwd: Option<String>) -> Option<String> {
+        let exe = pwsh()?;
+        Some(run_powershell_with(Some(exe), command.into(), cwd, Arc::new(ToolContext::new())).await)
+    }
+
+    #[tokio::test]
+    async fn live_unicode_multiline_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("dir with späce");
+        std::fs::create_dir(&d).unwrap();
+        let Some(out) = run("\"héllo ✓\"\nif ($true) {\n  (Get-Location).Path\n}", Some(d.to_string_lossy().into())).await else {
+            return;
+        };
+        assert!(out.contains("héllo ✓"), "{out}");
+        assert!(out.contains(&*d.to_string_lossy()), "{out}");
+        assert!(!out.contains("[Exit code"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn live_no_ansi_and_exit_codes() {
+        let Some(out) = run("Write-Error 'bad'", None).await else { return };
+        assert!(!out.contains("\x1b[") && out.contains("bad"), "{out:?}");
+        let out = run("throw \"boom\"", None).await.unwrap();
+        assert!(out.contains("boom") && out.contains("[Exit code: 1]"), "{out}");
+        let out = run("if ($true) {", None).await.unwrap();
+        assert!(out.contains("Missing closing") && out.contains("[Exit code: 1]"), "{out}");
+        let out = run("exit 7", None).await.unwrap();
+        assert!(out.contains("[Exit code: 7]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn live_timeout_kills_and_cleans_up() {
+        if pwsh().is_none() {
+            return;
+        }
+        let _guard = test_tool_timeout_guard();
+        let old = *TOOL_TIMEOUT.lock().unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = 2;
+        let scripts = || -> HashSet<PathBuf> {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    let n = p.file_name().unwrap().to_string_lossy();
+                    n.starts_with(&format!("pengy-{}-", std::process::id())) && n.ends_with(".ps1")
+                })
+                .collect()
+        };
+        let before = scripts();
+        let out = run("Start-Sleep -Seconds 30", None).await.unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = old;
+        assert!(out.contains("timed out"), "{out}");
+        assert!(scripts().is_subset(&before));
     }
 }

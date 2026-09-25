@@ -449,6 +449,7 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
                 format!("{host}: {}", val("command"))
             }
         }
+        "run_powershell" => val("command"),
         "run_python" => val("code"),
         "search_content" | "glob" => {
             let p = val("pattern");
@@ -3209,7 +3210,7 @@ function toolSummary(name, args) {{
   if (['read_file','write_file','replace_in_file','directory_tree'].includes(name)) s = val('path');
   else if (name === 'read_multiple_files') s = Array.isArray(args.paths) ? `${{args.paths.length}} files` : '';
   else if (name === 'web_search') s = val('query'); else if (name === 'fetch_url') s = val('url');
-  else if (name === 'download_file') s = val('filename') || val('url'); else if (name === 'run_bash') s = (val('host') ? `${{val('host')}}: ` : '') + val('command'); else if (name === 'run_python') s = val('code');
+  else if (name === 'download_file') s = val('filename') || val('url'); else if (name === 'run_bash') s = (val('host') ? `${{val('host')}}: ` : '') + val('command'); else if (name === 'run_powershell') s = val('command'); else if (name === 'run_python') s = val('code');
   else if (['search_content','glob'].includes(name)) s = val('pattern') + (val('path') ? ` in ${{val('path')}}` : '');
   else if (name === 'apply_changes') s = Array.isArray(args.changes) ? `${{args.changes.length}} files` : '';
   else if (name === 'ask_user_question') s = Array.isArray(args.questions) ? `${{args.questions.length}} questions` : '';
@@ -4710,6 +4711,10 @@ mod tests {
         assert_eq!(
             tool_summary("run_bash", &serde_json::json!({"command": "uptime", "host": "web1"})),
             "web1: uptime"
+        );
+        assert_eq!(
+            tool_summary("run_powershell", &serde_json::json!({"command": "Get-Service sshd"})),
+            "Get-Service sshd"
         );
         assert!(
             tool_summary("run_bash", &serde_json::json!({"command": "x".repeat(200)}))
