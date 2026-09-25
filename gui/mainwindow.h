@@ -116,4 +116,8 @@ private:
 
     QTimer* m_confirmTimer = nullptr;
     bool    m_sudoDialogOpen = false;
+    QDialog* m_sudoDialog = nullptr; // stack-owned by pollToolConfirmation()
+    ChatWorker* m_sudoDialogWorker = nullptr;
+    QDialog* m_questionDialog = nullptr; // stack-owned by handleQuestionRequest()
+    ChatWorker* m_questionDialogWorker = nullptr;
 };

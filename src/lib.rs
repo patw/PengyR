@@ -364,6 +364,7 @@ pub extern "C" fn pengy_llm_chat_run(
     // another's provider or cached password.
     if !sudo_state.is_null() {
         let sudo_ptr = sudo_state as usize; // safe to send across threads
+        let sudo_cancelled = tool_ctx.cancelled.clone();
         tool_ctx.set_sudo_provider(Some(Box::new(move |host: Option<&str>| {
             let state = sudo_ptr as *mut SudoState;
             unsafe {
@@ -378,6 +379,12 @@ pub extern "C" fn pengy_llm_chat_run(
             } // pending
               // Busy-wait for Qt main thread to respond
             loop {
+                // Stop must release the blocking provider even if the GUI is
+                // closing or no one can answer the prompt any more.
+                if sudo_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    unsafe { std::ptr::write_volatile(&mut (*state).status, 0) };
+                    return None;
+                }
                 let status = unsafe { std::ptr::read_volatile(&(*state).status) };
                 if status == 2 {
                     // Password provided — read from the buffer
