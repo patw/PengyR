@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $upgradeCode = '{A691F7BB-272C-4F16-8770-46F8D97E8A05}'  # must match msi\pengy.wxs
 $installDir = Join-Path $env:LOCALAPPDATA 'Programs\PengyR'
 $exe = Join-Path $installDir 'pengy.exe'
-$shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Pengy.lnk'
+$shortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'PengyR.lnk'
 $installer = New-Object -ComObject WindowsInstaller.Installer
 
 function Invoke-Msiexec([string] $Action, [string] $Package, [string] $Name) {

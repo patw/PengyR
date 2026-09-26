@@ -49,7 +49,7 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut">
         <Shortcut Id="PengyShortcut"
-                  Name="Pengy"
+                  Name="PengyR"
                   Description="Local-first AI agent with tools"
                   Target="[INSTALLFOLDER]pengy.exe"
                   WorkingDirectory="INSTALLFOLDER" />
