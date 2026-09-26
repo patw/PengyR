@@ -1,0 +1,66 @@
+<!--
+  PengyR Windows installer (WiX v5). Built by msi\build.ps1 from the
+  windeployqt'd PengyR-Windows\ folder that the release workflow also zips.
+
+  Per-user install into %LocalAppData%\Programs\PengyR: no UAC prompt, and
+  PengyR runs unelevated (run_powershell reports admin-only steps back to the
+  user instead of attempting them). Chats and settings live in the user's
+  config dir and are never touched by install, upgrade or uninstall.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <!-- UpgradeCode identifies "PengyR" across every version: never change it,
+       or new MSIs install alongside old ones instead of replacing them. -->
+  <Package Name="PengyR"
+           Manufacturer="Pat Wendorf"
+           Version="$(Version)"
+           UpgradeCode="{A691F7BB-272C-4F16-8770-46F8D97E8A05}"
+           Scope="perUser"
+           Compressed="yes">
+
+    <!-- Same-version upgrades keep dev builds of one version from piling up
+         as separate Add/Remove Programs entries. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="pengy.ico" SourceFile="$(sys.SOURCEFILEDIR)..\gui\pengy.ico" />
+    <Property Id="ARPPRODUCTICON" Value="pengy.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/patw/PengyR" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="PengyR" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Everything windeployqt produced, subfolders included, so the Qt
+         plugin list never has to be maintained here by hand. -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.app)\**" />
+    </ComponentGroup>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="PengyShortcut"
+                  Name="Pengy"
+                  Description="Local-first AI agent with tools"
+                  Target="[INSTALLFOLDER]pengy.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <!-- A per-user shortcut needs an HKCU value as its KeyPath. -->
+        <RegistryValue Root="HKCU" Key="Software\PengyR" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>

@@ -31,7 +31,7 @@ Pre-built binaries are on the [Releases page](https://github.com/patw/PengyR/rel
 |----------|--------|
 | **Linux** | `PengyR-x86_64.AppImage` (portable) · `.deb` (Debian/Ubuntu) |
 | **macOS** | `PengyR-<arch>.dmg` (arm64 / x86_64) |
-| **Windows** | `PengyR-Windows.zip` (bundled Qt DLLs) |
+| **Windows** | `PengyR-Windows-<version>.msi` (per-user installer, no admin needed) · `PengyR-Windows-<version>.zip` (portable) |
 
 ### Linux — Build from Source
 

@@ -6,6 +6,8 @@
 - **No console flashes on Windows.** Tool subprocesses (PowerShell, ssh, Python, and the `taskkill` used by Stop) start with `CREATE_NO_WINDOW`, and `taskkill` is invoked by its absolute System32 path.
 - **No console window behind the Windows GUI.** `pengy.exe` is now built as a Windows GUI app (`add_executable(pengy WIN32 …)`), so launching it from Explorer or a shortcut no longer opens a console window next to it. `--help` and `--version` attach to the terminal that launched them, so they still print. The `hostname` lookup behind the `{hostname}` system-message placeholder now also starts with `CREATE_NO_WINDOW`; without it, the windowed app would have flashed a console on every render.
 - **Windows exe icon.** `pengy.exe` now embeds the Pengy icon (`gui/pengy.ico`, 16–256px, via `gui/pengy.rc`), so Explorer, the taskbar and shortcuts show it instead of the generic Windows program icon.
+- **Windows MSI installer.** Releases now include `PengyR-Windows-<version>.msi` next to the zip. It installs per user into `%LocalAppData%\Programs\PengyR` (no admin prompt), adds a Start menu shortcut, and replaces the previous version on upgrade; uninstalling leaves chats and settings alone. Built with WiX v5 from `msi/pengy.wxs` via `msi/build.ps1`, and every release build installs, upgrades and uninstalls it on the CI runner before publishing.
+- **Windows builds bundle the MSVC runtime.** The zip and MSI ship the Visual C++ runtime DLLs next to `pengy.exe` instead of windeployqt's `vc_redist.x64.exe`, so PengyR starts on a clean Windows install without a separate runtime install.
 
 ## v1.9.3
 

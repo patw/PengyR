@@ -26,6 +26,8 @@ appimage/tools/
 
 # Windows
 *.exe
+*.msi
+*.wixpdb
 PengyR-Windows/
 
 # IDE / Editor

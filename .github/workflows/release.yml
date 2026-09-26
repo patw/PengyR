@@ -3,7 +3,7 @@
 # Produces and attaches to GitHub Release:
 #   Linux:   .deb + AppImage
 #   macOS:   .dmg
-#   Windows: PengyR-Windows.zip (Qt DLLs bundled)
+#   Windows: PengyR-Windows.zip (Qt + MSVC runtime DLLs bundled) + .msi installer
 #
 # Usage:
 #   git tag v1.3.0 && git push --tags
@@ -123,7 +123,7 @@ jobs:
           retention-days: 7
 
   windows:
-    name: Windows (Zip)
+    name: Windows (Zip + MSI)
     if: github.event_name == 'push' || contains(fromJSON('["windows","all"]'), inputs.platform)
     runs-on: windows-2022
     steps:
@@ -158,40 +158,58 @@ jobs:
           mkdir PengyR-Windows
           copy gui\build_windows\pengy.exe PengyR-Windows\ || exit /b 1
           cd PengyR-Windows
-          windeployqt pengy.exe
+          windeployqt --no-compiler-runtime pengy.exe
 
-      # Runs on every build, release or test: catches a missing Qt DLL, a
-      # broken WinMain entry point, or a console-subsystem exe before shipping.
-      - name: Smoke test
+      # Ship the MSVC runtime DLLs app-locally instead of windeployqt's
+      # vc_redist.x64.exe, which zip users had to find and run themselves and
+      # an MSI cannot run for them.
+      - name: Bundle MSVC runtime
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Resolve-Path PengyR-Windows\pengy.exe
+          $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir 'x64') -Directory -Filter 'Microsoft.VC*.CRT' |
+            Select-Object -First 1
+          if (-not $crt) { throw "MSVC CRT redist not found under $env:VCToolsRedistDir" }
+          Copy-Item (Join-Path $crt.FullName '*.dll') PengyR-Windows\
+          Get-ChildItem PengyR-Windows\*.dll | Select-Object Name, Length | Format-Table
 
-          # PE header: Subsystem 2 = Windows GUI (no console), 3 = console.
-          $bytes = [IO.File]::ReadAllBytes($exe)
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
-          Write-Host "PE subsystem: $subsystem"
-          if ($subsystem -ne 2) { throw "pengy.exe is not a GUI-subsystem exe (subsystem $subsystem)" }
+      # Runs on every build, release or test, before anything is packaged.
+      - name: Smoke test
+        shell: powershell
+        run: .github\scripts\windows-smoke-test.ps1 -Exe PengyR-Windows\pengy.exe
 
-          # --version exits before any window is created, but the process
-          # still has to load every linked DLL to get there.
-          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -NoNewWindow -PassThru `
-                 -RedirectStandardOutput version.txt
-          $version = (Get-Content version.txt -Raw)
-          Write-Host "--version: $version"
-          if ($p.ExitCode -ne 0 -or $version -notmatch 'Pengy v') { throw "--version failed (exit $($p.ExitCode))" }
+      - name: Install WiX
+        shell: powershell
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tools = Join-Path $env:USERPROFILE '.dotnet\tools'
+          $env:PATH = "$tools;$env:PATH"
+          $tools >> $env:GITHUB_PATH
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          wix --version
 
-          # Full launch against a throwaway config dir: the Qt platform plugin
-          # and the rest of windeployqt's output must load for it to stay up.
-          $cfg = Join-Path $env:RUNNER_TEMP 'pengy-smoke-config'
-          New-Item -ItemType Directory -Force $cfg | Out-Null
-          $p = Start-Process -FilePath $exe -ArgumentList '--config-dir', "`"$cfg`"" -PassThru
-          Start-Sleep -Seconds 8
-          if ($p.HasExited) { throw "pengy.exe exited early with code $($p.ExitCode)" }
-          Stop-Process -Id $p.Id -Force
-          Write-Host "GUI stayed up for 8s"
+      # The version comes from Cargo.toml (like the GUI's CMake), minus any
+      # pre-release suffix, which MSI versions can't hold. A second MSI with
+      # the build number bumped lets the next step test upgrading.
+      - name: Build MSI
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "(\d+)\.(\d+)\.(\d+)' | Select-Object -First 1
+          $g = $m.Matches[0].Groups
+          $major = $g[1].Value; $minor = $g[2].Value; $patch = $g[3].Value
+          $version = "$major.$minor.$patch"
+          $label = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' } else { 'dev' }
+          msi\build.ps1 -AppDir PengyR-Windows -Version $version -Out "PengyR-Windows-$label.msi"
+          msi\build.ps1 -AppDir PengyR-Windows -Version "$major.$minor.$([int]$patch + 1)" `
+            -Out "$env:RUNNER_TEMP\PengyR-next.msi"
+          "MSI_FILE=PengyR-Windows-$label.msi" >> $env:GITHUB_ENV
+
+      - name: Test MSI install, upgrade, uninstall
+        shell: powershell
+        run: .github\scripts\windows-msi-test.ps1 -Msi $env:MSI_FILE -NextMsi "$env:RUNNER_TEMP\PengyR-next.msi"
 
       - name: Zip artifacts
         if: github.ref_type == 'tag'
@@ -199,11 +217,13 @@ jobs:
         run: |
           Compress-Archive -Path PengyR-Windows\* -DestinationPath PengyR-Windows-${{ github.ref_name }}.zip
 
-      - name: Upload Windows Zip
+      - name: Upload Windows Zip + MSI
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: PengyR-Windows-*.zip
+          files: |
+            PengyR-Windows-*.zip
+            PengyR-Windows-*.msi
           fail_on_unmatched_files: false
 
       # Manual runs: the folder is uploaded as-is (GitHub zips it for
@@ -214,4 +234,12 @@ jobs:
         with:
           name: PengyR-Windows-${{ github.sha }}
           path: PengyR-Windows/
+          retention-days: 7
+
+      - name: Upload test MSI
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PengyR-Windows-MSI-${{ github.sha }}
+          path: ${{ env.MSI_FILE }}
           retention-days: 7
