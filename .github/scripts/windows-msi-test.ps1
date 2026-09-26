@@ -29,12 +29,12 @@ function Get-ComProperty($Object, [string] $Name, [object[]] $Arguments) {
 }
 
 # Installed products sharing PengyR's UpgradeCode, with their versions.
+# PowerShell enumerates the returned StringList itself, so @() of the call is
+# the list of product codes (empty when nothing is installed).
 function Get-Installed {
-    $list = Get-ComProperty $installer 'RelatedProducts' @($upgradeCode)
-    $count = Get-ComProperty $list 'Count' $null
+    $codes = @(Get-ComProperty $installer 'RelatedProducts' @($upgradeCode))
     $found = @()
-    for ($i = 0; $i -lt $count; $i++) {
-        $code = Get-ComProperty $list 'Item' @($i)
+    foreach ($code in $codes) {
         $found += [pscustomobject]@{
             Code    = $code
             Version = Get-ComProperty $installer 'ProductInfo' @($code, 'VersionString')
