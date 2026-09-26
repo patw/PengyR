@@ -28,8 +28,9 @@
     <Icon Id="pengy.ico" SourceFile="$(sys.SOURCEFILEDIR)..\gui\pengy.ico" />
     <Property Id="ARPPRODUCTICON" Value="pengy.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/patw/PengyR" />
-    <Property Id="ARPNOMODIFY" Value="1" />
 
+    <!-- WixUI_Minimal also sets ARPNOMODIFY: no "Change" in Add/Remove
+         Programs, since there are no optional features to change. -->
     <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
     <ui:WixUI Id="WixUI_Minimal" />
 
