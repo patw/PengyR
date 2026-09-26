@@ -409,8 +409,11 @@ fn whoami() -> String {
 }
 
 fn hostname() -> String {
-    std::process::Command::new("hostname")
-        .output()
+    let mut cmd = std::process::Command::new("hostname");
+    // Runs on every system-message render; without this the windowed GUI
+    // flashes a console each time on Windows.
+    crate::tools::hide_console(&mut cmd);
+    cmd.output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())

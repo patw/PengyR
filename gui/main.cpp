@@ -11,6 +11,30 @@
 #include "themehelper.h"
 #include "version.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <cstdio>
+#endif
+
+// pengy.exe is a GUI-subsystem app on Windows, so it starts without a console
+// and --help/--version output would go nowhere. Borrow the launching
+// terminal's console, if there is one, before printing -- unless stdout was
+// already redirected to a file or pipe (`pengy --version > v.txt`, CI), which
+// reopening CONOUT$ would override.
+static void attachParentConsole() {
+#ifdef _WIN32
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out != nullptr && out != INVALID_HANDLE_VALUE)
+        return;
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f = nullptr;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+    }
+#endif
+}
+
 static void showHelp(const char* argv0) {
     QTextStream out(stdout);
     out << "Pengy v" << PENGY_VERSION << " — Local-first AI agent with tools (GUI, Rust core)\n\n";
@@ -30,10 +54,12 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         const QString arg = QString::fromUtf8(argv[i]);
         if (arg == "-v" || arg == "--version") {
+            attachParentConsole();
             QTextStream(stdout) << "Pengy v" << PENGY_VERSION << "\n";
             return 0;
         }
         if (arg == "-h" || arg == "--help") {
+            attachParentConsole();
             showHelp(argv[0]);
             return 0;
         }

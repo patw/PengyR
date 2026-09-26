@@ -85,11 +85,18 @@ message(STATUS "Pengy core: ${PENGY_CORE_LIB} (static=${PENGY_RUST_STATIC})")
 
 # ── Source files ──────────────────────────────────────────────────
 
-add_executable(pengy
+# WIN32 builds a GUI-subsystem exe on Windows (no console window alongside the
+# app; Qt6::Core links the WinMain entry point for it). Ignored elsewhere.
+add_executable(pengy WIN32
   main.cpp mainwindow.cpp chathistory.cpp chatview.cpp
   chatinput.cpp chatworker.cpp settingsdialog.cpp tasksdialog.cpp
   resources.qrc
 )
+
+if(WIN32)
+  enable_language(RC)
+  target_sources(pengy PRIVATE pengy.rc)
+endif()
 
 # ── Link ──────────────────────────────────────────────────────────
 

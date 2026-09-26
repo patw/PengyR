@@ -8,12 +8,28 @@
 # Usage:
 #   git tag v1.3.0 && git push --tags
 #
+# Manual test builds (no release is created or touched):
+#   Actions tab -> Release -> "Run workflow", pick a branch and platform, or
+#   gh workflow run release.yml --ref <branch> -f platform=windows
+# The packages are attached to that run as downloadable artifacts instead.
+#
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform(s) to build'
+        type: choice
+        default: windows
+        options:
+          - windows
+          - linux
+          - macos
+          - all
 
 permissions:
   contents: write
@@ -21,6 +37,7 @@ permissions:
 jobs:
   linux:
     name: Linux (.deb + AppImage)
+    if: github.event_name == 'push' || contains(fromJSON('["linux","all"]'), inputs.platform)
     runs-on: ubuntu-24.04
     env:
       CARGO_PROFILE_RELEASE_LTO: "thin"
@@ -52,6 +69,7 @@ jobs:
           cd appimage && ./build.sh
 
       - name: Upload Release Assets
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -59,8 +77,19 @@ jobs:
             PengyR-x86_64.AppImage
           fail_on_unmatched_files: false
 
+      - name: Upload test build
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PengyR-Linux-${{ github.sha }}
+          path: |
+            pengy_*.deb
+            PengyR-x86_64.AppImage
+          retention-days: 7
+
   macos:
     name: macOS (DMG)
+    if: github.event_name == 'push' || contains(fromJSON('["macos","all"]'), inputs.platform)
     runs-on: macos-latest
     env:
       HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
@@ -79,13 +108,23 @@ jobs:
         run: ./build_macos.sh
 
       - name: Upload DMG
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: Pengy-macOS-*.dmg
           fail_on_unmatched_files: false
 
+      - name: Upload test build
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PengyR-macOS-${{ github.sha }}
+          path: Pengy-macOS-*.dmg
+          retention-days: 7
+
   windows:
     name: Windows (Zip)
+    if: github.event_name == 'push' || contains(fromJSON('["windows","all"]'), inputs.platform)
     runs-on: windows-2022
     steps:
       - name: Checkout
@@ -121,13 +160,58 @@ jobs:
           cd PengyR-Windows
           windeployqt pengy.exe
 
+      # Runs on every build, release or test: catches a missing Qt DLL, a
+      # broken WinMain entry point, or a console-subsystem exe before shipping.
+      - name: Smoke test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Resolve-Path PengyR-Windows\pengy.exe
+
+          # PE header: Subsystem 2 = Windows GUI (no console), 3 = console.
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          Write-Host "PE subsystem: $subsystem"
+          if ($subsystem -ne 2) { throw "pengy.exe is not a GUI-subsystem exe (subsystem $subsystem)" }
+
+          # --version exits before any window is created, but the process
+          # still has to load every linked DLL to get there.
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -NoNewWindow -PassThru `
+                 -RedirectStandardOutput version.txt
+          $version = (Get-Content version.txt -Raw)
+          Write-Host "--version: $version"
+          if ($p.ExitCode -ne 0 -or $version -notmatch 'Pengy v') { throw "--version failed (exit $($p.ExitCode))" }
+
+          # Full launch against a throwaway config dir: the Qt platform plugin
+          # and the rest of windeployqt's output must load for it to stay up.
+          $cfg = Join-Path $env:RUNNER_TEMP 'pengy-smoke-config'
+          New-Item -ItemType Directory -Force $cfg | Out-Null
+          $p = Start-Process -FilePath $exe -ArgumentList '--config-dir', "`"$cfg`"" -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "pengy.exe exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "GUI stayed up for 8s"
+
       - name: Zip artifacts
+        if: github.ref_type == 'tag'
         shell: powershell
         run: |
           Compress-Archive -Path PengyR-Windows\* -DestinationPath PengyR-Windows-${{ github.ref_name }}.zip
 
       - name: Upload Windows Zip
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: PengyR-Windows-*.zip
           fail_on_unmatched_files: false
+
+      # Manual runs: the folder is uploaded as-is (GitHub zips it for
+      # download), so there is no zip-inside-a-zip.
+      - name: Upload test build
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PengyR-Windows-${{ github.sha }}
+          path: PengyR-Windows/
+          retention-days: 7

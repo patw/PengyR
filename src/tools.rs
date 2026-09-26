@@ -932,7 +932,7 @@ fn terminate_process_group(pid: u32) {
 /// The GUI is a windowed app, so every powershell/ssh/python/taskkill child
 /// would otherwise flash a console.  CREATE_NO_WINDOW still gives the child a
 /// (hidden) console, so console APIs such as [Console]::OutputEncoding work.
-fn hide_console(cmd: &mut std::process::Command) {
+pub(crate) fn hide_console(cmd: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
