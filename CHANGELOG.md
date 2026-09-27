@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.10.0
 
 - **Native PowerShell on Windows (`run_powershell`, ported from Python Pengy).** On Windows the model now gets `run_powershell` for local commands instead of a `run_bash` that tried to start `bash.exe`, which a clean Windows install doesn't have. It uses PowerShell 7 (`pwsh`) when installed and otherwise the Windows PowerShell 5.1 that ships with Windows (never `cmd.exe`). The tool description tells the model which version it has, and whether PengyR is running as Administrator: if not, admin-only steps are reported back to the user instead of attempted through `Start-Process -Verb RunAs` or `sudo`. Scripts are run from a UTF-8 temp file compiled with `[ScriptBlock]::Create` (the prelude is byte-identical across editions), so there is no command-line quoting, no execution-policy prompt, and no `-EncodedCommand` for endpoint security to flag. Output is plain UTF-8 text with no ANSI colour or progress noise, and a script that throws or fails to parse exits 1. On Windows `run_bash` is kept only for remote hosts (`host` is required); remote sudo works exactly as on Linux and macOS. Linux and macOS are unchanged.
 - **No console flashes on Windows.** Tool subprocesses (PowerShell, ssh, Python, and the `taskkill` used by Stop) start with `CREATE_NO_WINDOW`, and `taskkill` is invoked by its absolute System32 path.
@@ -8,6 +8,8 @@
 - **Windows exe icon.** `pengy.exe` now embeds the Pengy icon (`gui/pengy.ico`, 16–256px, via `gui/pengy.rc`), so Explorer, the taskbar and shortcuts show it instead of the generic Windows program icon.
 - **Windows MSI installer.** Releases now include `PengyR-Windows-<version>.msi` next to the zip. It installs per user into `%LocalAppData%\Programs\PengyR` (no admin prompt), adds a Start menu shortcut, and replaces the previous version on upgrade; uninstalling leaves chats and settings alone. Built with WiX v5 from `msi/pengy.wxs` via `msi/build.ps1`, and every release build installs, upgrades and uninstalls it on the CI runner before publishing.
 - **Windows builds bundle the MSVC runtime.** The zip and MSI ship the Visual C++ runtime DLLs next to `pengy.exe` instead of windeployqt's `vc_redist.x64.exe`, so PengyR starts on a clean Windows install without a separate runtime install.
+
+- Coordinated v1.10.0 release across the Python, Rust, and C++ editions.
 
 ## v1.9.3
 
