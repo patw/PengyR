@@ -9,6 +9,7 @@
 - **Windows MSI installer.** Releases now include `PengyR-Windows-<version>.msi` next to the zip. It installs per user into `%LocalAppData%\Programs\PengyR` (no admin prompt), adds a Start menu shortcut, and replaces the previous version on upgrade; uninstalling leaves chats and settings alone. Built with WiX v5 from `msi/pengy.wxs` via `msi/build.ps1`, and every release build installs, upgrades and uninstalls it on the CI runner before publishing.
 - **Windows builds bundle the MSVC runtime.** The zip and MSI ship the Visual C++ runtime DLLs next to `pengy.exe` instead of windeployqt's `vc_redist.x64.exe`, so PengyR starts on a clean Windows install without a separate runtime install.
 
+- **Retire stale sudo and question dialogs with their worker.** If a tab's worker finished, was stopped, or was replaced while a sudo password prompt or an `ask_user_question` dialog it had raised was still open, the dialog lingered and answered a worker that was gone. Those prompts are now tracked against the worker that raised them and are dismissed when it exits, and queued questions from a retired worker are dropped.
 - Coordinated v1.10.0 release across the Python, Rust, and C++ editions.
 
 ## v1.9.3
