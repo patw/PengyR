@@ -123,9 +123,19 @@ if ! ls "$APPDIR"/usr/lib/libQt6WaylandClient.so.6* >/dev/null 2>&1; then
     echo "       The Wayland plugin would load but fail at runtime." >&2
     exit 1
 fi
-if ! ls "$APPDIR"/usr/lib/libQt6WaylandEglClientHwIntegration.so.6* >/dev/null 2>&1; then
-    echo "ERROR: 'libQt6WaylandEglClientHwIntegration.so.6' is missing from $APPDIR/usr/lib." >&2
-    echo "       The EGL Wayland plugin would load a host Qt library at runtime." >&2
+# The Wayland EGL client integration is packaged differently by Qt version:
+#   - Qt <= 6.4 (Debian/Ubuntu noble): a standalone shared lib,
+#     libQt6WaylandEglClientHwIntegration.so.6
+#   - Qt >= 6.5 (incl. 6.10): folded into a graphics-integration *plugin*,
+#     wayland-graphics-integration-client/libqt-plugin-wayland-egl.so
+# Accept either form -- the invariant that matters is that some bundled Wayland
+# EGL backend ships with the AppImage (never resolved from the host Qt).
+if ! ls "$APPDIR"/usr/lib/libQt6WaylandEglClientHwIntegration.so.6* >/dev/null 2>&1 \
+   && ! ls "$APPDIR"/usr/plugins/wayland-graphics-integration-client/lib*-wayland-egl.so >/dev/null 2>&1; then
+    echo "ERROR: no bundled Wayland EGL client integration found (neither" >&2
+    echo "       libQt6WaylandEglClientHwIntegration.so.6 nor a wayland-graphics-integration-client" >&2
+    echo "       wayland-egl plugin is present). The EGL Wayland plugin would load" >&2
+    echo "       a host Qt library at runtime." >&2
     exit 1
 fi
 while IFS= read -r -d '' plugin; do
