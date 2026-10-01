@@ -499,6 +499,28 @@ fn provider_messages(messages: &[ChatMessage], keep_turns: usize) -> Vec<ChatMes
     }).collect()
 }
 
+/// Keep only our tagged proxy's opaque replay state independent of the UI's
+/// optional preservation of ordinary, possibly human-readable reasoning.
+/// The proxy itself checks both provider and model before replaying it.
+fn strip_cross_model_proxy_state(messages: &mut [ChatMessage], model: &str) {
+    for message in messages {
+        if message.reasoning_details.as_ref().is_some_and(|details|
+            details.get("format").and_then(|v| v.as_str()) == Some("openai-proxy/reasoning-v1")
+            && details.get("proxy_model").and_then(|v| v.as_str()) != Some(model)
+        ) {
+            message.reasoning_details = None;
+        }
+    }
+}
+
+fn preserved_reasoning_details(msg: &serde_json::Value, preserve_reasoning: bool) -> Option<serde_json::Value> {
+    let details = msg.get("reasoning_details")?;
+    if preserve_reasoning || details.get("format").and_then(|v| v.as_str()) == Some("openai-proxy/reasoning-v1") {
+        return Some(details.clone());
+    }
+    None
+}
+
 fn format_question_answers(questions: &serde_json::Value, answers: &[String]) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(qs) = questions.as_array() {
@@ -569,7 +591,11 @@ pub async fn chat(
 
         // Attachment refs are local history only. Resolve image derivatives at
         // request time so provider payloads never leak back into chat JSON.
-        let api_messages = provider_messages(&current_messages, attachment_context_keep_turns);
+        let mut api_messages = provider_messages(&current_messages, attachment_context_keep_turns);
+        // Proxy envelopes are opaque state tied to one model and upstream.
+        // Keep them in persisted chat history, but don't leak them to a
+        // different selected model (including model overrides in a tab).
+        strip_cross_model_proxy_state(&mut api_messages, model);
         // Only this provider request is compacted. Events and persisted history
         // continue to use the unmodified current_messages.
         let mut request_messages = api_messages;
@@ -805,11 +831,9 @@ pub async fn chat(
                     } else {
                         None
                     },
-                    reasoning_details: if preserve_reasoning {
-                        msg.get("reasoning_details").cloned()
-                    } else {
-                        None
-                    },
+                    // Native proxy state is opaque and required to resume tool turns,
+                    // regardless of the UI preference for ordinary reasoning fields.
+                    reasoning_details: preserved_reasoning_details(msg, preserve_reasoning),
                 };
 
                 let _ = event_tx.send(LlmEvent::AssistantToolCalls {
@@ -1040,11 +1064,7 @@ pub async fn chat(
             } else {
                 None
             },
-            reasoning_details: if preserve_reasoning {
-                msg.get("reasoning_details").cloned()
-            } else {
-                None
-            },
+            reasoning_details: preserved_reasoning_details(msg, preserve_reasoning),
         };
         let _ = event_tx.send(LlmEvent::FinalResponse {
             content,
@@ -1288,6 +1308,32 @@ mod tests {
         // The newest retained image is unavailable in this fixture, but its
         // local metadata is still stripped rather than sent to the provider.
         assert_eq!(provider[1].content.as_ref().unwrap(), &serde_json::json!([{"type":"text","text":"new"}]));
+    }
+
+    #[test]
+    fn native_proxy_reasoning_is_preserved_without_user_toggle() {
+        let opaque = serde_json::json!({"format":"openai-proxy/reasoning-v1",
+            "provider":"openai_responses", "proxy_model":"astra", "model":"upstream-astra",
+            "blocks":[{"type":"reasoning", "encrypted_content":"opaque"}]});
+        let response = serde_json::json!({"reasoning_details":opaque});
+        assert_eq!(preserved_reasoning_details(&response, false), Some(opaque.clone()));
+        let mut assistant = ChatMessage::new("assistant", Some(serde_json::json!("Hi")));
+        assistant.reasoning_details = Some(opaque.clone());
+        let history = vec![assistant];
+        let mut same_model = provider_messages(&history, 0);
+        strip_cross_model_proxy_state(&mut same_model, "astra");
+        assert_eq!(same_model[0].reasoning_details, Some(opaque));
+        let mut changed_model = provider_messages(&history, 0);
+        strip_cross_model_proxy_state(&mut changed_model, "different");
+        assert!(changed_model[0].reasoning_details.is_none());
+        assert!(history[0].reasoning_details.is_some(), "stored history must remain intact");
+    }
+
+    #[test]
+    fn foreign_reasoning_respects_user_toggle() {
+        let response = serde_json::json!({"reasoning_details":[{"type":"other","text":"x"}]});
+        assert!(preserved_reasoning_details(&response, false).is_none());
+        assert!(preserved_reasoning_details(&response, true).is_some());
     }
 
     #[test]
@@ -1803,6 +1849,29 @@ mod loop_tests {
             if message.contains("Invalid model")));
         d.handle.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tagged_proxy_state_survives_tool_loop_without_reasoning_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let args = serde_json::json!({"path": file.to_str().unwrap()});
+        let envelope = serde_json::json!({"format":"openai-proxy/reasoning-v1",
+            "provider":"openai_responses", "proxy_model":"stub-model", "model":"upstream-stub",
+            "blocks":[{"type":"reasoning", "encrypted_content":"opaque"}]});
+        let first = serde_json::json!({"choices":[{"message":{
+            "role":"assistant", "content":"", "tool_calls":[tool_call("tc1", "read_file", &args)],
+            "reasoning_details":envelope}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}});
+        let (base, requests) = stub_server(vec![first, completion("done", serde_json::Value::Null, (5, 1))]);
+        let mut d = start_chat(&base, vec![user_msg("read")], ToolConfirmation::All, "", false);
+        while let Some(event) = d.rx.recv().await {
+            if matches!(event, LlmEvent::FinalResponse { .. } | LlmEvent::Error { .. }) { break; }
+        }
+        d.handle.await.unwrap();
+        let recorded = requests.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1]["messages"][1]["reasoning_details"], envelope);
     }
 
     #[tokio::test(flavor = "multi_thread")]

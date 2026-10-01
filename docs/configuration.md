@@ -17,7 +17,7 @@ PengyR stores its settings in `~/.config/pengy/settings.json`. This file is shar
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `reasoning_effort` | string | `""` | For models that support it: `none`, `low`, `medium`, `high`, `xhigh`, `max`. Empty string uses the provider default. |
-| `preserve_reasoning` | bool | `false` | When true, keeps the model's raw reasoning/chain-of-thought in the chat history. |
+| `preserve_reasoning` | bool | `false` | When true, keeps provider-specific reasoning fields in chat history. The tagged opaque `openai-proxy/reasoning-v1` continuation envelope is always retained for same-model tool turns even when this option is false. |
 | `tool_timeout` | int | `300` | Max seconds a tool can run before being killed. `-1` = no timeout. |
 | `tool_output_max_chars` | int | `250000` | Max characters in tool output before head+tail snipping kicks in. `0` = no limit. |
 | `max_tool_calls_per_turn` | int | `25` | Max tool calls the LLM can make in a single turn before PengyR forces a response. |
