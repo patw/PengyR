@@ -95,6 +95,7 @@ void MainWindow::setupUi() {
     connect(m_chatHistory, &ChatHistoryWidget::tasksRequested, this, &MainWindow::openTasks);
     connect(m_chatHistory, &ChatHistoryWidget::deleteRequested, this, &MainWindow::deleteChat);
     connect(m_chatHistory, &ChatHistoryWidget::modelChanged, this, &MainWindow::onModelChanged);
+    connect(m_chatHistory, &ChatHistoryWidget::effortChanged, this, &MainWindow::onEffortChanged);
     leftSplitter->addWidget(m_chatHistory);
 
     // Right pane: tab widget + input row
@@ -242,6 +243,18 @@ void MainWindow::onModelChanged(const QString& model) {
     if (session->chat["model"].toString() == m)
         return;
     session->chat["model"] = m;
+    QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+    pengy_chat_save(json.constData());
+    updateQuickSettingsFor(session);
+}
+
+void MainWindow::onEffortChanged(const QString& effort) {
+    TabSession* session = tabForChat(m_activeChatId);
+    if (!session) return;
+    if (effort == "global")
+        session->chat.remove("reasoning_effort");
+    else
+        session->chat["reasoning_effort"] = effort;
     QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
     pengy_chat_save(json.constData());
     updateQuickSettingsFor(session);
@@ -753,7 +766,9 @@ void MainWindow::processResponse(TabSession* session, const QJsonArray& apiMessa
     QString apiKey = m_config["api_key"].toString();
     QString model = modelForSession(session);
     QString tc = m_config["tool_confirmation"].toString("none");
-    QString re = m_config["reasoning_effort"].toString("");
+    QString re = session->chat["reasoning_effort"].isString()
+        ? session->chat["reasoning_effort"].toString()
+        : m_config["reasoning_effort"].toString();
     bool preserveReasoning = m_config["preserve_reasoning"].toBool(false);
 
     connect(thread, &QThread::started, worker, [worker, baseUrl, apiKey, model,
@@ -884,6 +899,10 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
         session->chat = QJsonDocument::fromJson(QByteArray(updatedChatRaw)).object();
         pengy_free(updatedChatRaw);
     }
+    if (response["tokens_per_second"].isDouble())
+        session->chat["last_response_tokens_per_second"] = response["tokens_per_second"];
+    else
+        session->chat.remove("last_response_tokens_per_second");
     QJsonObject cumulative = session->chat["usage"].toObject();
     session->promptTokens = cumulative["prompt_tokens"].toInt();
     session->completionTokens = cumulative["completion_tokens"].toInt();
@@ -906,10 +925,10 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
         else if (asstMsg.contains("reasoning"))
             display["reasoning_content"] = asstMsg["reasoning"];
         session->chatView->appendMessage("assistant", display);
-
-        QByteArray chatJson = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
-        pengy_chat_save(chatJson.constData());
     }
+    // Persist metrics even if the final response has no visible content.
+    QByteArray chatJson = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+    pengy_chat_save(chatJson.constData());
 
     if (session == tabForChat(m_activeChatId))
         updateQuickSettingsFor(session);
@@ -1362,10 +1381,11 @@ void MainWindow::pollToolConfirmation() {
 void MainWindow::updateQuickSettingsFor(TabSession* session) {
     m_chatHistory->updateQuickSettings(
         modelForSession(session),
-        m_config["tool_confirmation"].toString("none"));
+        session->chat["reasoning_effort"].isString()
+            ? session->chat["reasoning_effort"].toString() : QString("global"));
 
-    if (session->promptTokens || session->completionTokens)
-        m_chatHistory->updateTokenUsage(session->promptTokens, session->completionTokens);
+    m_chatHistory->updateTokenUsage(session->promptTokens, session->completionTokens);
+    m_chatHistory->updateResponseRate(session->chat["last_response_tokens_per_second"].toDouble(-1));
 
     if (session->toolRunning)
         m_chatHistory->setToolRunning(true);

@@ -1,6 +1,6 @@
 # Build the PengyR MSI from the windeployqt'd app folder.
 #
-#   msi\build.ps1 -AppDir PengyR-Windows -Version 1.9.3 -Out PengyR-Windows-v1.9.3.msi
+#   msi\build.ps1 -AppDir PengyR-Windows -Version 1.11.0 -Out PengyR-Windows-v1.11.0.msi
 #
 # Needs the WiX v5 CLI and its UI extension (v5 is pinned on purpose: v6
 # changed the licence terms for the binaries):

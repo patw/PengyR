@@ -898,6 +898,7 @@ impl WebWorker {
                         content,
                         message,
                         usage,
+                        ..
                     }) => {
                         chat.messages.push(message.unwrap_or(ChatMessage {
                             role: "assistant".into(),
@@ -4036,11 +4037,6 @@ function submitQuestion(override) {{
         } else {
             ""
         };
-        let reasoning_minimal_sel = if config.reasoning_effort == "minimal" {
-            " selected"
-        } else {
-            ""
-        };
         let reasoning_low_sel = if config.reasoning_effort == "low" {
             " selected"
         } else {
@@ -4116,7 +4112,6 @@ function submitQuestion(override) {{
         <select name="reasoning_effort" class="form-select">
           <option value=""{reasoning_default_sel}>Provider default — do not send</option>
           <option value="none"{reasoning_none_sel}>Off / none</option>
-          <option value="minimal"{reasoning_minimal_sel}>Minimal</option>
           <option value="low"{reasoning_low_sel}>Low</option>
           <option value="medium"{reasoning_medium_sel}>Medium</option>
           <option value="high"{reasoning_high_sel}>High</option>
@@ -4224,7 +4219,6 @@ async function fetchModels() {{
             system_message = escape_html(&config.system_message),
             reasoning_default_sel = reasoning_default_sel,
             reasoning_none_sel = reasoning_none_sel,
-            reasoning_minimal_sel = reasoning_minimal_sel,
             reasoning_low_sel = reasoning_low_sel,
             reasoning_medium_sel = reasoning_medium_sel,
             reasoning_high_sel = reasoning_high_sel,

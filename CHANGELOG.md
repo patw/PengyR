@@ -1,8 +1,15 @@
 # Changelog
 
-## Unreleased
+## v1.11.0
+
+- Remove the legacy Minimal reasoning-effort option from the GUI quick-settings dropdown and GUI/web Settings lists; all other options are unchanged.
+
+- **Per-tab reasoning effort and last-response throughput in the GUI.** The quick-settings panel replaces the Tool Confirm display with an Effort selector, saved with each chat. Global setting follows Settings; Provider default explicitly omits the reasoning hint. Last-response tok/s uses API-reported output tokens divided by the final successful HTTP request's wall time (including network/prefill/reasoning, excluding tools and retry waits), and is saved with the chat rather than accumulated. Missing API usage displays —; cumulative token totals remain separate and now reset correctly when switching to an empty tab. Tool-confirmation policy remains available in Settings.
 
 - **AppImage packaging guard works with newer Qt (no behaviour change on Qt 6.4).** The post-package check required the standalone library `libQt6WaylandEglClientHwIntegration.so.6` to be bundled. Qt 6.5 and later (including 6.10) instead ship the Wayland EGL client integration as a `wayland-graphics-integration-client` plugin, so on those hosts the guard failed the build and exited non-zero *after* `linuxdeploy` had already produced a correct AppImage — which aborted any `set -e` caller (e.g. `newpengy.sh`) before it could install the new AppImage, leaving the previous version's file in place. The guard now accepts either the Qt ≤ 6.4 standalone library or the Qt ≥ 6.5 plugin. Building the AppImage also requires `patchelf` and `qmlimportscanner` (from `qt6-declarative-dev-tools`) on `PATH`; the `qmlimportscanner` half of this is the same failure mode documented for v1.9.2.
+
+- **Reliable proxy continuation.** Preserve opaque proxy reasoning/continuation envelopes across tool calls and saved-chat resumes, even when visible reasoning preservation is off; drop model-bound proxy state when switching models.
+- Coordinated v1.11.0 release across the Python, Rust, and C++ editions.
 
 ## v1.10.0
 

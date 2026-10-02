@@ -215,6 +215,10 @@ pub enum LlmEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<ChatMessage>,
         usage: Usage,
+        /// Final response output tokens / successful HTTP request wall time.
+        /// Includes latency/prefill/reasoning, excludes tools and retry waits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_per_second: Option<f64>,
     },
     #[serde(rename = "retrying")]
     Retrying {
@@ -612,7 +616,7 @@ pub async fn chat(
         }
 
         // ── API call with 429 / 529 exponential backoff ──────────
-        let resp = {
+        let (resp, request_started) = {
             let mut last_status: Option<reqwest::StatusCode> = None;
             let mut last_body: Option<serde_json::Value> = None;
             let mut success = None;
@@ -622,6 +626,7 @@ pub async fn chat(
                     // Cancelled during backoff — emit nothing, just return
                     return;
                 }
+                let request_started = std::time::Instant::now();
                 match client
                     .post(&url)
                     .header("Authorization", format!("Bearer {api_key}"))
@@ -634,7 +639,7 @@ pub async fn chat(
                     Ok(r) => {
                         let status = r.status();
                         if status.is_success() {
-                            success = Some(r);
+                            success = Some((r, request_started));
                             break;
                         }
                         let code = status.as_u16();
@@ -759,6 +764,7 @@ pub async fn chat(
         };
 
         let body_text = resp.text().await.unwrap_or_default();
+        let request_seconds = request_started.elapsed().as_secs_f64();
         let body: serde_json::Value =
             serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
 
@@ -1070,9 +1076,19 @@ pub async fn chat(
             content,
             message: Some(final_msg),
             usage: accumulated_usage,
+            tokens_per_second: response_tokens_per_second(&body, request_seconds),
         });
         return;
     }
+}
+
+fn response_tokens_per_second(body: &serde_json::Value, seconds: f64) -> Option<f64> {
+    let tokens = body["usage"]["completion_tokens"].as_u64()?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return None;
+    }
+    let rate = tokens as f64 / seconds;
+    rate.is_finite().then_some(rate)
 }
 
 #[cfg(test)]
@@ -1172,10 +1188,23 @@ mod tests {
     }
 
     #[test]
+    fn final_response_rate_uses_only_output_tokens() {
+        let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":30,"total_tokens":1030}});
+        assert_eq!(response_tokens_per_second(&body, 2.0), Some(15.0));
+        assert_eq!(response_tokens_per_second(&body, 0.0), None);
+        assert_eq!(response_tokens_per_second(&body, f64::NAN), None);
+        assert_eq!(response_tokens_per_second(&serde_json::json!({}), 2.0), None);
+        assert_eq!(response_tokens_per_second(&serde_json::json!({"usage":{"completion_tokens":0}}), 2.0), Some(0.0));
+        let legacy = r#"{"type":"final_response","content":"ok","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        assert!(matches!(serde_json::from_str::<LlmEvent>(legacy).unwrap(), LlmEvent::FinalResponse {tokens_per_second: None, ..}));
+    }
+
+    #[test]
     fn llm_event_final_response_serde() {
         let event = LlmEvent::FinalResponse {
             content: "Hello!".into(),
             message: None,
+            tokens_per_second: Some(25.0),
             usage: Usage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
@@ -1727,7 +1756,8 @@ mod loop_tests {
         );
 
         match d.rx.recv().await.unwrap() {
-            LlmEvent::FinalResponse { content, usage, .. } => {
+            LlmEvent::FinalResponse { content, usage, tokens_per_second, .. } => {
+                assert!(tokens_per_second.unwrap() > 0.0);
                 assert_eq!(content, "hello there");
                 assert_eq!(usage.total_tokens, 15);
             }

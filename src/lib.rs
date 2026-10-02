@@ -578,6 +578,7 @@ pub extern "C" fn pengy_llm_chat_run(
                     let event = llm_client::LlmEvent::FinalResponse {
                         content: err_msg,
                         message: None,
+                        tokens_per_second: None,
                         usage: llm_client::Usage {
                             prompt_tokens: 0,
                             completion_tokens: 0,

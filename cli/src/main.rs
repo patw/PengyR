@@ -430,6 +430,8 @@ impl PengyCli {
                 }],
                 created_at: chrono_now(),
                 model: None,
+                reasoning_effort: None,
+                last_response_tokens_per_second: None,
                 usage: None,
             };
             self.current_chat = Some(chat);
@@ -722,6 +724,7 @@ impl PengyCli {
                     content,
                     message,
                     usage,
+                    ..
                 }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));

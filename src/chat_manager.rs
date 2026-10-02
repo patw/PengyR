@@ -23,6 +23,13 @@ pub struct Chat {
     /// Per-tab model override. `None` means "follow the global default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-tab effort override. None follows global settings; Some("") omits
+    /// the provider option explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Throughput of the last final API response, never cumulative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_response_tokens_per_second: Option<f64>,
     /// Cumulative token usage across every turn in this chat (not just the
     /// last one). `None` until the first turn reports usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +106,8 @@ impl Chat {
             messages: Vec::new(),
             created_at: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             model: None,
+            reasoning_effort: None,
+            last_response_tokens_per_second: None,
             usage: None,
         }
     }
@@ -828,6 +837,25 @@ mod tests {
         assert_eq!(chat2.id, chat.id);
         assert_eq!(chat2.title, "Test");
         assert_eq!(chat2.messages.len(), 2);
+    }
+
+    #[test]
+    fn chat_effort_and_last_response_rate_round_trip() {
+        let mut chat = Chat::new("Test");
+        let json = serde_json::to_value(&chat).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+        assert!(json.get("last_response_tokens_per_second").is_none());
+        for effort in ["", "high", "max"] {
+            chat.reasoning_effort = Some(effort.into());
+            chat.last_response_tokens_per_second = Some(42.5);
+            let restored: Chat = serde_json::from_value(serde_json::to_value(&chat).unwrap()).unwrap();
+            assert_eq!(restored.reasoning_effort.as_deref(), Some(effort));
+            assert_eq!(restored.last_response_tokens_per_second, Some(42.5));
+        }
+        let legacy = r#"{"id":"x","title":"old","messages":[],"created_at":"2026-01-01T00:00:00"}"#;
+        let restored: Chat = serde_json::from_str(legacy).unwrap();
+        assert!(restored.reasoning_effort.is_none());
+        assert!(restored.last_response_tokens_per_second.is_none());
     }
 
     #[test]
