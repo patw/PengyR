@@ -13,14 +13,6 @@ use tokio::sync::mpsc;
 
 // ── Graceful image-stripping helpers ────────────────────────────
 
-const IMAGE_ERROR_KEYWORDS: &[&str] = &[
-    "image",
-    "multimodal",
-    "vision",
-    "not support",
-    "unsupported",
-];
-
 fn has_image_url_parts(messages: &[ChatMessage]) -> bool {
     for msg in messages {
         if let Some(content) = &msg.content {
@@ -66,12 +58,42 @@ fn strip_image_url_parts(messages: &mut [ChatMessage]) {
     }
 }
 
-fn is_image_input_error(status_code: u16, error_text: &str) -> bool {
+fn is_image_input_error(status_code: u16, body: &serde_json::Value, error_text: &str) -> bool {
     if status_code != 400 {
         return false;
     }
+    let error = &body["error"];
+    // Structured local errors are authoritative. Invalid images, unsupported
+    // audio/options/roles/detail, etc. must not be hidden by stripping images.
+    if error["source"].as_str() == Some("openai-proxy") {
+        return error["code"].as_str() == Some("unsupported_content_type")
+            && error["content_type"].as_str() == Some("image_url");
+    }
     let lower = error_text.to_lowercase();
-    IMAGE_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    // Compatibility with the original text-only adapter; do not mistake this
+    // endpoint limitation for proof that the underlying model lacks vision.
+    if lower.trim_end_matches('.') == "only text content parts are supported by this upstream format" {
+        return true;
+    }
+    let unsupported_input_phrases = [
+        "does not support image", "doesn't support image", "do not support image",
+        "does not support vision", "does not support multimodal",
+        "image inputs are not supported", "image input is not supported",
+        "images are not supported", "image_url is not supported",
+        "unsupported image input", "unsupported vision input",
+    ];
+    unsupported_input_phrases.iter().any(|phrase| lower.contains(phrase))
+        || ((lower.contains("text-only") || lower.contains("only text"))
+            && ["image", "vision", "multimodal"].iter().any(|kw| lower.contains(kw)))
+}
+
+fn image_rejection_notice(body: &serde_json::Value, detail: &str) -> &'static str {
+    if body["error"]["source"].as_str() == Some("openai-proxy")
+        || detail.trim_end_matches('.') == "Only text content parts are supported by this upstream format" {
+        "[The proxy adapter cannot translate image inputs for this route. Images were omitted from this request; only file metadata is available. This is not evidence that the underlying model lacks vision. Do not claim to have inspected the images.]"
+    } else {
+        "[The API endpoint rejected image/vision inputs as unsupported. Images were omitted from this request; only file metadata is available. Do not claim to have inspected the images.]"
+    }
 }
 
 // ── 429 / 529 backoff ────────────────────────────────────────────
@@ -588,7 +610,7 @@ pub async fn chat(
         total_tokens: 0,
     };
 
-    'outer: loop {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -655,27 +677,19 @@ pub async fn chat(
                             .or_else(|| body["error"].as_str())
                             .or_else(|| body["message"].as_str())
                             .unwrap_or(body_text.as_str());
-                        if is_image_input_error(code, detail)
+                        if is_image_input_error(code, &body, detail)
                             && !is_context_limit_error(code, &body, detail)
-                            && has_image_url_parts(&current_messages)
+                            && has_image_url_parts(&request_messages)
                         {
-                            strip_image_url_parts(&mut current_messages);
-                            current_messages.push(ChatMessage {
-                                role: "user".into(),
-                                content: Some(serde_json::Value::String(
-                                    "[This AI model does not support image/vision inputs, \
-                                     so the image could not be attached. \
-                                     The file metadata was returned above.]"
-                                        .into(),
-                                )),
-                                attachments: vec![],
-                                tool_calls: vec![],
-                                tool_call_id: None,
-                                reasoning_content: None,
-                                reasoning: None,
-                                reasoning_details: None,
-                            });
-                            continue 'outer;
+                            // Retry the provider copy only. Stripping stored
+                            // messages would miss attachment refs, which get
+                            // resolved back into image parts on the next turn.
+                            strip_image_url_parts(&mut request_messages);
+                            request_messages.push(ChatMessage::new("user", Some(
+                                serde_json::Value::String(image_rejection_notice(&body, detail).into()),
+                            )));
+                            payload["messages"] = serde_json::to_value(&request_messages).unwrap();
+                            continue;
                         }
 
                         if is_context_limit_error(code, &body, detail) {
@@ -1366,6 +1380,42 @@ mod tests {
     }
 
     #[test]
+    fn image_recovery_requires_explicit_unsupported_input_signal() {
+        let empty = serde_json::json!({});
+        assert!(is_image_input_error(400, &empty, "Only text content parts are supported by this upstream format"));
+        assert!(is_image_input_error(400, &empty, "This model does not support image inputs"));
+        for message in ["Unsupported parameter: temperature", "Invalid image URL",
+            "Unsupported image format", "Unsupported image detail", "context length exceeded"] {
+            assert!(!is_image_input_error(400, &empty, message), "{message}");
+        }
+        let mut body = serde_json::json!({"error":{"source":"openai-proxy",
+            "code":"unsupported_content_type", "content_type":"image_url"}});
+        assert!(is_image_input_error(400, &body, "cannot translate"));
+        assert!(!is_image_input_error(500, &body, "cannot translate"));
+        body["error"]["content_type"] = serde_json::json!("input_audio");
+        assert!(!is_image_input_error(400, &body, "images unsupported"));
+        body["error"]["code"] = serde_json::json!("invalid_chat_request");
+        assert!(!is_image_input_error(400, &body, "images unsupported"));
+    }
+
+    #[test]
+    fn provider_image_stripping_preserves_local_history_and_attachment_refs() {
+        let mut original = attached_user("look", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        original.content = Some(serde_json::json!([
+            {"type":"text", "text":"look"},
+            {"type":"image_url", "image_url":{"url":"data:image/png;base64,aW1hZ2U="}}
+        ]));
+        let history = vec![original];
+        let mut outgoing = history.clone();
+        outgoing[0].attachments.clear();
+        strip_image_url_parts(&mut outgoing);
+        assert!(!has_image_url_parts(&outgoing));
+        assert_eq!(outgoing[0].content.as_ref().unwrap(), "look");
+        assert!(has_image_url_parts(&history));
+        assert_eq!(history[0].attachments.len(), 1);
+    }
+
+    #[test]
     fn provider_messages_zero_keeps_all_turns_but_strips_metadata() {
         let messages = vec![attached_user("one", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), attached_user("two", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")];
         let provider = provider_messages(&messages, 0);
@@ -2052,6 +2102,78 @@ mod loop_tests {
             if m["role"] == "user" {
                 assert!(m["content"].is_string(), "nothing should be attached");
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_image_unsupported_input_recovers_once_without_losing_tool_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shot.png");
+        image::RgbImage::from_pixel(48, 32, image::Rgb([10, 120, 200])).save(&file).unwrap();
+        let args = serde_json::json!({"path": file.to_str().unwrap()});
+        let envelope = serde_json::json!({"format":"openai-proxy/reasoning-v1",
+            "provider":"anthropic_messages", "proxy_model":"stub-model", "model":"upstream",
+            "blocks":[{"type":"tool_use", "id":"tc1", "name":"read_image", "input":args}]});
+        for error in [
+            serde_json::json!({"error":{"source":"openai-proxy", "code":"unsupported_content_type",
+                "content_type":"image_url", "message":"Adapter cannot translate pictures"}}),
+            serde_json::json!({"error":"Only text content parts are supported by this upstream format"}),
+        ] {
+            let mut first = completion("", serde_json::json!([tool_call("tc1", "read_image", &args)]), (10, 5));
+            first["choices"][0]["message"]["reasoning_details"] = envelope.clone();
+            let (base, requests) = stub_server_sequence(vec![
+                (200, first), (400, error),
+                (200, completion("I could not inspect the image", serde_json::Value::Null, (10, 5)))]);
+            let mut d = start_chat(&base, vec![user_msg("look")], ToolConfirmation::All, "", false);
+            let mut tool_results = 0;
+            let mut final_response = false;
+            while let Some(event) = d.rx.recv().await {
+                match event {
+                    LlmEvent::ToolResult { .. } => tool_results += 1,
+                    LlmEvent::FinalResponse { .. } => { final_response = true; break; },
+                    LlmEvent::Error { message, .. } => panic!("unexpected failure: {message}"),
+                    _ => {}
+                }
+            }
+            d.handle.await.unwrap();
+            assert!(final_response);
+            assert_eq!(tool_results, 1);
+            let req = requests.lock().unwrap();
+            assert_eq!(req.len(), 3);
+            let before: Vec<ChatMessage> = serde_json::from_value(req[1]["messages"].clone()).unwrap();
+            let after: Vec<ChatMessage> = serde_json::from_value(req[2]["messages"].clone()).unwrap();
+            assert!(has_image_url_parts(&before));
+            assert!(!has_image_url_parts(&after));
+            assert_eq!(req[2]["messages"][1]["reasoning_details"], envelope);
+            assert_eq!(req[2]["messages"][2]["tool_call_id"], "tc1");
+            let notice = after.last().unwrap().content.as_ref().unwrap().as_str().unwrap();
+            assert!(notice.contains("proxy adapter"));
+            assert!(notice.contains("not evidence"));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_image_bad_request_is_not_hidden_by_image_recovery() {
+        for message in ["Unsupported parameter: temperature", "Invalid image URL", "Unsupported image format"] {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("shot.png");
+            image::RgbImage::from_pixel(48, 32, image::Rgb([10, 120, 200])).save(&file).unwrap();
+            let args = serde_json::json!({"path": file.to_str().unwrap()});
+            let (base, requests) = stub_server_sequence(vec![
+                (200, completion("", serde_json::json!([tool_call("tc1", "read_image", &args)]), (10, 5))),
+                (400, serde_json::json!({"error":{"message":message}}))]);
+            let mut d = start_chat(&base, vec![user_msg("look")], ToolConfirmation::All, "", false);
+            let mut failed = false;
+            while let Some(event) = d.rx.recv().await {
+                match event {
+                    LlmEvent::Error { message: detail, .. } => { assert!(detail.contains(message)); failed = true; break; },
+                    LlmEvent::FinalResponse { .. } => panic!("error must not become an answer"),
+                    _ => {}
+                }
+            }
+            d.handle.await.unwrap();
+            assert!(failed);
+            assert_eq!(requests.lock().unwrap().len(), 2);
         }
     }
 
