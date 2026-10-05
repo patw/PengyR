@@ -106,6 +106,9 @@ const RETRYABLE_STATUSES: &[u16] = &[429, 529];
 
 // Context errors get size-reduction retries, never generic bad requests.
 const MAX_CONTEXT_RETRIES: u32 = 4;
+/// A length stop this short is context starvation, not a plausible output cap;
+/// larger (or unreported) completions keep the safe truncation failure.
+const SHORT_LENGTH_COMPLETION_TOKENS: u64 = 1024;
 const CONTEXT_PREVIEW: usize = 1500;
 const CONTEXT_STUB: &str = "[tool output omitted from provider request to fit context; original remains in chat history]";
 const CONTEXT_ERROR_CODES: &[&str] = &[
@@ -860,7 +863,10 @@ pub async fn chat(
         // Fail before emitting/persisting assistant messages or executing tools.
         // A length-truncated tool sequence is unsafe even if its JSON parses.
         if choice["finish_reason"].as_str() == Some("length") {
-            if content.trim().is_empty() && tool_calls.is_none_or(|calls| calls.is_empty()) {
+            let has_tool_calls = tool_calls.is_some_and(|calls| !calls.is_empty());
+            // The truncated reply is discarded unexecuted; a retry regenerates
+            // it against a smaller provider view.
+            if length_suggests_context_pressure(&content, has_tool_calls, &body["usage"], recovery.options.output_limit) {
                 match recover(&mut recovery, &current_messages, &client, &url, api_key, model, &cancel, &mut accumulated_usage).await {
                     Ok(Some(event)) => { let _ = event_tx.send(event); continue; }
                     Err(detail) => { let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail }); return; }
@@ -869,7 +875,7 @@ pub async fn chat(
             }
             let _ = event_tx.send(LlmEvent::Error {
                 kind: "truncated".into(),
-                message: generation_limit_message(&content, tool_calls.is_some_and(|calls| !calls.is_empty())),
+                message: generation_limit_message(&content, has_tool_calls, &body["usage"], recovery.attempts),
             });
             return;
         }
@@ -1184,8 +1190,33 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
     }))
 }
 
+/// Whether a length stop is worth a context-reduction retry.
+///
+/// An empty answer always qualifies. A partial answer or truncated tool call
+/// qualifies only when the provider reports a completion too short to be an
+/// output cap -- typically a lead-in like "Redoing it properly:" cut off just
+/// before its tool call because the window was nearly full.
+fn length_suggests_context_pressure(content: &str, has_tool_calls: bool, usage: &serde_json::Value, output_limit: u64) -> bool {
+    if !has_tool_calls && content.trim().is_empty() {
+        return true;
+    }
+    let limit = if output_limit > 0 { SHORT_LENGTH_COMPLETION_TOKENS.min(output_limit) } else { SHORT_LENGTH_COMPLETION_TOKENS };
+    usage["completion_tokens"].as_u64().is_some_and(|tokens| tokens < limit)
+}
+
+/// `1234567` -> `"1,234,567"`, matching Python's `{:,}` in the shared message.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    out
+}
+
 /// Length means generation exhaustion, not necessarily a full context window.
-fn generation_limit_message(content: &str, has_tool_calls: bool) -> String {
+fn generation_limit_message(content: &str, has_tool_calls: bool, usage: &serde_json::Value, recovery_attempts: u32) -> String {
     let detail = if has_tool_calls {
         "Generation limit reached during tool calls; no tools from this response were executed."
     } else if content.trim().is_empty() {
@@ -1193,8 +1224,17 @@ fn generation_limit_message(content: &str, has_tool_calls: bool) -> String {
     } else {
         "Generation limit reached; the answer is incomplete."
     };
+    let counts = match (usage["prompt_tokens"].as_u64(), usage["completion_tokens"].as_u64()) {
+        (Some(prompt), Some(completion)) => format!(" (prompt {} tokens, completion {} tokens)", thousands(prompt), thousands(completion)),
+        _ => String::new(),
+    };
+    let retried = if recovery_attempts > 0 {
+        format!("Pengy retried after {recovery_attempts} context reduction(s) without success.")
+    } else {
+        "Pengy did not retry automatically.".to_string()
+    };
     let mut message = format!(
-        "{detail} The provider reported finish_reason=length. This can mean an output-token cap or insufficient remaining context. Try a shorter conversation, a larger output allowance, or a reasoning budget that leaves room for an answer. Pengy did not retry automatically."
+        "{detail} The provider reported finish_reason=length{counts}. This can mean an output-token cap or insufficient remaining context. Try a shorter conversation, a larger output allowance, or a reasoning budget that leaves room for an answer. {retried}"
     );
     if !content.trim().is_empty() {
         message.push_str(&format!("\n\nPartial response (incomplete, not saved as an answer):\n{content}"));
@@ -1933,6 +1973,77 @@ mod loop_tests {
             assert_eq!(outgoing[outgoing.len()-2]["tool_calls"][0]["id"], "newest");
             assert_eq!(serde_json::to_value(&messages).unwrap(), original);
         }
+    }
+
+    fn recoverable_history() -> Vec<ChatMessage> {
+        let mut messages = vec![user_msg(&format!("Old requirement: HARBOR_17. {}", "history ".repeat(1000))), ChatMessage::new("assistant", Some(serde_json::json!("done")))];
+        for _ in 0..4 { messages.push(user_msg("recent")); messages.push(ChatMessage::new("assistant", Some(serde_json::json!("ok")))); }
+        messages.push(user_msg("current"));
+        messages
+    }
+
+    fn length_stop(content: &str, tool_calls: serde_json::Value, completion_tokens: u64) -> serde_json::Value {
+        let mut reply = completion(content, tool_calls, (250000, completion_tokens));
+        reply["choices"][0]["finish_reason"] = serde_json::json!("length");
+        reply
+    }
+
+    #[test]
+    fn short_length_completions_suggest_context_pressure() {
+        let usage = |n: u64| serde_json::json!({"prompt_tokens": 250000, "completion_tokens": n});
+        assert!(length_suggests_context_pressure(" ", false, &serde_json::Value::Null, 0));
+        assert!(length_suggests_context_pressure("Redoing it properly:", false, &usage(14), 0));
+        assert!(length_suggests_context_pressure("Writing:", true, &usage(40), 0));
+        assert!(!length_suggests_context_pressure("A long partial answer", false, &usage(4096), 0));
+        assert!(!length_suggests_context_pressure("Capped", false, &usage(256), 256));
+        assert!(!length_suggests_context_pressure("Unreported", false, &serde_json::Value::Null, 0));
+        let message = generation_limit_message("partial", false, &usage(4096), 0);
+        assert!(message.contains("finish_reason=length (prompt 250,000 tokens, completion 4,096 tokens)"), "{message}");
+        assert!(message.contains("did not retry automatically"));
+        assert!(generation_limit_message("partial", false, &usage(8), 3).contains("retried after 3 context reduction(s) without success"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_partial_length_recovers_and_discards_lead_in() {
+        let lead_in = "The mutations never applied — redoing it properly:";
+        let messages = recoverable_history();
+        let original = serde_json::to_value(&messages).unwrap();
+        let (base, requests) = stub_server(vec![length_stop(lead_in, serde_json::Value::Null, 14),
+            completion("HARBOR_17", serde_json::Value::Null, (20, 10)), completion("recovered", serde_json::Value::Null, (30, 5))]);
+        let mut d = start_chat(&base, messages.clone(), ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content == "recovered"));
+        d.handle.await.unwrap();
+        assert!(d.rx.recv().await.is_none());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1..].iter().all(|r| !r.to_string().contains(lead_in)));
+        assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_truncated_tool_call_recovers_without_executing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist");
+        let mut call = tool_call("tc1", "write_file", &serde_json::json!({"path": target, "content": "unsafe"}));
+        call["function"]["arguments"] = serde_json::json!("{\"path\":");
+        let (base, _requests) = stub_server(vec![length_stop("Writing:", serde_json::json!([call]), 40),
+            completion("HARBOR_17", serde_json::Value::Null, (20, 10)), completion("recovered", serde_json::Value::Null, (30, 5))]);
+        let mut d = start_chat(&base, recoverable_history(), ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content == "recovered"));
+        d.handle.await.unwrap();
+        assert!(!target.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_partial_length_still_fails_safely_with_token_counts() {
+        let (base, requests) = stub_server(vec![length_stop("A long partial answer", serde_json::Value::Null, 4096)]);
+        let mut d = start_chat(&base, recoverable_history(), ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::Error { kind, message }
+            if kind == "truncated" && message.contains("completion 4,096 tokens") && message.contains("did not retry automatically")));
+        d.handle.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]
