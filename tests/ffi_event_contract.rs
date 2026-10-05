@@ -84,6 +84,18 @@ fn run_turn_through_ffi(base_url: &str) -> Vec<String> {
 }
 
 #[test]
+fn length_completion_reaches_gui_as_one_terminal_error() {
+    let base = spawn_status_stub(200,
+        r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":48,"total_tokens":58}}"#);
+    let events = run_turn_through_ffi(&base);
+    assert_eq!(events.len(), 1, "no bogus final_response after truncation: {events:?}");
+    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["kind"], "truncated");
+    assert!(event["message"].as_str().unwrap().contains("before an answer was produced"));
+}
+
+#[test]
 fn rejected_credentials_reach_the_gui_as_one_error_event() {
     let base = spawn_status_stub(
         401,

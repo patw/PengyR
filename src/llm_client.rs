@@ -819,6 +819,16 @@ pub async fn chat(
         let content = msg["content"].as_str().unwrap_or("").to_string();
         let tool_calls = msg["tool_calls"].as_array();
 
+        // Fail before emitting/persisting assistant messages or executing tools.
+        // A length-truncated tool sequence is unsafe even if its JSON parses.
+        if choice["finish_reason"].as_str() == Some("length") {
+            let _ = event_tx.send(LlmEvent::Error {
+                kind: "truncated".into(),
+                message: generation_limit_message(&content, tool_calls.is_some_and(|calls| !calls.is_empty())),
+            });
+            return;
+        }
+
         if let Some(tool_calls) = tool_calls {
             if !tool_calls.is_empty() {
                 // Build the assistant message for history
@@ -1094,6 +1104,24 @@ pub async fn chat(
         });
         return;
     }
+}
+
+/// Length means generation exhaustion, not necessarily a full context window.
+fn generation_limit_message(content: &str, has_tool_calls: bool) -> String {
+    let detail = if has_tool_calls {
+        "Generation limit reached during tool calls; no tools from this response were executed."
+    } else if content.trim().is_empty() {
+        "Generation limit reached before an answer was produced."
+    } else {
+        "Generation limit reached; the answer is incomplete."
+    };
+    let mut message = format!(
+        "{detail} The provider reported finish_reason=length. This can mean an output-token cap or insufficient remaining context. Try a shorter conversation, a larger output allowance, or a reasoning budget that leaves room for an answer. Pengy did not retry automatically."
+    );
+    if !content.trim().is_empty() {
+        message.push_str(&format!("\n\nPartial response (incomplete, not saved as an answer):\n{content}"));
+    }
+    message
 }
 
 fn response_tokens_per_second(body: &serde_json::Value, seconds: f64) -> Option<f64> {
@@ -1787,6 +1815,104 @@ mod loop_tests {
                 assert!(message.contains("/baseurl"), "{message}");
             }
             other => panic!("expected an error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn length_completions_fail_once_without_assistant_events() {
+        for content in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!(" \n\t"), serde_json::json!("## Partial plan… 🐧")] {
+            let mut reply = completion("", serde_json::Value::Null, (10, 48));
+            reply["choices"][0]["finish_reason"] = serde_json::json!("length");
+            reply["choices"][0]["message"]["content"] = content.clone();
+            let (base, requests) = stub_server(vec![reply]);
+            let history = vec![user_msg("think hard")];
+            let original = serde_json::to_value(&history).unwrap();
+            let mut d = start_chat(&base, history.clone(), ToolConfirmation::All, "", false);
+            match d.rx.recv().await.unwrap() {
+                LlmEvent::Error { kind, message } => {
+                    assert_eq!(kind, "truncated");
+                    assert!(message.contains("finish_reason=length"));
+                    assert!(message.contains("output-token cap or insufficient remaining context"));
+                    assert!(message.contains("did not retry automatically"));
+                    if content.as_str().is_some_and(|text| !text.trim().is_empty()) {
+                        assert!(message.contains("answer is incomplete"));
+                        assert!(message.contains(content.as_str().unwrap()));
+                        assert!(message.contains("not saved as an answer"));
+                    } else {
+                        assert!(message.contains("before an answer was produced"));
+                    }
+                }
+                other => panic!("truncation must only emit an error, got {other:?}"),
+            }
+            d.handle.await.unwrap();
+            assert!(d.rx.recv().await.is_none());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(serde_json::to_value(&history).unwrap(), original);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn length_tool_calls_never_execute_even_when_arguments_parse() {
+        for malformed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("must-not-exist");
+            let args = serde_json::json!({"path": target, "content": "unsafe"});
+            let mut call = tool_call("tc1", "write_file", &args);
+            if malformed { call["function"]["arguments"] = serde_json::json!("{\"path\":"); }
+            let mut reply = completion("About to write", serde_json::json!([call]), (10, 48));
+            reply["choices"][0]["finish_reason"] = serde_json::json!("length");
+            let (base, requests) = stub_server(vec![reply]);
+            let mut d = start_chat(&base, vec![user_msg("write")], ToolConfirmation::All, "", false);
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::Error { kind, message }
+                if kind == "truncated" && message.contains("no tools from this response were executed")));
+            d.handle.await.unwrap();
+            assert!(d.rx.recv().await.is_none());
+            assert!(!target.exists());
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn length_after_completed_tool_does_not_rerun_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("done.txt");
+        let args = serde_json::json!({"path": target, "content": "done"});
+        let first = completion("", serde_json::json!([tool_call("tc1", "write_file", &args)]), (10, 5));
+        let mut last = completion("", serde_json::Value::Null, (20, 48));
+        last["choices"][0]["finish_reason"] = serde_json::json!("length");
+        let (base, requests) = stub_server(vec![first, last]);
+        let mut d = start_chat(&base, vec![user_msg("write")], ToolConfirmation::All, "", false);
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::AssistantToolCalls { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolResult { .. }));
+        assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::Error { kind, .. } if kind == "truncated"));
+        d.handle.await.unwrap();
+        assert!(d.rx.recv().await.is_none());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "done");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_tool_only_responses_with_missing_or_tool_finish_reason_still_run() {
+        for reason in [None, Some("tool_calls")] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("safe.txt");
+            let args = serde_json::json!({"path": target, "content": "done"});
+            let mut first = completion("", serde_json::json!([tool_call("tc1", "write_file", &args)]), (10, 5));
+            if let Some(reason) = reason {
+                first["choices"][0]["finish_reason"] = serde_json::json!(reason);
+            } else {
+                first["choices"][0].as_object_mut().unwrap().remove("finish_reason");
+            }
+            let (base, requests) = stub_server(vec![first, completion("written", serde_json::Value::Null, (20, 5))]);
+            let mut d = start_chat(&base, vec![user_msg("write")], ToolConfirmation::All, "", false);
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::AssistantToolCalls { .. }));
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolRequest { .. }));
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ToolResult { .. }));
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content == "written"));
+            d.handle.await.unwrap();
+            assert_eq!(std::fs::read_to_string(target).unwrap(), "done");
+            assert_eq!(requests.lock().unwrap().len(), 2);
         }
     }
 

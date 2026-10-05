@@ -268,6 +268,9 @@ fn main() {    // Durable attachment maintenance is exposed as a read-only repor
         cli.run_interactive();
     } else {
         cli.run_single_shot(&prompt_args.join(" "));
+        if cli.truncation_failed {
+            std::process::exit(1);
+        }
     }
 }
 
@@ -277,6 +280,7 @@ struct PengyCli {
     no_save: bool,
     yolo_this_turn: bool,
     output_mode: String,
+    truncation_failed: bool,
     rt: tokio::runtime::Runtime,
     rl: Editor<PengyHelper, FileHistory>,
     hist_path: std::path::PathBuf,
@@ -318,6 +322,7 @@ impl PengyCli {
             no_save,
             yolo_this_turn: false,
             output_mode: "pretty".to_string(),
+            truncation_failed: false,
             rt,
             rl,
             hist_path,
@@ -477,6 +482,7 @@ impl PengyCli {
     // ── Chat driver ──────────────────────────────────────────────
 
     fn drive_chat(&mut self) {
+        self.truncation_failed = false;
         let chat = self.current_chat.as_ref().unwrap();
         let messages = build_messages(chat, &self.config);
         let tc_mode = ToolConfirmation::from_str(&self.config.tool_confirmation);
@@ -752,6 +758,12 @@ impl PengyCli {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
+                    if kind == "truncated" {
+                        self.truncation_failed = true;
+                        if self.output_mode == "json" {
+                            println!("{}", serde_json::json!({"error": {"type": kind, "message": message}}));
+                        }
+                    }
                     self.report_turn_error(&kind, &message);
                     break;
                 }
@@ -819,6 +831,7 @@ impl PengyCli {
     // ── Rendering ────────────────────────────────────────────────
 
     fn render_tool_request(&self, name: &str, args: &serde_json::Value) {
+        if matches!(self.output_mode.as_str(), "json" | "silent") { return; }
         let mut args_str = serde_json::to_string_pretty(args).unwrap_or_default();
         if char_count(&args_str) > 4000 {
             args_str = format!("{}\n\n[... truncated ...]", take_chars(&args_str, 4000));
@@ -840,6 +853,7 @@ impl PengyCli {
     }
 
     fn render_tool_result(&self, content: &str, declined: bool) {
+        if matches!(self.output_mode.as_str(), "json" | "silent") { return; }
         if declined {
             print_box("Tool output", &["Declined".to_string()], None);
             return;

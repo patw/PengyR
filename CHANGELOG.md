@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.11.1
+
+- **Report generation truncation instead of a successful blank answer.** Completions with `finish_reason: length` now fail clearly before tool execution or assistant-history persistence. Partial text is labelled incomplete in the error; truncated tool calls are never executed. No automatic retry or context reduction is attempted because a generation cap does not prove context overflow. Single-shot CLI returns exit 1 and a structured error in JSON mode. Token-budget and history-compaction policies are unchanged.
+
 ## v1.11.0
 
 - Remove the legacy Minimal reasoning-effort option from the GUI quick-settings dropdown and GUI/web Settings lists; all other options are unchanged.

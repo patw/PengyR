@@ -596,6 +596,66 @@ fn task_round_trip_completes_a_turn() {
 // ── Single-shot mode ─────────────────────────────────────────────────
 
 #[test]
+fn length_single_shot_fails_with_json_error_and_no_assistant_history() {
+    for content in ["", "Only the first step… 🐧", "after-tool"] {
+        let h = Harness::new();
+        let mut replies = Vec::new();
+        if content == "after-tool" {
+            let target = h.config_path().join("done.txt");
+            let args = serde_json::json!({"path": target, "content": "done"});
+            replies.push(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"",
+                "tool_calls":[{"id":"tc1","type":"function","function":{"name":"write_file","arguments":args.to_string()}}]},
+                "finish_reason":"tool_calls"}]}).to_string());
+        }
+        let text = if content == "after-tool" { "" } else { content };
+        let mut reply: serde_json::Value = serde_json::from_str(&llm_completion(text, 10, 48)).unwrap();
+        reply["choices"][0]["finish_reason"] = serde_json::json!("length");
+        replies.push(reply.to_string());
+        let stub = spawn_stub_llm(replies);
+        h.point_at(&stub.base_url);
+        let output = Command::new(cli_bin())
+            .env("PENGY_CONFIG_DIR", h.config_path())
+            .env("HOME", h.home_dir.path())
+            .args(["--output", "json", "think hard"])
+            .output().expect("run single-shot");
+        assert_eq!(output.status.code(), Some(1));
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["error"]["type"], "truncated");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Generation limit reached"));
+        if !text.is_empty() {
+            assert!(payload["error"]["message"].as_str().unwrap().contains(text));
+        }
+        let chat_path = h.chats_dir().read_dir().unwrap().filter_map(|e| e.ok())
+            .map(|e| e.path()).find(|p| p.extension().is_some_and(|s| s == "json")
+                && p.file_stem().is_some_and(|s| s != "index")).unwrap();
+        let chat: Chat = serde_json::from_slice(&std::fs::read(chat_path).unwrap()).unwrap();
+        assert_eq!(chat.messages[0].role, "user");
+        if content == "after-tool" {
+            assert_eq!(chat.messages.len(), 3);
+            assert_eq!(chat.messages[1].tool_calls.len(), 1);
+            assert_eq!(chat.messages[2].role, "tool");
+            assert_eq!(std::fs::read_to_string(h.config_path().join("done.txt")).unwrap(), "done");
+        } else {
+            assert_eq!(chat.messages.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn length_interactive_turn_reports_error_and_keeps_repl_alive() {
+    let h = Harness::new();
+    let chat = h.seed_chat("Truncation", vec![user_msg("earlier")]);
+    let mut reply: serde_json::Value = serde_json::from_str(&llm_completion("", 10, 48)).unwrap();
+    reply["choices"][0]["finish_reason"] = serde_json::json!("length");
+    let stub = spawn_stub_llm(vec![reply.to_string()]);
+    h.point_at(&stub.base_url);
+    let (out, err) = h.run_capture(&["think hard"], Duration::from_secs(10));
+    assert!(out.contains("Goodbye"));
+    assert!(err.contains("before an answer was produced"));
+    assert!(!h.read_chat(&chat.id).messages.iter().any(|m| m.role == "assistant"));
+}
+
+#[test]
 fn single_shot_completes_a_turn_and_reports_usage() {
     let h = Harness::new();
     let stub = spawn_stub_llm(vec![llm_completion("General Kenobi!", 20, 8)]);
