@@ -67,6 +67,7 @@ rm -rf "$ICONSET"
 # Create .app bundle
 echo "==> Creating Pengy.app bundle..."
 APP_DIR="$ROOT/Pengy.app"
+rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$ROOT/gui/build_macos/pengy" "$APP_DIR/Contents/MacOS/"
 cp "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-cli" "$APP_DIR/Contents/MacOS/"
@@ -74,44 +75,60 @@ cp "$ROOT/target/$RUST_ARCH-apple-darwin/release/pengy-web" "$APP_DIR/Contents/M
 chmod +x "$APP_DIR/Contents/MacOS/pengy" "$APP_DIR/Contents/MacOS/pengy-cli" "$APP_DIR/Contents/MacOS/pengy-web"
 cp "$ROOT/gui/Info.plist" "$APP_DIR/Contents/"
 cp "$ROOT/pengy.icns" "$APP_DIR/Contents/Resources/"
-# Use macdeployqt to bundle Qt frameworks
-macdeployqt "$APP_DIR" -verbose=2
+# Deploy Widgets dependencies, not Qt's unrelated QML/optional plugin sweep.
+# Delay signing until every copied library's load commands are final.
+QT_PLUGIN_DIR="$(qmake -query QT_INSTALL_PLUGINS)"
+DEPLOY_ARGS=(-always-overwrite -no-plugins -no-codesign)
+for formula in brotli webp; do
+    prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
+    [ -z "$prefix" ] || DEPLOY_ARGS+=("-libpath=$prefix/lib")
+done
+macdeployqt "$APP_DIR" "${DEPLOY_ARGS[@]}" -verbose=2
+PLUGIN_ARGS=()
+# Cocoa and SVG are required by the Widgets UI; image/TLS plugins are optional
+# but copied explicitly so functionality is retained without a QML sweep.
+for plugin in platforms/libqcocoa.dylib iconengines/libqsvgicon.dylib \
+              imageformats/libqsvg.dylib imageformats/libqjpeg.dylib \
+              imageformats/libqgif.dylib imageformats/libqico.dylib \
+              imageformats/libqwebp.dylib imageformats/libqtiff.dylib \
+              styles/libqmacstyle.dylib tls/libqsecuretransportbackend.dylib; do
+    source="$QT_PLUGIN_DIR/$plugin"
+    if [ -f "$source" ]; then
+        mkdir -p "$APP_DIR/Contents/PlugIns/$(dirname "$plugin")"
+        cp "$source" "$APP_DIR/Contents/PlugIns/$plugin"
+        PLUGIN_ARGS+=("-executable=$APP_DIR/Contents/PlugIns/$plugin")
+    elif [ "$plugin" = platforms/libqcocoa.dylib ]; then
+        echo "ERROR: required Cocoa plugin missing: $source" >&2; exit 1
+    fi
+done
+macdeployqt "$APP_DIR" "${DEPLOY_ARGS[@]}" "${PLUGIN_ARGS[@]}" -verbose=2
 
-# macdeployqt modifies dylib load paths which invalidates existing signatures;
-# re-sign everything with an ad-hoc signature so macOS will launch the app
+# Normalize library IDs and resolve residual @rpath edges before signing.
+python3 "$ROOT/scripts/fix_macos_dependencies.py" "$APP_DIR"
+
+# Sign leaf Mach-O files after deployment, then seal the complete bundle.
+while IFS= read -r -d '' binary; do
+    if file -b "$binary" | grep -q 'Mach-O'; then
+        codesign --force --sign - "$binary"
+    fi
+done < <(find "$APP_DIR/Contents" -type f -print0)
 codesign --force --deep --sign - "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+
+# Fail packaging if a dependency still points at the developer/runner machine.
+while IFS= read -r -d '' binary; do
+    if file -b "$binary" | grep -q 'Mach-O'; then
+        if otool -L "$binary" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/(opt|Cellar)/|/Users/runner/'; then
+            echo "ERROR: nonportable dependency in $binary" >&2; exit 1
+        fi
+    fi
+done < <(find "$APP_DIR/Contents" -type f -print0)
+for binary in pengy pengy-cli pengy-web; do
+    version_output=$(env -i PATH=/usr/bin:/bin HOME="$HOME" "$APP_DIR/Contents/MacOS/$binary" --version)
+    [[ "$version_output" == Pengy\ v* ]] || { echo "ERROR: isolated $binary launch failed" >&2; exit 1; }
+    echo "==> Isolated $binary: $version_output"
+done
 
 echo "==> App bundle: $APP_DIR"
-
-# Create DMG for distribution
-echo "==> Creating DMG..."
-DMG_NAME="Pengy-macOS-$MACOS_ARCH.dmg"
-DMG_STAGING="$ROOT/.dmg_staging"
-rm -rf "$DMG_STAGING"
-mkdir -p "$DMG_STAGING"
-cp -r "$APP_DIR" "$DMG_STAGING/"
-cp "$ROOT/install_macos_cli.sh" "$DMG_STAGING/Install CLI Tools.command"
-chmod +x "$DMG_STAGING/Install CLI Tools.command"
-ln -s /Applications "$DMG_STAGING/Applications"
-
-# Add volume icon to staging area
-cp "$ROOT/pengy.icns" "$DMG_STAGING/.VolumeIcon.icns"
-
-hdiutil create \
-    -volname "Pengy" \
-    -srcfolder "$DMG_STAGING" \
-    -ov \
-    -format UDRW \
-    "$ROOT/$DMG_NAME"
-
-# Set the volume's custom icon bit so Finder uses .VolumeIcon.icns
-DMG_MOUNT=$(hdiutil attach -readwrite -noverify "$ROOT/$DMG_NAME" | grep -oE '/Volumes/.+$')
-SetFile -a C "$DMG_MOUNT"
-hdiutil detach "$DMG_MOUNT" -quiet
-
-# Convert to compressed read-only DMG
-hdiutil convert "$ROOT/$DMG_NAME" -format UDZO -o "$ROOT/${DMG_NAME%.dmg}-compressed.dmg" -ov
-mv "$ROOT/${DMG_NAME%.dmg}-compressed.dmg" "$ROOT/$DMG_NAME"
-
-rm -rf "$DMG_STAGING"
-echo "==> DMG ready: $ROOT/$DMG_NAME"
+bash "$ROOT/scripts/package_macos_dmg.sh" "$APP_DIR" "$ROOT/pengy.icns" \
+    "$ROOT/install_macos_cli.sh" "$ROOT/Pengy-macOS-$MACOS_ARCH.dmg"

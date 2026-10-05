@@ -104,6 +104,9 @@ jobs:
         run: |
           brew install qt@6 cmake
 
+      - name: Check packaging regressions
+        run: python3 tests/test_macos_packaging.py -v
+
       - name: Build DMG
         run: ./build_macos.sh
 

@@ -52,8 +52,14 @@ cd appimage && ./build.sh
 brew install qt@6 cmake rust
 ./build_macos.sh [arm64|x86_64]
 # → Pengy.app
-# → PengyR-macOS-<arch>.dmg
+# → Pengy-macOS-<arch>.dmg
 ```
+
+The packager deploys explicit Qt Widgets/image/TLS plugins, closes residual
+library paths inside the bundle, and verifies strict ad-hoc signatures and
+isolated launches. The DMG is created directly in compressed UDZO format;
+no writable mount or `SetFile` custom-icon step is required on headless runners.
+Packaging regression checks: `python3 tests/test_macos_packaging.py -v`.
 
 ## Windows
 

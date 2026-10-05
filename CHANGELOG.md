@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Harden macOS packaging.** Create the compressed DMG directly instead of mounting a writable image to set a cosmetic icon attribute. Deploy only the required Qt plugin families, repair residual bundle-local library paths, and verify signatures and isolated binary launches before packaging. Adds packaging regressions; application behavior and the v1.11.2 tag are unchanged.
+
 ## v1.11.2
 
 - **Automatic context recovery.** On explicit context overflow or an empty length-truncated reply, progressively reduce a provider-only conversation view: omit historical reasoning text, preview/stub large tool results, then summarize old completed turns. Protect instructions, the active task/tool chain and recent turns; keep required continuation state and the full transcript. Bounded retries and tool-free summary calls never rerun completed tools. Durable validated checkpoints avoid restoring oversized history next turn; recovery notices explain what changed. Optional output-token allowance and recovery settings are documented in `docs/context-recovery.md`.
