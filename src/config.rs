@@ -50,6 +50,14 @@ pub struct Config {
     /// Number of recent turns to keep when compacting context. 0 = keep all.
     #[serde(default)]
     pub context_keep_turns: usize,
+    #[serde(default = "default_auto_context_recovery")]
+    pub auto_context_recovery: bool,
+    #[serde(default = "default_recovery_keep_turns")]
+    pub recovery_keep_turns: usize,
+    #[serde(default)]
+    pub output_token_limit: u64,
+    #[serde(default = "default_output_token_parameter")]
+    pub output_token_parameter: String,
     /// Number of recent user turns whose media is included in provider context.
     #[serde(default = "default_attachment_context_keep_turns")]
     pub attachment_context_keep_turns: usize,
@@ -120,6 +128,9 @@ fn default_system_message() -> String {
 fn default_tool_confirmation() -> String {
     "none".into()
 }
+fn default_auto_context_recovery() -> bool { true }
+fn default_recovery_keep_turns() -> usize { 3 }
+fn default_output_token_parameter() -> String { "max_tokens".into() }
 fn default_attachment_context_keep_turns() -> usize { 4 }
 fn default_ui_scale() -> u32 {
     100
@@ -166,6 +177,10 @@ impl Default for Config {
             reasoning_effort: String::new(),
             preserve_reasoning: false,
             context_keep_turns: 0,
+            auto_context_recovery: true,
+            recovery_keep_turns: 3,
+            output_token_limit: 0,
+            output_token_parameter: default_output_token_parameter(),
             attachment_context_keep_turns: default_attachment_context_keep_turns(),
             ui_scale: default_ui_scale(),
             theme_mode: default_theme_mode(),
@@ -290,6 +305,10 @@ pub fn load_config() -> Config {
                             config.preserve_reasoning = b;
                         }
                     }
+                    if let Some(b) = obj.get("auto_context_recovery").and_then(|v| v.as_bool()) { config.auto_context_recovery = b; }
+                    if let Some(n) = obj.get("recovery_keep_turns").and_then(|v| v.as_u64()) { config.recovery_keep_turns = n as usize; }
+                    if let Some(n) = obj.get("output_token_limit").and_then(|v| v.as_u64()) { config.output_token_limit = n; }
+                    if let Some(s) = obj.get("output_token_parameter").and_then(|v| v.as_str()) { config.output_token_parameter = s.into(); }
                     if let Some(v) = obj.get("context_keep_turns") {
                         if let Some(n) = v.as_u64() {
                             config.context_keep_turns = n as usize;
@@ -523,6 +542,10 @@ mod tests {
             reasoning_effort: "high".into(),
             preserve_reasoning: true,
             context_keep_turns: 5,
+            auto_context_recovery: true,
+            recovery_keep_turns: 3,
+            output_token_limit: 0,
+            output_token_parameter: default_output_token_parameter(),
             attachment_context_keep_turns: 4,
             ui_scale: 150,
             theme_mode: "dark".into(),

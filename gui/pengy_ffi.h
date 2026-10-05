@@ -65,6 +65,7 @@ extern "C" {
     // provider is never clobbered by another tab.
     typedef struct PengyRun PengyRun;
     PengyRun* pengy_run_new(void);
+    void pengy_run_set_recovery(PengyRun* run, const char* chat_id);
     void      pengy_run_free(PengyRun* run);
 
     bool pengy_llm_chat_run(

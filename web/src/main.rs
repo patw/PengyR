@@ -694,6 +694,7 @@ impl WebWorker {
             let lt = config.llm_timeout;
             let cancel2 = cancel.clone();
             let ctx_for_task = tool_ctx.clone();
+            *ctx_for_task.recovery.lock().unwrap() = pengy_core::context_recovery::Options::configured(&config, &chat.id);
 
             tokio::spawn(async move {
                 llm_client::chat(
@@ -745,8 +746,9 @@ impl WebWorker {
                             });
                         }
                     }
-                    Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed }) => {
+                    Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message }) => {
                         push_event(SseEvent::ContextCompacted { attempt, max_attempts, chars_removed });
+                        if let Some(message) = message { push_event(SseEvent::AssistantMessage { html: format!("<p>{}</p>", escape_html(&message)) }); }
                     }
                     Some(LlmEvent::Retrying {
                         attempt,

@@ -6,6 +6,7 @@
 
 use crate::chat_manager::ChatMessage;
 use crate::tools;
+use crate::context_recovery::{Recovery, SUMMARY_PROMPT};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,6 +118,7 @@ const CONTEXT_ERROR_PHRASES: &[&str] = &[
     "exceeds the model's context", "exceeds the model context",
     "exceeds the context", "context size", "context_length_exceeded",
     "exceeds the maximum allowed number of tokens", "maximum number of tokens",
+    "leaves no room to answer in the context",
 ];
 
 fn is_context_limit_error(status: u16, body: &serde_json::Value, detail: &str) -> bool {
@@ -255,6 +257,8 @@ pub enum LlmEvent {
         attempt: u32,
         max_attempts: u32,
         chars_removed: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
     },
     /// A turn that failed for a reason the user has to act on.
     ///
@@ -610,6 +614,14 @@ pub async fn chat(
         total_tokens: 0,
     };
 
+    let options = tool_ctx.recovery.lock().unwrap().clone();
+    if !["max_tokens", "max_completion_tokens"].contains(&options.output_parameter.as_str()) {
+        emit_config_error(&event_tx, "output_token_parameter must be max_tokens or max_completion_tokens".into());
+        return;
+    }
+    let mut recovery = Recovery::new(&serde_json::to_value(&current_messages).unwrap().as_array().unwrap(), base_url, model, options);
+    let mut image_rejected = false;
+    let mut rejection_notice = String::new();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -617,7 +629,10 @@ pub async fn chat(
 
         // Attachment refs are local history only. Resolve image derivatives at
         // request time so provider payloads never leak back into chat JSON.
-        let mut api_messages = provider_messages(&current_messages, attachment_context_keep_turns);
+        let raw = serde_json::to_value(&current_messages).unwrap();
+        let reduced: Vec<ChatMessage> = serde_json::from_value(serde_json::Value::Array(recovery.apply(raw.as_array().unwrap()))).unwrap();
+        let mut api_messages = provider_messages(&reduced, attachment_context_keep_turns);
+        if image_rejected { strip_image_url_parts(&mut api_messages); api_messages.push(ChatMessage::new("user", Some(serde_json::json!(rejection_notice)))); }
         // Proxy envelopes are opaque state tied to one model and upstream.
         // Keep them in persisted chat history, but don't leak them to a
         // different selected model (including model overrides in a tab).
@@ -636,6 +651,7 @@ pub async fn chat(
         if !reasoning_effort.is_empty() {
             payload["reasoning_effort"] = serde_json::Value::String(reasoning_effort.to_string());
         }
+        if recovery.options.output_limit > 0 { payload[&recovery.options.output_parameter] = serde_json::json!(recovery.options.output_limit); }
 
         // ── API call with 429 / 529 exponential backoff ──────────
         let (resp, request_started) = {
@@ -684,6 +700,8 @@ pub async fn chat(
                             // Retry the provider copy only. Stripping stored
                             // messages would miss attachment refs, which get
                             // resolved back into image parts on the next turn.
+                            image_rejected = true;
+                            rejection_notice = image_rejection_notice(&body, detail).into();
                             strip_image_url_parts(&mut request_messages);
                             request_messages.push(ChatMessage::new("user", Some(
                                 serde_json::Value::String(image_rejection_notice(&body, detail).into()),
@@ -693,6 +711,25 @@ pub async fn chat(
                         }
 
                         if is_context_limit_error(code, &body, detail) {
+                            if recovery.options.enabled {
+                                match recover(&mut recovery, &current_messages, &client, &url, api_key, model, &cancel, &mut accumulated_usage).await {
+                                    Ok(Some(event)) => {
+                                        let _ = event_tx.send(event);
+                                        let raw = serde_json::to_value(&current_messages).unwrap();
+                                        let reduced: Vec<ChatMessage> = serde_json::from_value(serde_json::Value::Array(recovery.apply(raw.as_array().unwrap()))).unwrap();
+                                        request_messages = provider_messages(&reduced, attachment_context_keep_turns);
+                                        strip_cross_model_proxy_state(&mut request_messages, model);
+                                        if image_rejected { strip_image_url_parts(&mut request_messages); request_messages.push(ChatMessage::new("user", Some(serde_json::json!(rejection_notice)))); }
+                                        payload["messages"] = serde_json::to_value(&request_messages).unwrap();
+                                        continue;
+                                    }
+                                    result => {
+                                        let detail = result.err().unwrap_or_else(|| "Model context limit reached; could not fit the protected task after bounded recovery. Full history retained; try a shorter request or a new chat.".into());
+                                        let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail });
+                                        return;
+                                    }
+                                }
+                            }
                             if context_retries < MAX_CONTEXT_RETRIES {
                                 let saved = compact_tool_results(
                                     &mut request_messages, if context_retries == 0 { 1 } else { 2 });
@@ -703,6 +740,7 @@ pub async fn chat(
                                         attempt: context_retries,
                                         max_attempts: MAX_CONTEXT_RETRIES,
                                         chars_removed: saved,
+                                        message: None,
                                     });
                                     continue;
                                 }
@@ -822,6 +860,13 @@ pub async fn chat(
         // Fail before emitting/persisting assistant messages or executing tools.
         // A length-truncated tool sequence is unsafe even if its JSON parses.
         if choice["finish_reason"].as_str() == Some("length") {
+            if content.trim().is_empty() && tool_calls.is_none_or(|calls| calls.is_empty()) {
+                match recover(&mut recovery, &current_messages, &client, &url, api_key, model, &cancel, &mut accumulated_usage).await {
+                    Ok(Some(event)) => { let _ = event_tx.send(event); continue; }
+                    Err(detail) => { let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail }); return; }
+                    _ => {}
+                }
+            }
             let _ = event_tx.send(LlmEvent::Error {
                 kind: "truncated".into(),
                 message: generation_limit_message(&content, tool_calls.is_some_and(|calls| !calls.is_empty())),
@@ -1106,6 +1151,39 @@ pub async fn chat(
     }
 }
 
+/// Execute bounded, tool-free summary calls; commit only a smaller complete plan.
+async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &reqwest::Client,
+                 url: &str, key: &str, model: &str, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
+    let raw = serde_json::to_value(messages).unwrap();
+    let Some(plan) = recovery.plan(raw.as_array().unwrap()) else { return Ok(None); };
+    let mut summaries = vec![];
+    for chunk in &plan.chunks {
+        if cancel.load(Ordering::Relaxed) { return Err("Context recovery cancelled.".into()); }
+        recovery.summary_calls += 1;
+        let mut payload = serde_json::json!({"model": model, "messages":[{"role":"system","content":SUMMARY_PROMPT},{"role":"user","content":chunk}]});
+        payload[&recovery.options.output_parameter] = serde_json::json!(2048);
+        let body: serde_json::Value = client.post(url).bearer_auth(key).header("api-key",key).json(&payload).send().await.map_err(|e| e.to_string())?
+            .error_for_status().map_err(|e| format!("Context summary failed; history retained: {e}"))?.json().await.map_err(|e| e.to_string())?;
+        if let Some(u) = body["usage"].as_object() {
+            usage.prompt_tokens += u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            usage.completion_tokens += u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            usage.total_tokens += u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+        if cancel.load(Ordering::Relaxed) { return Err("Context recovery cancelled.".into()); }
+        let choice = &body["choices"][0];
+        let text = choice["message"]["content"].as_str().unwrap_or("");
+        if choice["finish_reason"] != "stop" || text.trim().is_empty() || choice["message"]["tool_calls"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Err("Context summary was incomplete; original history retained.".into());
+        }
+        summaries.push(text.to_string());
+    }
+    Ok(recovery.commit(plan,summaries,raw.as_array().unwrap())?.map(|v| LlmEvent::ContextCompacted {
+        attempt:v["attempt"].as_u64().unwrap() as u32, max_attempts:4,
+        chars_removed:v["chars_removed"].as_u64().unwrap() as usize,
+        message:v["message"].as_str().map(String::from),
+    }))
+}
+
 /// Length means generation exhaustion, not necessarily a full context window.
 fn generation_limit_message(content: &str, has_tool_calls: bool) -> String {
     let detail = if has_tool_calls {
@@ -1178,7 +1256,7 @@ mod tests {
 
     #[test]
     fn context_event_serde() {
-        let event = LlmEvent::ContextCompacted { attempt: 1, max_attempts: 4, chars_removed: 9000 };
+        let event = LlmEvent::ContextCompacted { attempt: 1, max_attempts: 4, chars_removed: 9000, message: None };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(json, r#"{"type":"context_compacted","attempt":1,"max_attempts":4,"chars_removed":9000}"#);
         assert!(matches!(serde_json::from_str::<LlmEvent>(&json).unwrap(), LlmEvent::ContextCompacted { .. }));
@@ -1816,6 +1894,23 @@ mod loop_tests {
             }
             other => panic!("expected an error event, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_length_summarizes_history_without_emitting_blank() {
+        let mut messages=vec![user_msg(&format!("Old requirement: HARBOR_17; /tmp/harbor-17; audit pending. {}","history ".repeat(1000))), ChatMessage::new("assistant",Some(serde_json::json!("done")))];
+        for _ in 0..4 { messages.push(user_msg("recent")); messages.push(ChatMessage::new("assistant",Some(serde_json::json!("ok")))); }
+        messages.push(user_msg("current"));
+        let original=serde_json::to_value(&messages).unwrap();
+        let mut blank=completion("",serde_json::Value::Null,(10,48));blank["choices"][0]["finish_reason"]=serde_json::json!("length");
+        let (base,requests)=stub_server(vec![blank,completion("HARBOR_17; /tmp/harbor-17; audit pending",serde_json::Value::Null,(20,10)),completion("recovered",serde_json::Value::Null,(30,5))]);
+        let mut d=start_chat(&base,messages.clone(),ToolConfirmation::All,"",false);
+        assert!(matches!(d.rx.recv().await.unwrap(),LlmEvent::ContextCompacted{message:Some(_),..}));
+        assert!(matches!(d.rx.recv().await.unwrap(),LlmEvent::FinalResponse{content,usage,..} if content=="recovered" && usage.total_tokens==123));
+        d.handle.await.unwrap();assert!(d.rx.recv().await.is_none());
+        let requests=requests.lock().unwrap();assert_eq!(requests.len(),3);assert!(requests[1].get("tools").is_none());
+        assert_eq!(requests[1]["messages"][0]["content"],SUMMARY_PROMPT);
+        assert_eq!(serde_json::to_value(&messages).unwrap(),original);
     }
 
     #[tokio::test(flavor = "multi_thread")]

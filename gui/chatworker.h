@@ -22,6 +22,7 @@ public:
                const QString& toolConfirmation, const QString& reasoningEffort,
                bool preserveReasoning);
 
+    void setRecoveryChatId(const QString& id) { QByteArray bytes = id.toUtf8(); pengy_run_set_recovery(m_run, bytes.constData()); }
     void cancel();
     void sendConfirmation(bool confirmed, bool yoloTurn);
 

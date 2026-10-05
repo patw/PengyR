@@ -760,6 +760,7 @@ void MainWindow::processResponse(TabSession* session, const QJsonArray& apiMessa
     worker->moveToThread(thread);
 
     QString chatId = session->chat["id"].toString();
+    worker->setRecoveryChatId(chatId);
     m_workerToChat[worker] = chatId;
 
     QString baseUrl = m_config["base_url"].toString();
@@ -812,6 +813,7 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
         handleTurnError(session, event);
 
     } else if (type == "context_compacted") {
+        if (!event["message"].toString().isEmpty()) session->chatView->appendMessage("assistant", event["message"]);
         if (session == tabForChat(m_activeChatId)) {
             m_chatHistory->setRetrying(
                 QString("Context limit — retrying with %1 fewer tool-output characters (%2/%3)")

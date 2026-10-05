@@ -8,6 +8,7 @@ pub mod about;
 pub mod attachments;
 pub mod chat_manager;
 pub mod config;
+pub mod context_recovery;
 pub mod image_utils;
 pub mod llm_client;
 pub mod model_cache;
@@ -599,6 +600,14 @@ pub extern "C" fn pengy_llm_chat_run(
     tool_ctx.set_sudo_provider(None);
 
     result
+}
+
+#[no_mangle]
+pub extern "C" fn pengy_run_set_recovery(run: *mut Arc<tools::ToolContext>, chat_id: *const c_char) {
+    if run.is_null() { return; }
+    let id = unsafe { cstr(chat_id) };
+    let config = config::load_config();
+    *unsafe { &*run }.recovery.lock().unwrap() = context_recovery::Options::configured(&config, &id);
 }
 
 /// Create a per-run tool context.  The GUI owns the handle for the lifetime of

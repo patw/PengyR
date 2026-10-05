@@ -499,6 +499,7 @@ impl PengyCli {
         let lt = self.config.llm_timeout;
         let cancel2 = cancel.clone();
         let ctx_for_task = self.tool_ctx.clone();
+        *ctx_for_task.recovery.lock().unwrap() = pengy_core::context_recovery::Options::configured(&self.config, if self.no_save { "" } else { &chat.id });
 
         self.rt.spawn(async move {
             llm_client::chat(
@@ -539,13 +540,12 @@ impl PengyCli {
                     self.current_chat.as_mut().unwrap().messages.push(message);
                     self.save_progress();
                 }
-                Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed }) => {
+                Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
                     expecting_api = true;
-                    eprintln!("{}Context limit — retrying with {} fewer tool-output characters ({}/{}){}",
-                        YELLOW, chars_removed, attempt, max_attempts, RESET);
+                    eprintln!("{}", message.unwrap_or_else(|| format!("Context limit — retrying with {chars_removed} fewer characters ({attempt}/{max_attempts})")));
                 }
                 Some(LlmEvent::Retrying {
                     attempt,

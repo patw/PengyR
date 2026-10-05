@@ -58,6 +58,7 @@ pub struct ToolContext {
     active_process_groups: Mutex<HashSet<u32>>,
     pending_images: Mutex<Vec<PendingImage>>,
     /// Set by `pengy_llm_cancel` so the LLM loop aborts at the next yield point.
+    pub recovery: Mutex<crate::context_recovery::Options>,
     pub cancelled: Arc<AtomicBool>,
 }
 
@@ -68,6 +69,7 @@ impl ToolContext {
             cached_sudo_passwords: Mutex::new(HashMap::new()),
             active_process_groups: Mutex::new(HashSet::new()),
             pending_images: Mutex::new(Vec::new()),
+            recovery: Mutex::new(crate::context_recovery::Options::default()),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
