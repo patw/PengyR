@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Reserve the final context-recovery retry for history.** Attempt 4 prioritizes a summary of eligible older completed turns instead of allowing reasoning/tool reductions to consume the entire retry budget. If no eligible turns or insufficient summary-call budget exist, the last attempt remains available for tool compaction. Failed or non-reducing summaries stop safely; the active task, recent-turn protection, full transcript, and four-attempt limit are unchanged.
+
 - **Harden macOS packaging.** Create the compressed DMG directly instead of mounting a writable image to set a cosmetic icon attribute. Deploy only the required Qt plugin families, repair residual bundle-local library paths, and verify signatures and isolated binary launches before packaging. Adds packaging regressions; application behavior and the v1.11.2 tag are unchanged.
 
 ## v1.11.2

@@ -271,6 +271,12 @@ impl Recovery {
         let before_messages = self.apply(messages);
         let before = size(&before_messages);
         let mut state = self.state.clone();
+        // Reserve the final attempt only for an eligible, budgeted summary.
+        if self.attempts == 3 {
+            if let Some(plan) = self.summary_plan(messages, state.clone(), before) {
+                return Some(plan);
+            }
+        }
         if !state.reasoning {
             state.reasoning = true;
             if size(&apply(&state, messages)) < before {
@@ -338,6 +344,9 @@ impl Recovery {
                 });
             }
         }
+        self.summary_plan(messages, state, before)
+    }
+    fn summary_plan(&self, messages: &[Value], mut state: State, before: usize) -> Option<Plan> {
         let users: Vec<usize> = messages
             .iter()
             .enumerate()
@@ -455,6 +464,75 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_final_attempt_reservation_fixtures() {
+        let cases: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/context_recovery_reserve.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let messages = case["messages"].as_array().unwrap();
+            let original = messages.clone();
+            let options = Options {
+                keep_turns: case["keep_turns"].as_u64().unwrap() as usize,
+                ..Options::default()
+            };
+            let mut recovery = Recovery::new(messages, "test", "m", options);
+            recovery.attempts = case["initial_attempts"].as_u64().unwrap() as u32;
+            recovery.summary_calls = case["summary_calls"].as_u64().unwrap() as usize;
+            let mut strategies = vec![];
+            for _ in recovery.attempts..4 {
+                let Some(plan) = recovery.plan(messages) else {
+                    break;
+                };
+                let strategy = plan.strategy.clone();
+                let before = serde_json::to_value(&recovery.state).unwrap();
+                if !plan.chunks.is_empty() && case["failure"] == "failure" {
+                    assert_eq!(serde_json::to_value(&recovery.state).unwrap(), before);
+                    break;
+                }
+                let summaries = plan
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        if case["failure"] == "nonreducing" {
+                            chunk.clone()
+                        } else {
+                            case["summary"].as_str().unwrap().into()
+                        }
+                    })
+                    .collect();
+                match recovery.commit(plan, summaries, messages) {
+                    Ok(Some(_)) => strategies.push(strategy),
+                    _ => {
+                        assert_eq!(serde_json::to_value(&recovery.state).unwrap(), before);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(strategies).unwrap(),
+                case["strategies"],
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                recovery.attempts,
+                case["expected_attempts"].as_u64().unwrap() as u32
+            );
+            assert_eq!(
+                Value::Array(recovery.apply(messages)),
+                case["expected"],
+                "{}",
+                case["name"]
+            );
+            assert_eq!(messages, &original);
+            if case["failure"] == "" {
+                assert!(recovery.plan(messages).is_none());
+            }
+        }
+    }
 
     #[test]
     fn shared_python_reference_fixtures() {

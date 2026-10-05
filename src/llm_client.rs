@@ -1897,6 +1897,45 @@ mod loop_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn fourth_recovery_attempt_reaches_summary_for_context_and_empty_length() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!("../tests/fixtures/context_recovery_reserve.json")).unwrap();
+        let fixture = &cases[0];
+        for empty_length in [false, true] {
+            let messages: Vec<ChatMessage> = serde_json::from_value(fixture["messages"].clone()).unwrap();
+            let original = serde_json::to_value(&messages).unwrap();
+            let mut sequence = vec![];
+            for _ in 0..4 {
+                if empty_length {
+                    let mut blank = completion("", serde_json::Value::Null, (10, 48));
+                    blank["choices"][0]["finish_reason"] = serde_json::json!("length");
+                    sequence.push((200, blank));
+                } else {
+                    sequence.push((400, serde_json::json!({"error":{"code":"context_length_exceeded","message":"context length exceeded"}})));
+                }
+            }
+            sequence.push((200, completion(fixture["summary"].as_str().unwrap(), serde_json::Value::Null, (10, 5))));
+            sequence.push((200, completion("HARBOR_17 /tmp/harbor-17 audit pending", serde_json::Value::Null, (10, 5))));
+            let (base, requests) = stub_server_sequence(sequence);
+            let mut d = start_chat(&base, messages.clone(), ToolConfirmation::All, "", false);
+            for attempt in 1..=4 {
+                assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { attempt: n, .. } if n == attempt));
+            }
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content.contains("HARBOR_17")));
+            d.handle.await.unwrap();
+            assert!(d.rx.recv().await.is_none());
+            let req = requests.lock().unwrap();
+            assert_eq!(req.len(), 6);
+            assert!(req[4].get("tools").is_none());
+            assert!(req[4]["messages"][1]["content"].as_str().unwrap().contains("HARBOR_17"));
+            let outgoing = req[5]["messages"].as_array().unwrap();
+            assert!(outgoing[1]["content"].as_str().unwrap().contains("HARBOR_17"));
+            assert!(outgoing.last().unwrap()["content"].as_str().unwrap().starts_with('B'));
+            assert_eq!(outgoing[outgoing.len()-2]["tool_calls"][0]["id"], "newest");
+            assert_eq!(serde_json::to_value(&messages).unwrap(), original);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn empty_length_summarizes_history_without_emitting_blank() {
         let mut messages=vec![user_msg(&format!("Old requirement: HARBOR_17; /tmp/harbor-17; audit pending. {}","history ".repeat(1000))), ChatMessage::new("assistant",Some(serde_json::json!("done")))];
         for _ in 0..4 { messages.push(user_msg("recent")); messages.push(ChatMessage::new("assistant",Some(serde_json::json!("ok")))); }
