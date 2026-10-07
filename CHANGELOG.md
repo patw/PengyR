@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.11.4
 
 - **The GUI now honors the configured LLM timeout.** `pengy_llm_chat_run()` passed a hardcoded 300 s to the chat loop and never read `config.llm_timeout`, so the desktop app's "LLM timeout" setting — which the Settings dialog still wrote — had no effect on real requests; only the CLI and Web UI honored it. The FFI now reads the setting the same way they do, so a slow local model no longer fails as "Could not reach <url> (timed out)" at 300 s with no way to raise it from the desktop app. The GUI also now propagates the image limits (`image_max_dimension`/`image_max_mb`/`image_quality`) to the core via `pengy_tool_set_image_limits`, which the CLI and Web UI already did — the LLM-side image parts and `read_image` previously used the core defaults regardless of the setting.
 
