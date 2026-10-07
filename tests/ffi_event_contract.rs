@@ -135,3 +135,64 @@ fn server_error_reaches_the_gui_as_one_error_event() {
     assert!(event["message"].as_str().unwrap().contains("boom"));
     assert!(!event.to_string().contains("final_response"));
 }
+
+/// A stub that accepts the connection, waits `delay`, then answers 200 with a
+/// normal completion.  Used to prove the FFI honours the *configured* LLM
+/// timeout: with `llm_timeout = 1` the request times out first, whereas the old
+/// hardcoded 300 would instead wait out the delay and return the completion.
+fn spawn_slow_stub(delay: std::time::Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow stub");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            std::thread::sleep(delay);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+    base
+}
+
+/// The desktop app has no per-call timeout argument: `ChatWorker` reads it from
+/// settings.json, and `pengy_llm_chat_run` is the only path it has.  This pins
+/// the regression that the FFI used to hardcode 300 and ignore the setting
+/// entirely (the GUI's Settings dialog still wrote `llm_timeout`, so the control
+/// looked live but did nothing).
+#[test]
+fn ffi_honours_configured_llm_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("settings.json"), r#"{"llm_timeout": 1}"#).unwrap();
+    // PENGY_CONFIG_DIR is resolved per call (not a OnceLock), so this points the
+    // run at the scratch config.  Every other test in this binary passes its own
+    // base_url and uses an immediate stub, so a 1s timeout cannot affect them.
+    std::env::set_var("PENGY_CONFIG_DIR", dir.path());
+
+    let base = spawn_slow_stub(std::time::Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    let events = run_turn_through_ffi(&base);
+    let elapsed = started.elapsed();
+
+    std::env::remove_var("PENGY_CONFIG_DIR");
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "llm_timeout=1 must abort before the 3s stub answers; took {elapsed:?} \
+         (a hardcoded 300s timeout would instead wait for the completion)"
+    );
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(event["type"], "error");
+    let message = event["message"].as_str().unwrap();
+    assert!(message.contains("timed out"), "{message}");
+    assert!(message.contains(&base), "the error must name the endpoint: {message}");
+}

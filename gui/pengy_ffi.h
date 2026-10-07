@@ -35,6 +35,7 @@ extern "C" {
     void  pengy_tool_set_timeout(unsigned long long secs);
     void  pengy_tool_set_download_max_mb(unsigned long long mb);
     void  pengy_tool_set_output_max_chars(unsigned long long chars);
+    void  pengy_tool_set_image_limits(unsigned int max_dimension, double max_mb, unsigned char quality);
 
     char* pengy_image_preprocess(const char* path,
                                  unsigned int max_dimension,

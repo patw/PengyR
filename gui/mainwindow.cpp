@@ -192,10 +192,19 @@ void MainWindow::updateLlmClient() {
     int timeout = m_config.value("tool_timeout").toInt(300);
     int outputMax = m_config.value("tool_output_max_chars").toInt(250000);
     int downloadMax = m_config.value("download_max_mb").toInt(100);
+    int imageMaxDim = m_config.value("image_max_dimension").toInt(4096);
+    double imageMaxMb = m_config.value("image_max_mb").toDouble(4.5);
+    int imageQuality = m_config.value("image_quality").toInt(85);
     pengy_tool_set_user_agent(ua.toUtf8().constData());
     pengy_tool_set_timeout(timeout);
     pengy_tool_set_output_max_chars(outputMax);
     pengy_tool_set_download_max_mb(downloadMax);
+    // The GUI resizes user attachments itself (pengy_attachment_import_image),
+    // but the LLM-side image parts and the read_image tool read these core
+    // globals -- the CLI and web set them, so the GUI must too or a configured
+    // image_max_dimension/mb/quality is silently ignored for those paths.
+    pengy_tool_set_image_limits(static_cast<unsigned int>(imageMaxDim), imageMaxMb,
+                                static_cast<unsigned char>(imageQuality));
 }
 
 void MainWindow::refreshModelCombo() {

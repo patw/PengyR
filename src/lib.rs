@@ -424,7 +424,7 @@ pub extern "C" fn pengy_llm_chat_run(
             tc_mode,
             &re_str,
             preserve_reasoning,
-            300,
+            config::load_config().llm_timeout,
             config::load_config().attachment_context_keep_turns,
             event_tx,
             confirm_rx,

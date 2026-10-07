@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **The GUI now honors the configured LLM timeout.** `pengy_llm_chat_run()` passed a hardcoded 300 s to the chat loop and never read `config.llm_timeout`, so the desktop app's "LLM timeout" setting — which the Settings dialog still wrote — had no effect on real requests; only the CLI and Web UI honored it. The FFI now reads the setting the same way they do, so a slow local model no longer fails as "Could not reach <url> (timed out)" at 300 s with no way to raise it from the desktop app. The GUI also now propagates the image limits (`image_max_dimension`/`image_max_mb`/`image_quality`) to the core via `pengy_tool_set_image_limits`, which the CLI and Web UI already did — the LLM-side image parts and `read_image` previously used the core defaults regardless of the setting.
+
 ## v1.11.3
 
 - **Recover from short truncated replies, not just empty ones.** A `finish_reason: length` reply with a lead-in sentence (e.g. "Redoing it properly:") or a truncated tool call now triggers automatic context recovery when the provider reports fewer than 1,024 completion tokens (and fewer than `output_token_limit`, if set) — too short to be an output cap, so the window was nearly full. Previously only an empty reply qualified, and long agentic runs failed outright. The truncated reply is discarded and no tool from it runs. Longer or unreported completions still fail safely. Length errors now include prompt/completion token counts and say whether recovery was attempted.
