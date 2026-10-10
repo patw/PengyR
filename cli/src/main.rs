@@ -567,6 +567,7 @@ impl PengyCli {
                     name,
                     args,
                     tool_call_id,
+                    ..
                 }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
@@ -627,6 +628,7 @@ impl PengyCli {
                     args: _,
                     tool_call_id,
                     questions,
+                    ..
                 }) => {
                     // Present questions to user and collect answers
                     eprintln!();

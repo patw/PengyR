@@ -815,6 +815,20 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
     QJsonObject event = QJsonDocument::fromJson(eventJson.toUtf8()).object();
     QString type = event["type"].toString();
 
+    // Tick the token count during the turn: intermediate events (tool_request /
+    // question_request) carry the running turn usage, so the sidebar can
+    // advance instead of jumping only when control returns to the user. The
+    // persisted chat total is the base and is never written here, so repeated
+    // events cannot double-count and a failed turn leaves no trace.
+    if (event["usage"].isObject()) {
+        const QJsonObject turn = event["usage"].toObject();
+        const QJsonObject base = session->chat["usage"].toObject();
+        session->promptTokens     = base["prompt_tokens"].toInt()     + turn["prompt_tokens"].toInt();
+        session->completionTokens = base["completion_tokens"].toInt() + turn["completion_tokens"].toInt();
+        if (session == tabForChat(m_activeChatId))
+            m_chatHistory->updateTokenUsage(session->promptTokens, session->completionTokens);
+    }
+
     if (type == "final_response") {
         handleFinalResponse(session, event);
 
@@ -822,7 +836,15 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
         handleTurnError(session, event);
 
     } else if (type == "context_compacted") {
-        if (!event["message"].toString().isEmpty()) session->chatView->appendMessage("assistant", event["message"]);
+        // A harness notice, not an assistant turn: render it in its own
+        // highlighted card (ChatView's "notice" role) instead of the Assistant
+        // bubble it used to be shown as. The tool-output compaction path emits
+        // no message, so fall back to the same text as the Python edition --
+        // otherwise that path's notice is silently missing entirely.
+        QString notice = event["message"].toString();
+        if (notice.isEmpty())
+            notice = QString("Context recovery — full history retained.");
+        session->chatView->appendMessage("notice", notice);
         if (session == tabForChat(m_activeChatId)) {
             m_chatHistory->setRetrying(QString("Context recovery"));
         }
@@ -951,7 +973,7 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
 void MainWindow::handleTurnError(TabSession* session, const QJsonObject& event) {
     const bool credential = event["kind"].toString() == "credentials";
     session->chatView->appendMessageText(
-        "assistant",
+        "error",
         (credential ? QString::fromUtf8("\u274c ") : QString("Error: "))
             + event["message"].toString());
 

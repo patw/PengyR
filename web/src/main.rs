@@ -315,6 +315,9 @@ enum SseEvent {
         safe_id: String,
         summary: String,
         auto_approved: bool,
+        /// Chat cumulative including this in-flight turn, so the navbar token
+        /// badge can advance after every model round (see `live_usage`).
+        cumulative_usage: llm_client::Usage,
     },
     ToolResult {
         tool_call_id: String,
@@ -348,6 +351,9 @@ enum SseEvent {
         questions: serde_json::Value,
         tool_call_id: String,
         safe_id: String,
+        /// See [`SseEvent::ToolRequest`]. The ask_user_question round emits no
+        /// tool_request, so it carries the live total itself.
+        cumulative_usage: llm_client::Usage,
     },
     QuestionResult {
         tool_call_id: String,
@@ -489,6 +495,20 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
     s
 }
 
+/// Cumulative usage preview for a mid-turn event: the chat's persisted total
+/// plus the in-flight turn's running usage. Never written to disk -- the
+/// authoritative total is produced by `chat_manager::add_usage` on the final
+/// response, so a failed turn leaves no trace and repeated events cannot
+/// double-count.
+fn live_usage(chat: &chat_manager::Chat, turn: &llm_client::Usage) -> llm_client::Usage {
+    let base = chat.usage.clone().unwrap_or_default();
+    llm_client::Usage {
+        prompt_tokens: base.prompt_tokens + turn.prompt_tokens,
+        completion_tokens: base.completion_tokens + turn.completion_tokens,
+        total_tokens: base.total_tokens + turn.total_tokens,
+    }
+}
+
 fn sse_event_to_json(event: &SseEvent) -> String {
     match event {
         SseEvent::ToolRequest {
@@ -498,6 +518,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             safe_id,
             summary,
             auto_approved,
+            cumulative_usage,
         } => serde_json::json!({
             "type": "tool_request",
             "name": name,
@@ -506,6 +527,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "safe_id": safe_id,
             "summary": summary,
             "auto_approved": auto_approved,
+            "cumulative_usage": {
+                "prompt_tokens": cumulative_usage.prompt_tokens,
+                "completion_tokens": cumulative_usage.completion_tokens,
+                "total_tokens": cumulative_usage.total_tokens,
+            },
         })
         .to_string(),
         SseEvent::ToolResult {
@@ -556,6 +582,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             questions,
             tool_call_id,
             safe_id,
+            cumulative_usage,
         } => serde_json::json!({
             "type": "question_request",
             "name": name,
@@ -563,6 +590,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "questions": questions,
             "tool_call_id": tool_call_id,
             "safe_id": safe_id,
+            "cumulative_usage": {
+                "prompt_tokens": cumulative_usage.prompt_tokens,
+                "completion_tokens": cumulative_usage.completion_tokens,
+                "total_tokens": cumulative_usage.total_tokens,
+            },
         })
         .to_string(),
         SseEvent::QuestionResult {
@@ -769,6 +801,7 @@ impl WebWorker {
                         name,
                         args,
                         tool_call_id,
+                        usage,
                     }) => {
                         let needs_confirm = tc_mode != ToolConfirmation::All
                             && !(tc_mode == ToolConfirmation::Safe
@@ -784,6 +817,7 @@ impl WebWorker {
                             safe_id: sid,
                             summary: tool_summary(&name, &args),
                             auto_approved: !needs_confirm,
+                            cumulative_usage: live_usage(&chat, &usage),
                         });
 
                         if needs_confirm {
@@ -846,6 +880,7 @@ impl WebWorker {
                         args,
                         tool_call_id,
                         questions,
+                        usage,
                     }) => {
                         push_event(SseEvent::QuestionRequest {
                             name,
@@ -853,6 +888,7 @@ impl WebWorker {
                             questions: questions.clone(),
                             tool_call_id: tool_call_id.clone(),
                             safe_id: safe_id(&tool_call_id),
+                            cumulative_usage: live_usage(&chat, &usage),
                         });
 
                         // Always wait for user answers (ask_user_question is always interactive)
@@ -3335,11 +3371,16 @@ function hideThinking() {{
 }}
 
 function showContextCompacted(data) {{
+  // A harness notice, not model output: a persistent highlighted card, matching
+  // the Python edition's alert-info (and the desktop's "notice" role). It used
+  // to replace the spinner with a plain grey status line. The spinner stays, as
+  // in the Python edition.
   hideThinking();
-  thinkingEl = document.createElement('div');
-  thinkingEl.className = 'msg-thinking';
-  thinkingEl.textContent = `Context limit — retrying with ${{Number(data.chars_removed).toLocaleString()}} fewer tool-output characters; attempt ${{data.attempt}} of ${{data.max_attempts}}`;
-  appendToArea(thinkingEl);
+  showThinking();
+  const el = document.createElement('div');
+  el.className = 'alert alert-info py-2';
+  el.textContent = `Context limit — retrying with ${{Number(data.chars_removed).toLocaleString()}} fewer tool-output characters; attempt ${{data.attempt}} of ${{data.max_attempts}}`;
+  appendToArea(el);
 }}
 
 function showRetrying(data) {{
@@ -3704,6 +3745,9 @@ function handleEvent(data) {{
   switch (data.type) {{
     case 'tool_request':
       hideThinking();
+      // Intermediate rounds carry the running turn usage: advance the badge
+      // now instead of waiting for final_response.
+      if (data.cumulative_usage) updateCumulativeTokens(data.cumulative_usage);
       appendToolRequest(data);
       if (!data.auto_approved) {{
         pendingToolCallId = data.tool_call_id;
@@ -3735,6 +3779,7 @@ function handleEvent(data) {{
       break;
     case 'question_request':
       hideThinking();
+      if (data.cumulative_usage) updateCumulativeTokens(data.cumulative_usage);
       appendToolRequest(Object.assign({{}}, data, {{auto_approved: false}}));
       showQuestionModal(data);
       break;
@@ -4456,6 +4501,7 @@ mod tests {
                 safe_id: "tc_tool1".into(),
                 summary: String::new(),
                 auto_approved: false,
+                cumulative_usage: Default::default(),
             },
             SseEvent::ToolResult {
                 tool_call_id: "tool-1".into(),
@@ -4492,6 +4538,7 @@ mod tests {
             safe_id: "tc_tool1".into(),
             summary: String::new(),
             auto_approved: false,
+            cumulative_usage: Default::default(),
         }]));
         let (tx, rx) = tokio::sync::watch::channel(1usize);
         let done = Arc::new(AtomicBool::new(false));
@@ -4650,11 +4697,17 @@ mod tests {
             questions: serde_json::json!([]),
             tool_call_id: "call-q".into(),
             safe_id: safe_id("call-q"),
+            cumulative_usage: llm_client::Usage {
+                prompt_tokens: 11,
+                completion_tokens: 3,
+                total_tokens: 14,
+            },
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "question_request");
         assert_eq!(v["name"], "ask_user_question");
         assert_eq!(v["safe_id"], "tc_callq");
+        assert_eq!(v["cumulative_usage"]["total_tokens"], 14);
 
         let json = sse_event_to_json(&SseEvent::QuestionResult {
             tool_call_id: "call-q".into(),
@@ -4665,6 +4718,43 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["safe_id"], "tc_callq");
         assert_eq!(v["content"], "**Approach**: Rebase");
+    }
+
+    #[test]
+    fn live_usage_adds_the_turn_to_the_persisted_total() {
+        let mut chat = Chat::new("Live tokens");
+        chat.usage = Some(llm_client::Usage {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            total_tokens: 1500,
+        });
+        let turn = llm_client::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+        };
+        let live = live_usage(&chat, &turn);
+        assert_eq!(
+            (
+                live.prompt_tokens,
+                live.completion_tokens,
+                live.total_tokens
+            ),
+            (1010, 505, 1515)
+        );
+        // The preview never writes the persisted total; add_usage owns that.
+        assert_eq!(chat.usage.unwrap().total_tokens, 1500);
+    }
+
+    #[test]
+    fn live_usage_defaults_a_chat_with_no_history_to_the_turn() {
+        let chat = Chat::new("First turn");
+        let turn = llm_client::Usage {
+            prompt_tokens: 7,
+            completion_tokens: 2,
+            total_tokens: 9,
+        };
+        assert_eq!(live_usage(&chat, &turn).total_tokens, 9);
     }
 
     // Option labels must never be interpolated into HTML attributes: radios

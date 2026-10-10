@@ -214,6 +214,13 @@ pub enum LlmEvent {
         name: String,
         args: serde_json::Value,
         tool_call_id: String,
+        /// Running turn usage so a frontend can advance its token count before
+        /// the turn ends, instead of waiting for [`LlmEvent::FinalResponse`].
+        /// Same accumulator the final response reports, so the live total and
+        /// the terminal total agree. `#[serde(default)]` keeps older event
+        /// consumers (and the FFI's legacy tests) deserialising.
+        #[serde(default)]
+        usage: Usage,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -229,6 +236,11 @@ pub enum LlmEvent {
         args: serde_json::Value,
         tool_call_id: String,
         questions: serde_json::Value,
+        /// Running turn usage (see [`LlmEvent::ToolRequest`]). The
+        /// ask_user_question round emits no tool_request, so it carries the
+        /// live total itself.
+        #[serde(default)]
+        usage: Usage,
     },
     #[serde(rename = "question_result")]
     QuestionResult {
@@ -454,7 +466,7 @@ fn emit_turn_error(
     });
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -948,6 +960,7 @@ pub async fn chat(
                             args: args.clone(),
                             tool_call_id: tc_id.clone(),
                             questions: questions.clone(),
+                            usage: accumulated_usage.clone(),
                         });
 
                         match confirm_rx.recv().await {
@@ -1006,6 +1019,7 @@ pub async fn chat(
                             name: name.clone(),
                             args: args.clone(),
                             tool_call_id: tc_id.clone(),
+                            usage: accumulated_usage.clone(),
                         });
 
                         let result = tools::execute_tool(&name, &args, &tool_ctx).await;
@@ -1034,6 +1048,7 @@ pub async fn chat(
                             name: name.clone(),
                             args: args.clone(),
                             tool_call_id: tc_id.clone(),
+                            usage: accumulated_usage.clone(),
                         });
 
                         // Wait for confirmation
@@ -1332,17 +1347,37 @@ mod tests {
             name: "read_file".into(),
             args: serde_json::json!({"path": "/tmp/test"}),
             tool_call_id: "tc-123".into(),
+            usage: Usage {
+                prompt_tokens: 40,
+                completion_tokens: 8,
+                total_tokens: 48,
+            },
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"tool_request\""));
         let parsed: LlmEvent = serde_json::from_str(&json).unwrap();
         match parsed {
             LlmEvent::ToolRequest {
-                name, tool_call_id, ..
+                name,
+                tool_call_id,
+                usage,
+                ..
             } => {
                 assert_eq!(name, "read_file");
                 assert_eq!(tool_call_id, "tc-123");
+                assert_eq!(usage.total_tokens, 48);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn tool_request_without_usage_deserialises_as_zero() {
+        // The field is additive: an older producer that omits it must not break
+        // the consumer (the GUI parses these events from the FFI).
+        let legacy = r#"{"type":"tool_request","name":"read_file","args":{},"tool_call_id":"tc-1"}"#;
+        match serde_json::from_str::<LlmEvent>(legacy).unwrap() {
+            LlmEvent::ToolRequest { usage, .. } => assert_eq!(usage.total_tokens, 0),
             _ => panic!("wrong variant"),
         }
     }
