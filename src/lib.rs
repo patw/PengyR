@@ -13,6 +13,7 @@ pub mod image_utils;
 pub mod llm_client;
 pub mod model_cache;
 pub mod task_manager;
+pub mod tool_args;
 pub mod tools;
 
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -470,6 +471,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                         confirmed: false,
                                         yolo_turn: false,
                                         answers: None,
+                                        unavailable: false,
                                     });
                                     break 'outer false;
                                 }
@@ -487,6 +489,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                 confirmed,
                                 yolo_turn: yolo,
                                 answers: None,
+                                unavailable: false,
                             });
                         }
                         // else: auto-confirmed or safe — the generator handles it
@@ -520,6 +523,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                         confirmed: false,
                                         yolo_turn: false,
                                         answers: None,
+                                        unavailable: false,
                                     });
                                     break 'outer false;
                                 }
@@ -546,6 +550,7 @@ pub extern "C" fn pengy_llm_chat_run(
                                 confirmed: answered,
                                 yolo_turn: false,
                                 answers: if answered { Some(answers) } else { None },
+                                unavailable: false,
                             });
                         }
                     }

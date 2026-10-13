@@ -835,6 +835,7 @@ impl WebWorker {
                                         confirmed,
                                         yolo_turn,
                                         answers: None,
+                                        unavailable: false,
                                     });
                                 }
                                 None => break,
@@ -901,6 +902,7 @@ impl WebWorker {
                                     confirmed,
                                     yolo_turn: false,
                                     answers,
+                                    unavailable: false,
                                 });
                             }
                             None => break,

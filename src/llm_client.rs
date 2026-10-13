@@ -482,7 +482,14 @@ pub struct Confirmation {
     pub yolo_turn: bool,
     /// User's answers for ask_user_question (if this is a question confirmation).
     pub answers: Option<Vec<String>>,
+    /// ask_user_question only: nobody can answer (headless CLI). The model is
+    /// told to decide and state its assumption instead of "cancelled".
+    pub unavailable: bool,
 }
+
+/// Sent back for ask_user_question when the frontend has no user to ask.
+/// Identical to `NO_USER_ANSWER` in the Python and C++ editions.
+pub const NO_USER_ANSWER: &str = "No user is available to answer (non-interactive run). If what you found makes one option clearly the most reasonable, take it and state that assumption in your reply. If it would be a pure guess, leave that part undone and say what you need.";
 
 /// Tool confirmation mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -946,15 +953,36 @@ pub async fn chat(
                     let tc_id = tc["id"].as_str().unwrap_or("").to_string();
                     let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                     let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                    let args: serde_json::Value =
-                        serde_json::from_str(args_str).unwrap_or_default();
+                    // Malformed JSON is kept (not replaced by {}) so the tool
+                    // layer can tell the model its call didn't parse.
+                    let args = crate::tool_args::parse_raw_arguments(args_str);
 
                     // ask_user_question is a special harness-level tool
                     if name == "ask_user_question" {
-                        let questions = args
-                            .get("questions")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Array(vec![]));
+                        let args = match tools::validate_question_arguments(&args) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                current_messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: Some(serde_json::Value::String(err.clone())),
+                                    attachments: vec![],
+                                    tool_calls: vec![],
+                                    tool_call_id: Some(tc_id.clone()),
+                                    reasoning_content: None,
+                                    reasoning: None,
+                                    reasoning_details: None,
+                                });
+                                let _ = event_tx.send(LlmEvent::ToolResult {
+                                    tool_call_id: tc_id.clone(),
+                                    name: name.clone(),
+                                    args: args.clone(),
+                                    content: err,
+                                    declined: false,
+                                });
+                                continue;
+                            }
+                        };
+                        let questions = args["questions"].clone();
                         let _ = event_tx.send(LlmEvent::QuestionRequest {
                             name: name.clone(),
                             args: args.clone(),
@@ -983,8 +1011,12 @@ pub async fn chat(
                                     content: result_text,
                                 });
                             }
-                            _ => {
-                                let declined_msg = "User cancelled the question.".to_string();
+                            other => {
+                                let declined_msg = if other.as_ref().is_some_and(|c| c.unavailable) {
+                                    NO_USER_ANSWER.to_string()
+                                } else {
+                                    "User cancelled the question.".to_string()
+                                };
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
@@ -2621,6 +2653,7 @@ mod loop_tests {
                 confirmed: true,
                 yolo_turn: false,
                 answers: None,
+                unavailable: false,
             })
             .unwrap();
 
@@ -2634,6 +2667,73 @@ mod loop_tests {
             LlmEvent::FinalResponse { .. }
         ));
         d.handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unanswerable_question_tells_model_to_decide() {
+        let args = serde_json::json!({"questions": [{"header": "H", "question": "Q?",
+            "options": [{"label": "A", "description": "a"}]}]});
+        let (base, _requests) = stub_server(vec![
+            completion("", serde_json::json!([tool_call("q1", "ask_user_question", &args)]), (1, 1)),
+            completion("done", serde_json::Value::Null, (1, 1)),
+        ]);
+        let mut d = start_chat(&base, vec![user_msg("go")], ToolConfirmation::All, "", false);
+        loop {
+            if let LlmEvent::QuestionRequest { .. } = d.rx.recv().await.unwrap() {
+                break;
+            }
+        }
+        d.confirm_tx
+            .send(Confirmation {
+                tool_call_id: "q1".into(),
+                confirmed: false,
+                yolo_turn: false,
+                answers: None,
+                unavailable: true,
+            })
+            .unwrap();
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::ToolResult { content, declined, .. } => {
+                assert!(declined);
+                assert_eq!(content, NO_USER_ANSWER);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        d.handle.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_question_is_reported_not_asked() {
+        // ask_user_question bypasses execute_tool, so it is schema-checked
+        // separately: a malformed call goes back to the model, never to the user.
+        let cases = [
+            // questions as a string holding broken JSON (seen from a local model)
+            serde_json::json!({"questions": "[{\"header\": \"H\", \"question\": \"Q?\", \"options\": [{\"label\": \"A\"]}]"}).to_string(),
+            serde_json::json!({"questions": []}).to_string(),
+            "{not json!".to_string(),
+        ];
+        for raw in cases {
+            let call = serde_json::json!([{"id": "q1", "type": "function",
+                "function": {"name": "ask_user_question", "arguments": raw}}]);
+            let (base, _requests) = stub_server(vec![
+                completion("", call, (1, 1)),
+                completion("done", serde_json::Value::Null, (1, 1)),
+            ]);
+            let mut d = start_chat(&base, vec![user_msg("go")], ToolConfirmation::All, "", false);
+            loop {
+                match d.rx.recv().await.unwrap() {
+                    LlmEvent::QuestionRequest { .. } => panic!("malformed question reached the user"),
+                    LlmEvent::ToolResult { content, declined, .. } => {
+                        assert!(!declined);
+                        assert!(content.starts_with("Error: "), "{content}");
+                        assert!(content.contains("ask_user_question"), "{content}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            d.handle.await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2666,6 +2766,7 @@ mod loop_tests {
                 confirmed: false,
                 yolo_turn: false,
                 answers: None,
+                unavailable: false,
             })
             .unwrap();
 
@@ -2725,6 +2826,7 @@ mod loop_tests {
                 confirmed: true,
                 yolo_turn: true,
                 answers: None,
+                unavailable: false,
             })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
@@ -2780,6 +2882,7 @@ mod loop_tests {
                 confirmed: true,
                 yolo_turn: true,
                 answers: None,
+                unavailable: false,
             })
             .unwrap();
         d.rx.recv().await.unwrap(); // ToolResult tc1
@@ -2793,6 +2896,7 @@ mod loop_tests {
                 confirmed: false,
                 yolo_turn: false,
                 answers: None,
+                unavailable: false,
             })
             .unwrap();
         match d.rx.recv().await.unwrap() {

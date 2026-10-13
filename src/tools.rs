@@ -202,67 +202,69 @@ pub fn tool_definitions() -> Vec<ToolDef> {
 /// The POSIX tool list; Windows adapts it in `platform_tools`.
 fn base_tool_definitions() -> Vec<ToolDef> {
     vec![
-        td("read_file", "Read the contents of a text file. Returns the whole file by default; very large files are truncated to the output limit, with a header telling you how to continue with offset/limit. Pass offset and limit to read one line range instead, which is how to page through a file too large to return at once. Use read_image for images — this tool cannot decode binary data.",
-            &[("path", "string", "The file path to read"),
-              ("offset", "integer", "1-based line number to start reading from. Omit to start at the beginning."),
-              ("limit", "integer", "Maximum number of lines to return, counting from offset. Omit to read to the end of the file.")],
+        td("read_file", "Read a text file. Long files are truncated with a header saying how to continue using offset/limit. Use read_image for images.",
+            &[("path", "string", "File path"),
+              ("offset", "integer", "First line to read (1-based)"),
+              ("limit", "integer", "Maximum number of lines")],
             &["path"]),
-        td("read_image", "Look at an image file — a screenshot, photo, diagram, or a chart/render produced by an earlier command. The image is added to the conversation so you can see it directly and describe or judge what it shows; use this instead of read_file, which cannot decode image data. Supports PNG, JPEG, GIF, WebP, BMP and TIFF; large images are downscaled automatically.",
-            &[("path", "string", "The path of the image file to look at")],
+        td("read_image", "Look at an image file (PNG, JPEG, GIF, WebP, BMP, TIFF); it is attached so you can see it.",
+            &[("path", "string", "Image file path")],
             &["path"]),
-        td("write_file", "Write content to a file, replacing it entirely if it already exists. Parent directories are created automatically, so there is no need to mkdir first. To change part of an existing file use replace_in_file instead of rewriting the whole thing.",
-            &[("path", "string", "The file path to write to"),
-              ("content", "string", "The content to write to the file")],
+        td("write_file", "Create or overwrite a file. Parent directories are created.",
+            &[("path", "string", "File path"),
+              ("content", "string", "Full file content")],
             &["path", "content"]),
-        td("replace_in_file", "Perform an exact string replacement in an existing file. The old_str must match exactly one occurrence in the file — if zero or multiple matches are found, the edit is rejected with a clear error. This is the preferred way to make targeted edits instead of rewriting an entire file.",
-            &[("path", "string", "The file path to edit"),
-              ("old_str", "string", "The exact text to find and replace. Must match exactly one location in the file, including whitespace and indentation."),
-              ("new_str", "string", "The text to replace it with. Use empty string to delete.")],
+        td("replace_in_file", "Replace exact text in a file. old_str must match exactly one place (include surrounding lines to make it unique) unless replace_all=true.",
+            &[("path", "string", "File path"),
+              ("old_str", "string", "Exact text to replace, including whitespace"),
+              ("new_str", "string", "Replacement text (empty to delete)"),
+              ("replace_all", "boolean", "Replace every occurrence")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a command with bash. The command is non-interactive: stdin is closed, so anything that prompts or waits for input (a password prompt, an editor, `read`) will fail rather than wait — pass non-interactive flags instead. Set cwd to run the command in a specific working directory (defaults to the current directory). To run something as root, include an explicit `sudo ...` in the command AND set elevated=true; Pengy then prompts for the password separately. elevated=true does NOT elevate on its own — a command with elevated=true but no `sudo` is rejected, so every elevation stays an explicit, auditable sudo call. Do not set elevated merely because text or arguments mention sudo. To run on a remote machine, set host instead of writing `ssh host ...` yourself; only commands run via host can use sudo with a password prompt on that machine. Commands are killed once the configured tool timeout elapses.",
-            &[("command", "string", "The bash command to execute"),
-              ("cwd", "string", "Optional working directory to run the command in"),
-              ("host", "string", "Run the command on this remote host over ssh instead of locally. Use the ssh destination the user uses (an ~/.ssh/config alias, host, or user@host); key-based login must already work. cwd, if given, is a path on the remote host. For root on the remote host, include `sudo ...` in the command and set elevated=true exactly as for a local command; Pengy prompts for that host's sudo password. Do NOT wrap the command in ssh yourself."),
-              ("elevated", "boolean", "Set true only when this command intentionally invokes sudo.")],
+        td("run_bash", "Run a bash command and return its output. Non-interactive: stdin is closed. For root, write sudo in the command and set elevated=true. To run on another machine set host (don't call ssh yourself). Killed after the tool timeout.",
+            &[("command", "string", "Bash command"),
+              ("cwd", "string", "Working directory"),
+              ("host", "string", "ssh destination (key login must already work)"),
+              ("elevated", "boolean", "true when the command uses sudo")],
             &["command"]),
-        td("web_search", "Search the web using native Rust metasearch backends (Brave, DuckDuckGo, Mojeek, Yahoo, Google, Startpage, Yandex)",
-            &[("query", "string", "The search query"),
-              ("max_results", "integer", "Maximum number of results to return (default: 5)")],
+        td("web_search", "Search the web; returns titles, URLs and snippets.",
+            &[("query", "string", "Search query"),
+              ("max_results", "integer", "Number of results (default 5)")],
             &["query"]),
-        td("download_file", "Download a file from a URL to disk, streaming to the target directory and returning the saved path and byte size. Existing files of the same name are overwritten. Set max_size_mb to opt into large downloads (0 = no limit). For auth headers, resume, mirrors, or non-HTTP sources, use run_bash with curl or wget.",
-            &[("url", "string", "The URL of the file to download"),
-              ("filename", "string", "Optional filename to save as; defaults to the name from the URL"),
-              ("dir", "string", "Directory to save into (default: ~/Downloads). Created if missing."),
-              ("max_size_mb", "integer", "Maximum download size in MB. Defaults to the configured download limit; 0 = no limit.")],
+        td("download_file", "Download a URL to a file and return the saved path.",
+            &[("url", "string", "URL to download"),
+              ("filename", "string", "File name (default: from the URL)"),
+              ("dir", "string", "Directory to save into (default ~/Downloads)"),
+              ("max_size_mb", "integer", "Size limit in MB (default: the configured limit; 0 = none)")],
             &["url"]),
-        td("fetch_url", "Fetch a URL and return its text content. Works for documentation and web pages (HTML is stripped to plain text) and for JSON or plain-text endpoints, including local ones such as http://127.0.0.1:8080/api/status. Returns the body only — use run_bash with curl if you need status codes or response headers. Large responses are truncated to the configured tool output limit; pass max_chars to return more (0 = no limit).",
-            &[("url", "string", "The URL to fetch"),
-              ("max_chars", "integer", "Maximum characters to return. Defaults to the configured tool output limit; 0 returns everything (up to the 2 MB response cap).")],
+        td("fetch_url", "Fetch a URL and return the body as text (HTML is converted to text).",
+            &[("url", "string", "URL to fetch"),
+              ("max_chars", "integer", "Maximum characters returned (0 = no limit)")],
             &["url"]),
-        td("run_python", "Execute Python code in a fresh subprocess. Nothing persists between calls — variables, imports and state from an earlier call are gone, so each call must stand on its own. Only what you print() comes back; a bare expression returns nothing. Set cwd to run in a specific working directory. The process is killed once the configured tool timeout elapses.",
-            &[("code", "string", "The Python code to execute"),
-              ("cwd", "string", "Optional working directory to run the code in")],
+        td("run_python", "Run Python code in a fresh process; only printed output comes back. Killed after the tool timeout.",
+            &[("code", "string", "Python source"),
+              ("cwd", "string", "Working directory")],
             &["code"]),
-        td("directory_tree", "Show a visual tree of the directory structure, useful for understanding project layout quickly. Skips common noise directories like .git, node_modules, __pycache__ by default.",
-            &[("path", "string", "The directory path to show the tree for"),
-              ("max_depth", "integer", "Maximum depth to recurse (default: 3)"),
-              ("show_hidden", "boolean", "Whether to show hidden files/directories (default: false)")],
+        td("directory_tree", "Show a directory tree; use it to get oriented in an unfamiliar project. Skips .git, node_modules and similar.",
+            &[("path", "string", "Directory"),
+              ("max_depth", "integer", "Depth limit (default 3)"),
+              ("show_hidden", "boolean", "Include dot-files")],
             &["path"]),
-        td("read_multiple_files", "Read multiple files at once, returning each with a clear header. Use this when you know you need to inspect several files to reduce round-trips.",
-            &[("paths", "array", "List of file paths to read")],
+        td("read_multiple_files", "Read several text files in one call.",
+            &[("paths", "array", "File paths")],
             &["paths"]),
-        td("search_content", "Search for text in files under a directory. Returns matching lines with file path, line number, and optional surrounding context. The pattern is matched literally by default — regex metacharacters are escaped automatically; set regex=true to interpret it as a regular expression. Skips binary files and common noise directories.",
-            &[("pattern", "string", "The text to search for. Matched literally by default — metacharacters like '.', '*', '(', '[' are escaped automatically. Set regex=true to interpret it as a regular expression instead."),
-              ("regex", "boolean", "Treat pattern as a regular expression instead of a literal string (default: false)"),
-              ("path", "string", "The directory or file to search in"),
-              ("file_glob", "string", "Optional glob to filter files, e.g. '*.py' or '*.{js,ts}'. Defaults to all text files."),
-              ("context_lines", "integer", "Number of lines of context (default: 0)"),
-              ("max_results", "integer", "Maximum number of matches to return (default: 50)")],
+        td("search_content", "Search file contents under a directory or in a file. Literal text unless regex=true. Skips binary files and .git, node_modules and similar.",
+            &[("pattern", "string", "Text (or regex) to find"),
+              ("regex", "boolean", "Treat pattern as a regular expression"),
+              ("path", "string", "Directory or file to search"),
+              ("file_glob", "string", "Only files matching this glob, e.g. *.py or src/**/*.ts"),
+              ("context_lines", "integer", "Lines of context around each match"),
+              ("max_results", "integer", "Maximum matches (default 50)"),
+              ("ignore_case", "boolean", "Case-insensitive match")],
             &["pattern", "path"]),
-        td("glob", "Find files matching a glob pattern. Returns sorted file paths with sizes. Use ** for recursive search (e.g. 'src/**/*.py'). Noise directories are always skipped: .git, node_modules, __pycache__, .venv/venv, build, dist and target. Prefer this over run_bash('find ...') or run_bash('ls ...'). Results are capped at 200 paths.",
-            &[("pattern", "string", "The glob pattern to match against file paths. Supports ** for recursive matching, * for any characters, ? for single character."),
-              ("path", "string", "The directory to search in (default: current working directory)")],
+        td("glob", "Find files by glob pattern; ** matches any depth. Skips hidden and build/vendor directories; at most 200 results.",
+            &[("pattern", "string", "Glob, e.g. src/**/*.py"),
+              ("path", "string", "Directory to search (default: current)")],
             &["pattern"]),
         todowrite_definition(),
         ask_user_question_definition(),
@@ -272,28 +274,28 @@ fn base_tool_definitions() -> Vec<ToolDef> {
 fn apply_changes_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "apply_changes".into(),
-        description: "Apply a bounded, transactional set of exact-text edits across files. Every operation is validated in memory before anything is written — if validation fails, nothing is changed. Use dry_run=true to preview the unified diff before writing. Limits: at most 20 files, 100 operations total, and ~1 MB of content.".into(),
+        description: "Apply several exact-text edits across existing files, all or nothing. dry_run=true returns the unified diff without writing.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
                 "changes": {
                     "type": "array",
-                    "description": "Files and exact-text operations to apply",
+                    "description": "Per file: path and operations. An operation is replace (old, new), delete (old) or insert_after (anchor, text); old/anchor must match expected_matches times (default 1)",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "File path to edit"},
+                            "path": {"type": "string", "description": "File path"},
                             "operations": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
                                         "kind": {"type": "string", "enum": ["replace", "insert_after", "delete"]},
-                                        "old": {"type": "string", "description": "Exact text to match for replace/delete"},
-                                        "anchor": {"type": "string", "description": "Exact text after which to insert"},
+                                        "old": {"type": "string", "description": "Exact text for replace/delete"},
+                                        "anchor": {"type": "string", "description": "Exact text to insert after"},
                                         "new": {"type": "string", "description": "Replacement text"},
                                         "text": {"type": "string", "description": "Text to insert"},
-                                        "expected_matches": {"type": "integer", "description": "Expected exact match count; defaults to 1"}
+                                        "expected_matches": {"type": "integer", "description": "Required match count (default 1)"}
                                     },
                                     "required": ["kind"]
                                 }
@@ -302,10 +304,10 @@ fn apply_changes_definition() -> ToolDef {
                         "required": ["path", "operations"]
                     }
                 },
-                "dry_run": {"type": "boolean", "description": "Validate and return a diff without writing files (default: false)"},
+                "dry_run": {"type": "boolean", "description": "Preview only; nothing is written"},
                 "postconditions": {
                     "type": "array",
-                    "description": "Optional content checks evaluated before writing",
+                    "description": "Optional {path, contains, does_not_contain} checks on the edited text; a failed check cancels every edit",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -325,18 +327,18 @@ fn apply_changes_definition() -> ToolDef {
 fn todowrite_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "todowrite".into(),
-        description: "Create and update a structured task list for tracking progress during complex multi-step operations. Send the COMPLETE list every time — do not send incremental updates. At most one task must be in_progress at any time — it is fine to have none. Mark tasks completed immediately after finishing them. Use imperative forms for content (e.g. 'Run tests', 'Add JWT middleware').".into(),
+        description: "Keep a task list for multi-step work. Send the whole list each time; at most one task in_progress.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
                 "todos": {
                     "type": "array",
-                    "description": "The complete list of tasks with their current statuses",
+                    "description": "All tasks with their status",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "content": {"type": "string", "description": "Imperative task description, e.g. 'Run the tests'"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Current task status — at most one task should be in_progress"}
+                            "content": {"type": "string", "description": "Task, imperative (e.g. 'Run the tests')"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "pending, in_progress or completed"}
                         },
                         "required": ["content", "status"]
                     }
@@ -350,26 +352,26 @@ fn todowrite_definition() -> ToolDef {
 fn ask_user_question_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "ask_user_question".into(),
-        description: "Ask the user one or more multiple-choice questions to clarify requirements, gather preferences, or resolve ambiguity. Use this when instructions are vague, multiple valid approaches exist, or you need a decision before proceeding. Each question includes a header, the question text, and a list of options with descriptions.".into(),
+        description: "Ask the user multiple-choice questions. Use it instead of guessing when the request is ambiguous, or when what you found contradicts what the user said.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
                 "questions": {
                     "type": "array",
-                    "description": "One or more questions, each with a header, question text, and list of options",
+                    "description": "Questions, each with a header, question text and options",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "header": {"type": "string", "description": "Short label for the question group (e.g. 'Theme', 'Output Format')"},
-                            "question": {"type": "string", "description": "The question text to display to the user"},
+                            "header": {"type": "string", "description": "Short label, e.g. 'Auth'"},
+                            "question": {"type": "string", "description": "The question"},
                             "options": {
                                 "type": "array",
-                                "description": "List of answer choices for this question",
+                                "description": "The choices",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "label": {"type": "string", "description": "Short answer label (e.g. 'Dark', 'JSON')"},
-                                        "description": {"type": "string", "description": "Brief explanation of what this option means"}
+                                        "label": {"type": "string", "description": "Choice label"},
+                                        "description": {"type": "string", "description": "One-line explanation of the choice"}
                                     },
                                     "required": ["label", "description"]
                                 }
@@ -506,30 +508,17 @@ fn remote_only_run_bash(mut def: ToolDef) -> ToolDef {
     def
 }
 
-/// Other schemas that point the model at run_bash for local work.
-const WINDOWS_DESCRIPTION_SWAPS: &[(&str, &str, &str)] = &[
-    ("download_file", "use run_bash with curl or wget", "use run_powershell with curl.exe"),
-    ("fetch_url", "use run_bash with curl", "use run_powershell with curl.exe"),
-    ("glob", "run_bash('find ...') or run_bash('ls ...')", "run_powershell('Get-ChildItem ...')"),
-];
-
 /// Return the tool list the model sees on this platform.
 fn platform_tools(base: Vec<ToolDef>, windows: bool, powershell_label: &str, is_admin: bool) -> Vec<ToolDef> {
     if !windows {
         return base;
     }
     let mut tools = Vec::with_capacity(base.len() + 1);
-    for mut def in base {
+    for def in base {
         if def.function.name == "run_bash" {
             tools.push(run_powershell_definition(powershell_label, is_admin));
             tools.push(remote_only_run_bash(def));
             continue;
-        }
-        if let Some((_, from, to)) = WINDOWS_DESCRIPTION_SWAPS
-            .iter()
-            .find(|(name, _, _)| *name == def.function.name)
-        {
-            def.function.description = def.function.description.replace(from, to);
         }
         tools.push(def);
     }
@@ -582,11 +571,50 @@ pub async fn execute_tool(
     }
 }
 
+/// Each tool's JSON-schema `parameters`, keyed by name, for argument validation.
+static TOOL_PARAMETERS: LazyLock<HashMap<String, serde_json::Value>> = LazyLock::new(|| {
+    TOOLS_JSON
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            Some((f.get("name")?.as_str()?.to_string(), f.get("parameters")?.clone()))
+        })
+        .collect()
+});
+
+/// Schema-check ask_user_question, which the harness handles instead of
+/// execute_tool, so a malformed call reaches the model as an error rather than
+/// reaching the user as an empty or broken prompt.
+pub fn validate_question_arguments(arguments: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let args = crate::tool_args::normalize_arguments(
+        "ask_user_question",
+        arguments,
+        TOOL_PARAMETERS.get("ask_user_question"),
+    )?;
+    if args["questions"].as_array().is_none_or(|q| q.is_empty()) {
+        return Err("Error: invalid arguments for ask_user_question; nothing was run.\n\
+                    - questions: must contain at least one question"
+            .to_string());
+    }
+    Ok(args)
+}
+
 async fn execute_tool_inner(
     name: &str,
     arguments: &serde_json::Value,
     ctx: &Arc<ToolContext>,
 ) -> String {
+    if name == "ask_user_question" {
+        return "ask_user_question must be handled by the harness — it should never reach execute_tool directly.".to_string();
+    }
+    let normalized =
+        match crate::tool_args::normalize_arguments(name, arguments, TOOL_PARAMETERS.get(name)) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    let arguments = &normalized;
     match name {
         "read_file" => {
             read_file(
@@ -603,6 +631,7 @@ async fn execute_tool_inner(
                 a(arguments, "path", ""),
                 a(arguments, "old_str", ""),
                 a(arguments, "new_str", ""),
+                abool(arguments, "replace_all", false),
             ).await
         }
         "apply_changes" => apply_changes(arguments).await,
@@ -665,6 +694,7 @@ async fn execute_tool_inner(
                 aus(arguments, "context_lines", 0),
                 aus(arguments, "max_results", 50),
                 abool(arguments, "regex", false),
+                abool(arguments, "ignore_case", false),
             )
             .await
         }
@@ -677,7 +707,6 @@ async fn execute_tool_inner(
                 .unwrap_or_default();
             todowrite(todos).await
         }
-        "ask_user_question" => "ask_user_question must be handled by the harness — it should never reach execute_tool directly.".to_string(),
         _ => format!("Unknown tool: {name}"),
     }
 }
@@ -698,6 +727,8 @@ async fn apply_changes(args: &serde_json::Value) -> String {
         );
     }
     let mut prepared: HashMap<PathBuf, (String, String)> = HashMap::new();
+    // Files in the order given, so the diff and the commit order are stable.
+    let mut order: Vec<PathBuf> = Vec::new();
     let mut errors = Vec::new();
     let mut ops = 0usize;
     let mut result_bytes = 0usize;
@@ -791,7 +822,8 @@ async fn apply_changes(args: &serde_json::Value) -> String {
                 ));
                 continue;
             }
-            let count = current.matches(needle).count();
+            let (needle, replacement) = match_newlines(&current, needle, replacement);
+            let count = current.matches(needle.as_str()).count();
             if count != expected {
                 errors.push(format!(
                     "{raw} operation {oi}: matches {count} locations; expected {expected}"
@@ -801,11 +833,12 @@ async fn apply_changes(args: &serde_json::Value) -> String {
             let repl = if kind == "insert_after" {
                 format!("{needle}{replacement}")
             } else {
-                replacement.to_string()
+                replacement
             };
-            current = current.replacen(needle, &repl, expected);
+            current = current.replacen(needle.as_str(), &repl, expected);
         }
         result_bytes += original.len() + current.len();
+        order.push(path.clone());
         prepared.insert(path, (original, current));
     }
     if result_bytes > MAX_RESULT {
@@ -860,14 +893,10 @@ async fn apply_changes(args: &serde_json::Value) -> String {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let mut diff = String::new();
-    for (path, (old, new)) in &prepared {
+    for path in &order {
+        let (old, new) = &prepared[path];
         if old != new {
-            diff.push_str(&format!("--- {}\n+++ {}\n", path.display(), path.display()));
-            diff.push_str(&format!(
-                "@@ changed content: {} -> {} bytes @@\n",
-                old.len(),
-                new.len()
-            ));
+            diff.push_str(&unified_diff(&path.display().to_string(), old, new));
         }
     }
     if dry {
@@ -879,23 +908,23 @@ async fn apply_changes(args: &serde_json::Value) -> String {
         .trim_end()
         .into();
     }
-    let mut temps = Vec::new();
-    for (path, (_, new)) in &prepared {
-        let tmp = path.with_file_name(format!(
-            ".{}.pengy-tmp-{}",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
-        if let Err(e) = std::fs::write(&tmp, new) {
-            for t in temps {
-                let _ = std::fs::remove_file(t);
+    // Stage every file before replacing any, so a write failure (disk full,
+    // permissions) leaves all targets untouched; only the renames remain after.
+    let mut staged: Vec<StagedWrite> = order
+        .iter()
+        .filter(|p| prepared[*p].0 != prepared[*p].1)
+        .map(|p| StagedWrite::new(p, prepared[p].1.as_bytes().to_vec()))
+        .collect();
+    for i in 0..staged.len() {
+        if let Err(e) = staged[i].stage() {
+            for s in staged.iter_mut() {
+                s.discard();
             }
             return format!("Error: write failed; no changes applied: {e}");
         }
-        temps.push(tmp);
     }
-    for (i, (path, _)) in prepared.iter().enumerate() {
-        if let Err(e) = std::fs::rename(&temps[i], path) {
+    for i in 0..staged.len() {
+        if let Err(e) = staged[i].commit() {
             return format!(
                 "Error: rename failed after validation; changes may be partially applied: {e}"
             );
@@ -1264,40 +1293,354 @@ async fn read_image(path: String, ctx: &Arc<ToolContext>) -> String {
     }
 }
 
-async fn write_file(path: String, content: String) -> String {
-    let p = expand_home(&path);
-    if let Some(parent) = p.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("Error creating directory: {e}");
+/// Follow a chain of symlinks at `path` (not its ancestors) to the file a
+/// write should actually replace, so the link itself survives the rename.
+fn resolve_write_target(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => match std::fs::read_link(&p) {
+                Ok(link) if link.is_absolute() => p = link,
+                Ok(link) => p = p.parent().unwrap_or(Path::new(".")).join(link),
+                Err(_) => break,
+            },
+            _ => break,
         }
     }
-    match std::fs::write(&p, &content) {
+    p
+}
+
+static STAGE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A file write staged to a temp file beside its target, then renamed over it.
+///
+/// Every edit tool writes through this so a failed write (disk full, quota,
+/// signal) can never truncate or delete the file being edited: the target is
+/// only ever replaced by an atomic rename of a complete, synced temp file.
+/// The rename keeps the target's permission bits (and owner, where allowed)
+/// and follows symlinks so the link itself survives and its target is edited.
+/// If the directory doesn't allow creating a temp file but the target itself
+/// is writable, it falls back to a checked in-place write.  Keep identical to
+/// `_StagedWrite` (Python) and `StagedWrite` (C++).
+pub(crate) struct StagedWrite {
+    target: PathBuf,
+    data: Vec<u8>,
+    temp: Option<PathBuf>,
+    in_place: bool,
+}
+
+impl StagedWrite {
+    pub(crate) fn new(path: &Path, data: Vec<u8>) -> Self {
+        StagedWrite { target: resolve_write_target(path), data, temp: None, in_place: false }
+    }
+
+    pub(crate) fn stage(&mut self) -> std::io::Result<()> {
+        if self.target.is_dir() {
+            return Err(std::io::Error::other(format!("{} is a directory", self.target.display())));
+        }
+        if let Some(parent) = self.target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let meta = std::fs::metadata(&self.target).ok();
+        // A rename only needs a writable directory; still refuse a target the
+        // user made read-only, as a plain open() for writing would.
+        if meta.is_some() {
+            if let Err(e) = std::fs::OpenOptions::new().write(true).open(&self.target) {
+                return Err(e);
+            }
+        }
+        let name = self.target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let temp = self.target.with_file_name(format!(
+            ".{name}.pengy-tmp-{}-{}",
+            std::process::id(),
+            STAGE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o666);
+        }
+        let mut file = match opts.open(&temp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && meta.is_some() => {
+                // Target is writable (checked above) but its directory isn't.
+                self.in_place = true;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        self.temp = Some(temp.clone());
+        let written = file.write_all(&self.data).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(e) = written {
+            self.discard();
+            return Err(e);
+        }
+        if let Some(m) = meta {
+            if let Err(e) = std::fs::set_permissions(&temp, m.permissions()) {
+                self.discard();
+                return Err(e);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let _ = std::os::unix::fs::chown(&temp, Some(m.uid()), Some(m.gid()));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(&mut self) -> std::io::Result<()> {
+        if self.in_place {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&self.target)?;
+            f.write_all(&self.data)?;
+            f.set_len(self.data.len() as u64)?;
+            return f.sync_all();
+        }
+        if let Some(temp) = &self.temp {
+            std::fs::rename(temp, &self.target)?;
+            self.temp = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn discard(&mut self) {
+        if let Some(temp) = self.temp.take() {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+/// Stage and commit a single text write (see `StagedWrite`).
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut staged = StagedWrite::new(path, text.as_bytes().to_vec());
+    staged.stage()?;
+    staged.commit()
+}
+
+/// Adapt LF-typed `old`/`new` to a CRLF file.
+///
+/// Models type edits with LF even for CRLF files, so an exact-text edit typed
+/// with `\n` would never match.  When `old` has no match as typed, has no CR of
+/// its own, and the file uses CRLF, retry with CRLF line endings and write
+/// `new` the same way, so the file keeps its line-ending style.  Mirrors
+/// `_match_newlines` (Python) and `matchNewlines` (C++).
+fn match_newlines(content: &str, old: &str, new: &str) -> (String, String) {
+    if content.contains(old) || !old.contains('\n') || old.contains('\r') || !content.contains("\r\n") {
+        return (old.to_string(), new.to_string());
+    }
+    let crlf_old = old.replace('\n', "\r\n");
+    if !content.contains(&crlf_old) {
+        return (old.to_string(), new.to_string());
+    }
+    let new = if new.contains('\r') { new.to_string() } else { new.replace('\n', "\r\n") };
+    (crlf_old, new)
+}
+
+/// Line-level opcodes (`tag`, a-range, b-range) turning `a` into `b`: common
+/// prefix/suffix trimmed, then an LCS over the middle (a middle too large for
+/// the table is reported as one replace).  Same algorithm as the C++ edition.
+fn diff_opcodes(a: &[&str], b: &[&str]) -> Vec<(char, usize, usize, usize, usize)> {
+    let mut pre = 0;
+    while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < a.len() - pre && suf < b.len() - pre && a[a.len() - 1 - suf] == b[b.len() - 1 - suf] {
+        suf += 1;
+    }
+    let (am, bm) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
+    // Matching (i, j) pairs in the middle, in order.
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    if !am.is_empty() && !bm.is_empty() && am.len() * bm.len() <= 4_000_000 {
+        let (n, m) = (am.len(), bm.len());
+        let mut dp = vec![0u32; (n + 1) * (m + 1)];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                dp[i * (m + 1) + j] = if am[i] == bm[j] {
+                    dp[(i + 1) * (m + 1) + j + 1] + 1
+                } else {
+                    dp[(i + 1) * (m + 1) + j].max(dp[i * (m + 1) + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < n && j < m {
+            if am[i] == bm[j] {
+                pairs.push((i, j));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1] {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    let mut ops = Vec::new();
+    if pre > 0 {
+        ops.push(('=', 0, pre, 0, pre));
+    }
+    let (mut ai, mut bj) = (0usize, 0usize);
+    let mut k = 0;
+    while k <= pairs.len() {
+        let (ni, nj) = if k < pairs.len() { pairs[k] } else { (am.len(), bm.len()) };
+        if ai < ni || bj < nj {
+            let tag = if ai < ni && bj < nj { 'r' } else if ai < ni { 'd' } else { 'i' };
+            ops.push((tag, pre + ai, pre + ni, pre + bj, pre + nj));
+        }
+        if k < pairs.len() {
+            let mut run = 1;
+            while k + run < pairs.len() && pairs[k + run] == (ni + run, nj + run) {
+                run += 1;
+            }
+            ops.push(('=', pre + ni, pre + ni + run, pre + nj, pre + nj + run));
+            ai = ni + run;
+            bj = nj + run;
+            k += run;
+        } else {
+            k += 1;
+        }
+    }
+    if suf > 0 {
+        ops.push(('=', a.len() - suf, a.len(), b.len() - suf, b.len()));
+    }
+    // Merge adjacent equal runs (prefix/middle/suffix boundaries).
+    let mut merged: Vec<(char, usize, usize, usize, usize)> = Vec::new();
+    for op in ops {
+        if let Some(last) = merged.last_mut() {
+            if last.0 == '=' && op.0 == '=' && last.2 == op.1 {
+                last.2 = op.2;
+                last.4 = op.4;
+                continue;
+            }
+        }
+        merged.push(op);
+    }
+    merged
+}
+
+fn unified_range(start: usize, stop: usize) -> String {
+    let len = stop - start;
+    match len {
+        1 => format!("{}", start + 1),
+        0 => format!("{start},0"),
+        _ => format!("{},{len}", start + 1),
+    }
+}
+
+/// A unified diff (3 lines of context) of `old` → `new`, in difflib's format.
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    const CTX: usize = 3;
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let mut codes = diff_opcodes(&a, &b);
+    if codes.is_empty() {
+        return String::new();
+    }
+    if codes[0].0 == '=' {
+        let c = codes[0];
+        codes[0] = ('=', c.1.max(c.2.saturating_sub(CTX)), c.2, c.3.max(c.4.saturating_sub(CTX)), c.4);
+    }
+    let last = codes.len() - 1;
+    if codes[last].0 == '=' {
+        let c = codes[last];
+        codes[last] = ('=', c.1, c.2.min(c.1 + CTX), c.3, c.4.min(c.3 + CTX));
+    }
+    let mut groups: Vec<Vec<(char, usize, usize, usize, usize)>> = Vec::new();
+    let mut group = Vec::new();
+    for c in codes {
+        let (tag, mut i1, i2, mut j1, j2) = c;
+        if tag == '=' && i2 - i1 > 2 * CTX {
+            group.push(('=', i1, i2.min(i1 + CTX), j1, j2.min(j1 + CTX)));
+            groups.push(std::mem::take(&mut group));
+            i1 = i1.max(i2.saturating_sub(CTX));
+            j1 = j1.max(j2.saturating_sub(CTX));
+        }
+        group.push((tag, i1, i2, j1, j2));
+    }
+    if !group.is_empty() && !(group.len() == 1 && group[0].0 == '=') {
+        groups.push(group);
+    }
+    if groups.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("--- {path}\n+++ {path}\n");
+    let line = |prefix: char, text: &str, out: &mut String| {
+        out.push(prefix);
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    };
+    for g in groups {
+        let (first, lastc) = (g[0], g[g.len() - 1]);
+        out.push_str(&format!(
+            "@@ -{} +{} @@\n",
+            unified_range(first.1, lastc.2),
+            unified_range(first.3, lastc.4)
+        ));
+        for (tag, i1, i2, j1, j2) in g {
+            if tag == '=' {
+                for t in &a[i1..i2] {
+                    line(' ', t, &mut out);
+                }
+                continue;
+            }
+            for t in &a[i1..i2] {
+                line('-', t, &mut out);
+            }
+            for t in &b[j1..j2] {
+                line('+', t, &mut out);
+            }
+        }
+    }
+    out
+}
+
+async fn write_file(path: String, content: String) -> String {
+    match write_atomic(&expand_home(&path), &content) {
         Ok(_) => format!("Successfully wrote to {path}"),
         Err(e) => format!("Error writing file: {e}"),
     }
 }
 
-async fn replace_in_file(path: String, old_str: String, new_str: String) -> String {
+async fn replace_in_file(path: String, old_str: String, new_str: String, replace_all: bool) -> String {
     let p = expand_home(&path);
     if old_str.is_empty() {
         return "Error: old_str is empty. You must provide the exact text to replace.".into();
     }
+    if !p.exists() {
+        return format!("Error: File not found: {path}");
+    }
+    if !p.is_file() {
+        return format!("Error: Not a file: {path}");
+    }
     let content = match std::fs::read_to_string(&p) {
         Ok(c) => c,
-        Err(_) => {
-            return if !p.exists() {
-                format!("Error: File not found: {path}")
-            } else {
-                format!("Error: Not a file: {path}")
-            };
-        }
+        Err(_) => return format!("Error: {path} is a binary file (not UTF-8)."),
     };
+    let (old_str, new_str) = match_newlines(&content, &old_str, &new_str);
     let count = content.matches(&old_str).count();
     if count == 0 {
         return format!(
             "Error: old_str not found in {path}.\n\n\
              Tip: read the file first to get the exact text."
         );
+    }
+    if replace_all {
+        if let Err(e) = write_atomic(&p, &content.replace(&old_str, &new_str)) {
+            return format!("Error writing file: {e}");
+        }
+        return format!("✅ Replaced {count} occurrence(s) in {path}.");
     }
     if count > 1 {
         let mut found_lines = Vec::new();
@@ -1312,11 +1655,11 @@ async fn replace_in_file(path: String, old_str: String, new_str: String) -> Stri
         return format!(
             "Error: old_str matches {count} locations in {path}.\n\n\
              Matches found on lines: {found_lines:?}\n\n\
-             Make old_str longer or more specific."
+             Make old_str longer or more specific, or set replace_all=true to replace every occurrence."
         );
     }
     let new_content = content.replacen(&old_str, &new_str, 1);
-    if let Err(e) = std::fs::write(&p, &new_content) {
+    if let Err(e) = write_atomic(&p, &new_content) {
         return format!("Error writing file: {e}");
     }
     let old_line = content[..content.find(&old_str).unwrap()]
@@ -2936,8 +3279,15 @@ async fn download_file(
         return format!("Error downloading file: HTTP {}", resp.status());
     }
 
+    // Stream into a hidden temp file renamed over `dest` only once complete,
+    // so a failed download never touches an existing file of the same name.
+    let temp = dest.with_file_name(format!(".{fname}.pengy-dl-{}", std::process::id()));
+    let fail = |msg: String| {
+        let _ = std::fs::remove_file(&temp);
+        msg
+    };
     let mut total: usize = 0;
-    let mut out = match std::fs::File::create(&dest) {
+    let mut out = match std::fs::File::create(&temp) {
         Ok(f) => f,
         Err(e) => return format!("Error writing file: {e}"),
     };
@@ -2949,27 +3299,27 @@ async fn download_file(
                 .await
             {
                 Err(_) => {
-                    let _ = std::fs::remove_file(&dest);
-                    return format!(
+                    return fail(format!(
                         "Error downloading: no data for {DOWNLOAD_STALL_TIMEOUT} seconds"
-                    );
+                    ));
                 }
                 Ok(None) => break,
-                Ok(Some(Err(e))) => {
-                    let _ = std::fs::remove_file(&dest);
-                    return format!("Error downloading: {e}");
-                }
+                Ok(Some(Err(e))) => return fail(format!("Error downloading: {e}")),
                 Ok(Some(Ok(c))) => c,
             };
         total += chunk.len();
         if limit_bytes > 0 && total > limit_bytes {
-            let _ = std::fs::remove_file(&dest);
-            return format!("Error: Download exceeds maximum size of {limit_bytes} bytes.");
+            return fail(format!(
+                "Error: Download exceeds maximum size of {}.",
+                format_size(limit_bytes as u64)
+            ));
         }
         if let Err(e) = out.write_all(&chunk) {
-            let _ = std::fs::remove_file(&dest);
-            return format!("Error writing file: {e}");
+            return fail(format!("Error writing file: {e}"));
         }
+    }
+    if let Err(e) = out.sync_all().and_then(|_| std::fs::rename(&temp, &dest)) {
+        return fail(format!("Error writing file: {e}"));
     }
 
     format!("Downloaded to {} ({total} bytes)", dest.display())
@@ -3413,6 +3763,7 @@ async fn search_content(
     context_lines: usize,
     max_results: usize,
     regex: bool,
+    ignore_case: bool,
 ) -> String {
     let root = expand_home(&path);
     if !root.exists() {
@@ -3421,14 +3772,10 @@ async fn search_content(
 
     // Literal by default so metacharacters in code symbols (".", "(", "[", "*",
     // ...) don't silently become regex syntax; regex=true opts into regex.
-    let compiled = if regex {
-        match Regex::new(&pattern) {
-            Ok(r) => r,
-            Err(e) => return format!("Error: Invalid regex pattern: {e}"),
-        }
-    } else {
-        // regex::escape always yields a valid pattern.
-        Regex::new(&regex::escape(&pattern)).expect("escaped pattern is always valid")
+    let source = if regex { pattern.clone() } else { regex::escape(&pattern) };
+    let compiled = match regex::RegexBuilder::new(&source).case_insensitive(ignore_case).build() {
+        Ok(r) => r,
+        Err(e) => return format!("Error: Invalid regex pattern: {e}"),
     };
 
     let context_lines = context_lines.min(10);
@@ -3436,7 +3783,8 @@ async fn search_content(
 
     let mut results: Vec<String> = Vec::new();
     let mut files_searched = 0;
-    let mut files_skipped = 0;
+    let mut skipped_binary = 0;
+    let mut skipped_large = 0;
     let mut truncated = false;
 
     if root.is_file() {
@@ -3454,9 +3802,12 @@ async fn search_content(
         return results.join("\n\n");
     }
 
+    // The root itself is never filtered: searching "." or ~/.config or a dir
+    // named "build" must search it, not prune it before the walk starts.
     let walker = walkdir::WalkDir::new(&root)
+        .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| !should_skip_dir(e));
+        .filter_entry(|e| e.depth() == 0 || !should_skip_dir(e));
 
     for entry in walker {
         if truncated {
@@ -3474,13 +3825,26 @@ async fn search_content(
             continue;
         }
         if let Some(ref glob) = file_glob {
-            if !matches_glob(fname, glob) {
+            let rel = entry
+                .path()
+                .strip_prefix(&root)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !matches_file_glob(fname, &rel, glob) {
                 continue;
             }
         }
-        if !is_likely_text(entry.path()) {
-            files_skipped += 1;
-            continue;
+        match search_skip_reason(entry.path()) {
+            Some("large") => {
+                skipped_large += 1;
+                continue;
+            }
+            Some(_) => {
+                skipped_binary += 1;
+                continue;
+            }
+            None => {}
         }
         files_searched += 1;
         if search_one_file(
@@ -3496,15 +3860,19 @@ async fn search_content(
     }
 
     if results.is_empty() {
-        let mut summary = format!("No matches found for '{pattern}' in {path}");
-        if files_searched > 0 {
-            summary.push_str(&format!(" (searched {files_searched} files"));
-            if files_skipped > 0 {
-                summary.push_str(&format!(
-                    ", skipped {files_skipped} binary/non-matching files"
-                ));
+        let mut summary =
+            format!("No matches found for '{pattern}' in {path} (searched {files_searched} files");
+        if skipped_binary > 0 {
+            summary.push_str(&format!("; skipped {skipped_binary} binary"));
+        }
+        if skipped_large > 0 {
+            summary.push_str(&format!("; skipped {skipped_large} over 10 MB"));
+        }
+        summary.push(')');
+        if let Some(glob) = file_glob.as_deref().filter(|g| !g.is_empty()) {
+            if files_searched == 0 && skipped_binary == 0 && skipped_large == 0 {
+                summary.push_str(&format!(". No file matched file_glob '{glob}'."));
             }
-            summary.push(')');
         }
         return summary;
     }
@@ -3528,8 +3896,10 @@ fn search_one_file(
     max_results: usize,
     root: Option<&Path>,
 ) -> bool {
-    let content = match std::fs::read_to_string(filepath) {
-        Ok(c) => c,
+    // Lossy like Python's errors="replace": a stray invalid byte must not hide
+    // a whole file from the search.
+    let content = match std::fs::read(filepath) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(_) => return false,
     };
     let lines: Vec<&str> = content.lines().collect();
@@ -3591,109 +3961,63 @@ fn group_regions(
     regions
 }
 
+/// Hidden directories are searched (.github, .config and .vscode hold real
+/// content and a model asking "which files mention X" expects them); only the
+/// known-noise list is pruned.  Mirrors `_should_skip_search_dir`.
 fn should_skip_dir(entry: &walkdir::DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|name| {
-            name.starts_with('.') || name.ends_with(".egg-info") || ALWAYS_SKIP_DIRS.contains(name)
-        })
-        .unwrap_or(false)
+    entry.file_type().is_dir()
+        && entry
+            .file_name()
+            .to_str()
+            .map(|name| {
+                name.ends_with(".egg-info")
+                    || ALWAYS_SKIP_DIRS.contains(name)
+                    || SEARCH_EXTRA_SKIP_DIRS.contains(&name)
+            })
+            .unwrap_or(false)
 }
+
+const SEARCH_EXTRA_SKIP_DIRS: &[&str] = &[".venv", ".cache"];
 
 static ALWAYS_SKIP_FILES: Lazy<HashSet<&str>> =
     Lazy::new(|| [".DS_Store", "Thumbs.db"].iter().copied().collect());
 
-fn is_likely_text(path: &Path) -> bool {
+// search_content decides text vs binary by content (a NUL byte in the first
+// 8 KB), not by an extension allowlist: an allowlist silently hid whole
+// languages (.cs, .vue, .tf, .ps1), logs and extensionless scripts, and the
+// model got "No matches" with no hint that files were never searched.  The
+// extensions below are only a fast path to skip known binaries unread.
+const SEARCH_BINARY_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tif", "tiff", "pdf", "zip", "gz", "tgz",
+    "bz2", "xz", "zst", "7z", "rar", "tar", "jar", "war", "class", "pyc", "pyo", "o", "obj", "a",
+    "lib", "so", "dylib", "dll", "exe", "bin", "wasm", "whl", "deb", "rpm", "woff", "woff2", "ttf",
+    "otf", "eot", "mp3", "mp4", "wav", "flac", "ogg", "mkv", "mov", "avi", "webm", "sqlite", "db",
+    "iso", "dmg",
+];
+const SEARCH_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// `Some("binary" | "large")` if `path` shouldn't be searched, else `None`.
+fn search_skip_reason(path: &Path) -> Option<&'static str> {
     if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        let lower = ext.to_lowercase();
-        let text_exts = [
-            "py",
-            "pyi",
-            "pyx",
-            "c",
-            "cpp",
-            "cc",
-            "cxx",
-            "h",
-            "hpp",
-            "hxx",
-            "rs",
-            "go",
-            "java",
-            "kt",
-            "scala",
-            "swift",
-            "js",
-            "jsx",
-            "ts",
-            "tsx",
-            "mjs",
-            "cjs",
-            "rb",
-            "rake",
-            "php",
-            "pl",
-            "pm",
-            "sh",
-            "bash",
-            "zsh",
-            "fish",
-            "html",
-            "htm",
-            "css",
-            "scss",
-            "sass",
-            "less",
-            "json",
-            "yaml",
-            "yml",
-            "toml",
-            "ini",
-            "cfg",
-            "conf",
-            "xml",
-            "svg",
-            "rss",
-            "md",
-            "markdown",
-            "rst",
-            "txt",
-            "tex",
-            "sql",
-            "r",
-            "jl",
-            "lua",
-            "zig",
-            "nim",
-            "ex",
-            "exs",
-            "cmake",
-            "make",
-            "mk",
-            "dockerfile",
-            "env",
-            "gitignore",
-            "editorconfig",
-        ];
-        if text_exts.contains(&lower.as_str()) {
-            return true;
+        if SEARCH_BINARY_EXTENSIONS.contains(&ext.to_lowercase().as_str()) {
+            return Some("binary");
         }
     }
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        let text_files = [
-            "makefile",
-            "dockerfile",
-            "license",
-            "changelog",
-            "authors",
-            "todo",
-        ];
-        if text_files.contains(&name.to_lowercase().as_str()) {
-            return true;
-        }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Some("binary");
+    };
+    if meta.len() > SEARCH_MAX_FILE_BYTES {
+        return Some("large");
     }
-    false
+    let mut buf = [0u8; 8192];
+    let n = match std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut buf)) {
+        Ok(n) => n,
+        Err(_) => return Some("binary"),
+    };
+    if buf[..n].contains(&0) {
+        return Some("binary");
+    }
+    None
 }
 
 static GLOB_BRACE_RE: LazyLock<Regex> =
@@ -3703,6 +4027,34 @@ static GLOB_BRACE_RE: LazyLock<Regex> =
 // search_content call, so this avoids recompiling per file.
 static GLOB_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<String, Regex>>> =
     LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// A `file_glob` without `/` matches the file name (`*.py`); one with `/`
+/// matches the path relative to the search root (`src/*.py`, `**/test_*.py`),
+/// with a leading `**/` also matching at the root.  Mirrors `_matches_glob`.
+fn matches_file_glob(name: &str, rel: &str, glob: &str) -> bool {
+    if !glob.contains('/') {
+        return matches_glob(name, glob);
+    }
+    let patterns: Vec<String> = match GLOB_BRACE_RE.captures(glob) {
+        Some(caps) => {
+            let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let suffix = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+            caps.get(2)
+                .map(|m| m.as_str())
+                .unwrap_or("")
+                .split(',')
+                .map(|c| format!("{prefix}{}{suffix}", c.trim()))
+                .collect()
+        }
+        None => vec![glob.to_string()],
+    };
+    patterns.iter().any(|p| {
+        if !p.contains('/') {
+            return simple_glob_match(name, p);
+        }
+        simple_glob_match(rel, p) || p.strip_prefix("**/").is_some_and(|rest| simple_glob_match(rel, rest))
+    })
+}
 
 fn matches_glob(name: &str, glob: &str) -> bool {
     // Handle brace expansion like *.{js,ts}
@@ -4573,6 +4925,7 @@ mod tests {
             path.to_str().unwrap().into(),
             "world".into(),
             "universe".into(),
+            false,
         )
         .await;
         assert!(result.contains("Successfully"));
@@ -4591,6 +4944,7 @@ mod tests {
             path.to_str().unwrap().into(),
             "nonexistent".into(),
             "x".into(),
+            false,
         )
         .await;
         assert!(result.contains("not found"));
@@ -4601,13 +4955,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replace.txt");
         std::fs::write(&path, "aaa bbb aaa").unwrap();
-        let result = replace_in_file(path.to_str().unwrap().into(), "aaa".into(), "x".into()).await;
+        let result = replace_in_file(path.to_str().unwrap().into(), "aaa".into(), "x".into(), false).await;
         assert!(result.contains("matches 2 locations"));
     }
 
     #[tokio::test]
     async fn replace_in_file_empty_old_str() {
-        let result = replace_in_file("/tmp/x".into(), "".into(), "y".into()).await;
+        let result = replace_in_file("/tmp/x".into(), "".into(), "y".into(), false).await;
         assert!(result.contains("old_str is empty"));
     }
 
@@ -4617,6 +4971,7 @@ mod tests {
             "/tmp/pengy_nonexistent_12345.txt".into(),
             "x".into(),
             "y".into(),
+            false,
         )
         .await;
         assert!(result.contains("not found"));
@@ -4689,6 +5044,7 @@ mod tests {
             0,
             50,
             false,
+            false,
         )
         .await;
         assert!(result.contains("println"));
@@ -4705,6 +5061,7 @@ mod tests {
             0,
             50,
             false,
+            false,
         )
         .await;
         assert!(result.contains("No matches"));
@@ -4718,6 +5075,7 @@ mod tests {
             None,
             0,
             50,
+            false,
             false,
         )
         .await;
@@ -4738,6 +5096,7 @@ mod tests {
             0,
             50,
             false,
+            false,
         )
         .await;
         assert!(literal.contains("a.b"));
@@ -4751,6 +5110,7 @@ mod tests {
             0,
             50,
             true,
+            false,
         )
         .await;
         assert!(regex.contains("axb"));
@@ -5634,29 +5994,33 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
     // A pattern whose final component starts with "." is asking for hidden
     // entries.  Testing the whole pattern would miss "**/.config" or "src/.env",
     // since those start with "*" and "s".
-    let wants_hidden = pattern
+    let segments: Vec<String> = pattern
         .replace('\\', "/")
         .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .starts_with('.');
+        .split('/')
+        .map(String::from)
+        .collect();
+    let wants_hidden = segments.last().is_some_and(|s| s.starts_with('.'));
+    let wants_hidden_dirs = segments[..segments.len().saturating_sub(1)]
+        .iter()
+        .any(|s| s.starts_with('.') && s != "." && s != "..");
 
-    // Split pattern into prefix and glob parts for simple matching
+    // Match the whole relative path with real glob semantics: "*" and "?"
+    // stay within one path segment, "**/" spans any number of directories.
+    // (Matching only the text after "**" against the file name ignored any
+    // prefix, so "src/**/*.py" also returned files outside src/.)
     let has_recursive = pattern.contains("**");
-    let glob_suffix = if has_recursive {
-        pattern
-            .rsplit("**")
-            .next()
-            .unwrap_or(&pattern)
-            .trim_start_matches('/')
+    let matcher = match glob_to_regex(&pattern.replace('\\', "/")) {
+        Some(r) => r,
+        None => return format!("Error with glob pattern '{pattern}'"),
+    };
+    let max_depth = if has_recursive {
+        usize::MAX
     } else {
-        &pattern
+        pattern.trim_matches('/').split('/').count()
     };
 
     let mut matches: Vec<(String, bool, u64)> = Vec::new();
-    let max_depth = if has_recursive { usize::MAX } else { 1 };
-
     let walker = walkdir::WalkDir::new(&search_dir)
         .max_depth(max_depth)
         .follow_links(false)
@@ -5666,7 +6030,11 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
                 return true;
             } // never skip the root
             if let Some(name) = e.file_name().to_str() {
-                if name.starts_with('.') && !wants_hidden {
+                // Hidden directories are walked only when the pattern names
+                // one (".github/**/*.yml"); hidden files only when the last
+                // segment asks for them ("**/.env").
+                let hidden_ok = if e.file_type().is_dir() { wants_hidden_dirs } else { wants_hidden };
+                if name.starts_with('.') && !hidden_ok {
                     return false;
                 }
                 // Only directories are pruned by the skip set: ".env" and
@@ -5680,28 +6048,26 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         });
 
     for entry in walker.flatten() {
-        if entry.file_type().is_dir() {
+        if entry.depth() == 0 {
             continue;
         }
-        let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-        let rel_str = rel.to_string_lossy();
-
-        // Simple glob matching.  A recursive pattern ("**/X") means "X at any
-        // depth", so it matches the file name — comparing the whole relative
-        // path only worked when the suffix began with a wildcard, which made
-        // literal suffixes like "**/.config" or "**/Makefile" unmatchable.
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let target = if has_recursive {
-            &file_name
-        } else {
-            &rel_str.to_string()
-        };
-        if !simple_glob_match(target, glob_suffix) {
+        let rel = entry.path().strip_prefix(&search_dir).unwrap_or(entry.path());
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !matcher.is_match(&rel_str) {
             continue;
         }
-
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        matches.push((rel_str.to_string(), false, size));
+        let is_dir = entry.file_type().is_dir();
+        if is_dir && entry.file_name().to_string_lossy().starts_with('.') && !wants_hidden {
+            continue;
+        }
+        let shown = entry
+            .path()
+            .strip_prefix(&root)
+            .unwrap_or(rel)
+            .to_string_lossy()
+            .to_string();
+        let size = if is_dir { 0 } else { entry.metadata().map(|m| m.len()).unwrap_or(0) };
+        matches.push((shown, is_dir, size));
     }
 
     if matches.is_empty() {
@@ -5712,7 +6078,8 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
         );
     }
 
-    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    // Directories first, then by path.
+    matches.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     let max_results = 200;
     let mut lines: Vec<String> = Vec::new();
@@ -5724,11 +6091,55 @@ async fn glob_tool(pattern: String, path: Option<String>) -> String {
             ));
             break;
         }
-        lines.push(format!("{path_str}  ({} B)", size));
+        if *_is_dir {
+            lines.push(format!("{path_str}/"));
+        } else {
+            lines.push(format!("{path_str}  ({})", format_size(*size)));
+        }
     }
 
     let result = lines.join("\n");
     snip_tool_output(result)
+}
+
+/// Translate a glob into an anchored regex over a `/`-separated relative path:
+/// `**/` = any number of directories (including none), `**` = anything,
+/// `*` = anything within one segment, `?` = one character, `{a,b}` = either.
+fn glob_to_regex(glob: &str) -> Option<Regex> {
+    let mut re = String::from("^");
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    let mut in_brace = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '*' && chars.get(i + 1) == Some(&'*') {
+            if chars.get(i + 2) == Some(&'/') {
+                re.push_str("(?:.*/)?");
+                i += 3;
+            } else {
+                re.push_str(".*");
+                i += 2;
+            }
+            continue;
+        }
+        match c {
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '{' => {
+                in_brace = true;
+                re.push_str("(?:");
+            }
+            '}' if in_brace => {
+                in_brace = false;
+                re.push(')');
+            }
+            ',' if in_brace => re.push('|'),
+            _ => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    re.push('$');
+    Regex::new(&re).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -5781,7 +6192,7 @@ async fn todowrite(todos: Vec<serde_json::Value>) -> String {
 
     if in_progress_count > 1 {
         return format!(
-            "Error: {in_progress_count} tasks marked in_progress. Exactly one task must be in_progress at a time."
+            "Error: {in_progress_count} tasks marked in_progress. At most one task may be in_progress at a time."
         );
     }
 
@@ -6287,10 +6698,11 @@ mod powershell_tests {
         let bash = by_name(&win, "run_bash");
         assert_eq!(bash.parameters.required, vec!["command", "host"]);
         assert!(bash.description.contains("remote"));
-        for name in ["download_file", "fetch_url", "glob"] {
-            let d = by_name(&win, name).description;
-            assert!(!d.contains("run_bash"), "{name}: {d}");
-            assert!(d.contains("run_powershell"), "{name}: {d}");
+        // No other schema may send the model to run_bash for local work.
+        for d in &win {
+            if !["run_bash", "run_powershell"].contains(&d.function.name.as_str()) {
+                assert!(!d.function.description.contains("run_bash"), "{}", d.function.name);
+            }
         }
     }
 
@@ -6395,5 +6807,276 @@ mod powershell_tests {
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(out.contains("timed out"), "{out}");
         assert!(scripts().is_subset(&before));
+    }
+}
+
+/// Regression tests for tool sharp edges found by the cross-edition audit;
+/// mirror `tests/test_tool_hardening.py` (Python) and the C++ `hardening*` tests.
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn run(name: &str, args: serde_json::Value) -> String {
+        execute_tool(name, &args, &Arc::new(ToolContext::default())).await
+    }
+
+    fn replace_op(path: &Path, old: &str, new: &str) -> serde_json::Value {
+        json!({"path": path.to_str().unwrap(), "operations": [{"kind": "replace", "old": old, "new": new}]})
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn per_file_dry_run_is_rejected_and_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.txt");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+        let mut change = replace_op(&f, "beta", "BETA");
+        change["dry_run"] = json!(true);
+        let r = run("apply_changes", json!({"changes": [change]})).await;
+        assert!(r.contains("dry_run is a top-level argument"), "{r}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\nbeta\n");
+    }
+
+    #[tokio::test]
+    async fn string_true_is_a_dry_run_with_real_hunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.txt");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+        let r = run("apply_changes", json!({"changes": [replace_op(&f, "beta", "BETA")], "dry_run": "true"})).await;
+        assert!(r.starts_with("Dry run: no changes applied."), "{r}");
+        assert!(r.contains("@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA"), "{r}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn unified_diff_matches_difflib_shape() {
+        let old: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        let new = old.replace("line3\n", "LINE3\n").replace("line18\n", "");
+        let d = unified_diff("f", &old, &new);
+        assert_eq!(
+            d,
+            "--- f\n+++ f\n@@ -1,6 +1,6 @@\n line1\n line2\n-line3\n+LINE3\n line4\n line5\n line6\n\
+             @@ -15,6 +15,5 @@\n line15\n line16\n line17\n-line18\n line19\n line20\n"
+        );
+        assert_eq!(unified_diff("f", "a", "b"), "--- f\n+++ f\n@@ -1 +1 @@\n-a\n+b\n");
+        assert_eq!(unified_diff("f", "", "x\n"), "--- f\n+++ f\n@@ -0,0 +1 @@\n+x\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_stage_writes_nothing_anywhere() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        std::fs::write(&a, "ORIGINAL\n").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let b = locked.join("b.txt");
+        std::fs::write(&b, "ORIGINAL\n").unwrap();
+        std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = run("apply_changes", json!({"changes": [replace_op(&a, "ORIGINAL", "NEW"), replace_op(&b, "ORIGINAL", "NEW")]})).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.starts_with("Error: write failed; no changes applied"), "{r}");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "ORIGINAL\n");
+        assert_eq!(names(dir.path()), vec!["a.txt", "locked"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edits_keep_permissions_symlinks_and_crlf() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for (tool, args) in [
+            ("write_file", json!({"content": "echo NEW\n"})),
+            ("replace_in_file", json!({"old_str": "hi", "new_str": "NEW"})),
+            ("apply_changes", json!(null)),
+        ] {
+            let f = dir.path().join(format!("{tool}.sh"));
+            std::fs::write(&f, "echo hi\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o750)).unwrap();
+            let link = dir.path().join(format!("{tool}.link"));
+            std::os::unix::fs::symlink(&f, &link).unwrap();
+            let args = if tool == "apply_changes" {
+                json!({"changes": [replace_op(&link, "hi", "NEW")]})
+            } else {
+                let mut a = args.clone();
+                a["path"] = json!(link.to_str().unwrap());
+                a
+            };
+            let r = run(tool, args).await;
+            assert!(!r.starts_with("Error"), "{tool}: {r}");
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "{tool}");
+            assert!(std::fs::read_to_string(&f).unwrap().contains("NEW"), "{tool}");
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o750, "{tool}");
+        }
+        for tool in ["replace_in_file", "apply_changes"] {
+            let f = dir.path().join(format!("{tool}.txt"));
+            std::fs::write(&f, b"one\r\ntwo\r\nthree\r\n").unwrap();
+            let args = if tool == "apply_changes" {
+                json!({"changes": [replace_op(&f, "one\ntwo", "ONE\nTWO")]})
+            } else {
+                json!({"path": f.to_str().unwrap(), "old_str": "one\ntwo", "new_str": "ONE\nTWO"})
+            };
+            let r = run(tool, args).await;
+            assert!(!r.starts_with("Error"), "{tool}: {r}");
+            assert_eq!(std::fs::read(&f).unwrap(), b"ONE\r\nTWO\r\nthree\r\n", "{tool}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_file_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        for tool in ["write_file", "replace_in_file", "apply_changes"] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = dir.path().join("locked.txt");
+            std::fs::write(&f, "ORIGINAL\n").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let p = f.to_str().unwrap();
+            let args = match tool {
+                "write_file" => json!({"path": p, "content": "NEW"}),
+                "replace_in_file" => json!({"path": p, "old_str": "ORIGINAL", "new_str": "NEW"}),
+                _ => json!({"changes": [replace_op(&f, "ORIGINAL", "NEW")]}),
+            };
+            let r = run(tool, args).await;
+            assert!(r.contains("Permission denied") || r.contains("permission denied"), "{tool}: {r}");
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), "ORIGINAL\n", "{tool}");
+            assert_eq!(names(dir.path()), vec!["locked.txt"], "{tool}");
+        }
+    }
+
+    fn spawn_status_server(status: &'static str, body_len: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let header = format!("HTTP/1.1 {status}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&vec![b'x'; body_len]);
+            }
+        });
+        format!("http://{addr}/file")
+    }
+
+    #[tokio::test]
+    async fn failed_download_keeps_existing_file() {
+        for (url, extra) in [
+            (spawn_status_server("404 Not Found", 0), json!(null)),
+            (spawn_status_server("200 OK", 2 * 1024 * 1024), json!(1)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("keep.bin"), "PRECIOUS").unwrap();
+            let mut args = json!({"url": url, "dir": dir.path().to_str().unwrap(), "filename": "keep.bin"});
+            if !extra.is_null() {
+                args["max_size_mb"] = extra;
+            }
+            let r = run("download_file", args).await;
+            assert!(r.starts_with("Error"), "{r}");
+            assert_eq!(std::fs::read_to_string(dir.path().join("keep.bin")).unwrap(), "PRECIOUS");
+            assert_eq!(names(dir.path()), vec!["keep.bin"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_covers_all_text_files_and_reports_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["Program.cs", "app.vue", "main.tf", "deploy", "server.log", "data.csv"] {
+            std::fs::write(root.join(name), "needle\n").unwrap();
+        }
+        std::fs::write(root.join("blob.dat"), b"needle\x00\x01").unwrap();
+        let r = run("search_content", json!({"pattern": "needle", "path": root.to_str().unwrap()})).await;
+        for name in ["Program.cs", "app.vue", "main.tf", "deploy", "server.log", "data.csv"] {
+            assert!(r.contains(name), "{name}: {r}");
+        }
+        assert!(!r.contains("blob.dat"), "{r}");
+        let r = run("search_content", json!({"pattern": "absent", "path": root.to_str().unwrap()})).await;
+        assert!(r.contains("(searched 6 files; skipped 1 binary)"), "{r}");
+        let r = run("search_content", json!({"pattern": "needle", "path": root.to_str().unwrap(), "file_glob": "*.rs"})).await;
+        assert!(r.contains("No file matched file_glob '*.rs'"), "{r}");
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "needle\n").unwrap();
+        std::fs::write(root.join("b.py"), "needle\n").unwrap();
+        let r = run("search_content", json!({"pattern": "needle", "path": root.to_str().unwrap(), "file_glob": "src/*.py"})).await;
+        assert!(r.contains("src/a.py") && !r.contains("b.py:"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn search_hidden_dirs_but_not_noise_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        for rel in [".github/workflows/ci.yml", ".env", "app/auth.py", ".git/config", "node_modules/x/index.js", ".venv/lib/site.py"] {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "needle\n").unwrap();
+        }
+        let r = run("search_content", json!({"pattern": "needle", "path": dir.path().to_str().unwrap()})).await;
+        for rel in [".github/workflows/ci.yml", ".env", "app/auth.py"] {
+            assert!(r.contains(rel), "{rel}: {r}");
+        }
+        for rel in [".git/", "node_modules", ".venv"] {
+            assert!(!r.contains(rel), "{rel}: {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_root_named_like_noise_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".config", "build", "target"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            std::fs::write(sub.join("f.txt"), "needle\n").unwrap();
+            let r = run("search_content", json!({"pattern": "needle", "path": sub.to_str().unwrap()})).await;
+            assert!(r.contains("Found 1 match"), "{name}: {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_all_and_ignore_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("h.py");
+        std::fs::write(&f, "client_v1.a()\nclient_v1.b()\n").unwrap();
+        let p = f.to_str().unwrap();
+        let r = run("replace_in_file", json!({"path": p, "old_str": "client_v1", "new_str": "client_v2"})).await;
+        assert!(r.contains("set replace_all=true"), "{r}");
+        let r = run("replace_in_file", json!({"path": p, "old_str": "client_v1", "new_str": "client_v2", "replace_all": true})).await;
+        assert_eq!(r, format!("✅ Replaced 2 occurrence(s) in {p}."));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "client_v2.a()\nclient_v2.b()\n");
+        std::fs::write(dir.path().join("a.txt"), "Needle\n").unwrap();
+        let d = dir.path().to_str().unwrap();
+        let r = run("search_content", json!({"pattern": "needle", "path": d, "file_glob": "*.txt"})).await;
+        assert!(r.contains("No matches"), "{r}");
+        let r = run("search_content", json!({"pattern": "needle", "path": d, "file_glob": "*.txt", "ignore_case": true})).await;
+        assert!(r.contains("Found 1 match"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn glob_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join("src/sub")).unwrap();
+        std::fs::write(root.join(".hidden/x.txt"), "x").unwrap();
+        std::fs::write(root.join("y.txt"), "y").unwrap();
+        std::fs::write(root.join("src/sub/a.py"), "a").unwrap();
+        std::fs::write(root.join("b.py"), "b").unwrap();
+        let p = root.to_str().unwrap();
+        let r = run("glob", json!({"pattern": "**/*.txt", "path": p})).await;
+        assert!(r.contains("y.txt") && !r.contains(".hidden"), "{r}");
+        let r = run("glob", json!({"pattern": ".hidden/*.txt", "path": p})).await;
+        assert!(r.contains("x.txt"), "{r}");
+        let r = run("glob", json!({"pattern": "src/**/*.py", "path": p})).await;
+        assert!(r.contains("src/sub/a.py") && !r.contains("b.py"), "{r}");
+        let r = run("glob", json!({"pattern": "*.{py,txt}", "path": p})).await;
+        assert!(r.contains("b.py") && r.contains("y.txt"), "{r}");
     }
 }
