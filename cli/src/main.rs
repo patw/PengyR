@@ -553,14 +553,21 @@ impl PengyCli {
                     delay_secs,
                     status_code,
                     message,
+                    reason,
                 }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
                     expecting_api = true; // will show "Thinking..." again after sleep
+                    // A timeout carries no HTTP status when it is our own
+                    // deadline, so the label stands alone there.
+                    let label = match reason.as_deref() {
+                        Some("timeout") => "Timeout".to_string(),
+                        _ => format!("Overloaded (HTTP {status_code})"),
+                    };
                     eprintln!(
-                        "{}Overloaded (HTTP {}) — retrying in {:.1}s ({}/{}){}  {}",
-                        YELLOW, status_code, delay_secs, attempt, max_attempts, RESET, message
+                        "{}{} — retrying in {:.1}s ({}/{}){}  {}",
+                        YELLOW, label, delay_secs, attempt, max_attempts, RESET, message
                     );
                 }
                 Some(LlmEvent::ToolRequest {

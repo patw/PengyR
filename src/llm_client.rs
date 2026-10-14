@@ -104,6 +104,18 @@ const MAX_DELAY_SECS: f64 = 60.0;
 const JITTER: f64 = 0.25;
 const RETRYABLE_STATUSES: &[u16] = &[429, 529];
 
+// ── Provider / transport timeouts ─────────────────────────────────
+// A timeout usually means "the endpoint was busy", not "the request was wrong",
+// so it gets a retry budget of its own.  The budget is deliberately smaller than
+// MAX_RETRIES: this request is non-streaming, so the configured timeout is total
+// wall clock per attempt, and five retries at the 300 s default would hang a turn
+// for ~25 minutes before the user saw the timeout message.  Cancel is polled
+// during every backoff sleep.
+pub const MAX_TIMEOUT_RETRIES: u32 = 3;
+/// 408 Request Timeout, and 504 Gateway Timeout -- a proxy answering for an
+/// upstream that ran out of time, which is the same failure seen from the client.
+pub const TIMEOUT_STATUSES: &[u16] = &[408, 504];
+
 // Context errors get size-reduction retries, never generic bad requests.
 const MAX_CONTEXT_RETRIES: u32 = 4;
 /// A length stop this short is context starvation, not a plausible output cap;
@@ -181,6 +193,48 @@ fn backoff_delay(attempt: u32, retry_after: Option<f64>) -> f64 {
     };
     let jitter = base * JITTER * (rand::random::<f64>() * 2.0 - 1.0);
     base + jitter.max(-base * JITTER)
+}
+
+/// Sleep in 500 ms slices so a cancel stays responsive.
+/// Returns `false` when the user cancelled during the sleep.
+async fn sleep_interruptible(delay: f64, cancel: &AtomicBool) -> bool {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(delay);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        let remaining = deadline - now;
+        tokio::time::sleep(remaining.min(tokio::time::Duration::from_millis(500))).await;
+    }
+}
+
+/// Announce one timeout retry and sleep out.
+///
+/// *attempt* is the number of timeout retries already spent (0-based), so the
+/// ladder matches the 429/529 path: 1s, 2s, 4s.  Returns `false` when the user
+/// cancelled during the sleep, in which case the caller stops the turn.
+async fn pause_after_timeout(
+    attempt: u32,
+    status_code: u16,
+    detail: &str,
+    headers: &reqwest::header::HeaderMap,
+    event_tx: &mpsc::UnboundedSender<LlmEvent>,
+    cancel: &AtomicBool,
+) -> bool {
+    let delay = backoff_delay(attempt, extract_retry_after(headers));
+    let _ = event_tx.send(LlmEvent::Retrying {
+        attempt: attempt + 1,
+        max_attempts: MAX_TIMEOUT_RETRIES,
+        delay_secs: (delay * 10.0).round() / 10.0,
+        status_code,
+        message: detail.to_string(),
+        reason: Some("timeout".into()),
+    });
+    sleep_interruptible(delay, cancel).await
 }
 
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
@@ -266,6 +320,11 @@ pub enum LlmEvent {
         delay_secs: f64,
         status_code: u16,
         message: String,
+        /// Why the request is being re-sent: `"timeout"` for a provider 408/504
+        /// answer or our own deadline, absent for the 429/529 overload path.
+        /// Frontends label the two differently.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     #[serde(rename = "context_compacted")]
     ContextCompacted {
@@ -681,6 +740,7 @@ pub async fn chat(
             let mut last_body: Option<serde_json::Value> = None;
             let mut success = None;
             let mut rate_retries = 0;
+            let mut timeout_retries = 0u32;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     // Cancelled during backoff — emit nothing, just return
@@ -774,6 +834,18 @@ pub async fn chat(
                             return;
                         }
 
+                        if TIMEOUT_STATUSES.contains(&code) && timeout_retries < MAX_TIMEOUT_RETRIES {
+                            // The endpoint answered, saying it ran out of time.
+                            // Same ladder as 429/529, its own smaller budget.
+                            let keep_going = pause_after_timeout(
+                                timeout_retries, code, detail, &headers, &event_tx, &cancel).await;
+                            timeout_retries += 1;
+                            if !keep_going {
+                                return;
+                            }
+                            continue;
+                        }
+
                         if RETRYABLE_STATUSES.contains(&code) && rate_retries < MAX_RETRIES {
                             let ra = extract_retry_after(&headers);
                             let delay = backoff_delay(rate_retries, ra);
@@ -790,26 +862,31 @@ pub async fn chat(
                                 delay_secs: (delay * 10.0).round() / 10.0,
                                 status_code: code,
                                 message: detail,
+                                reason: None,
                             });
                             // Sleep in 500ms slices so cancel is responsive
-                            let deadline = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_secs_f64(delay);
-                            loop {
-                                if cancel.load(Ordering::Relaxed) {
-                                    return;
-                                }
-                                let now = tokio::time::Instant::now();
-                                if now >= deadline {
-                                    break;
-                                }
-                                let remaining = deadline - now;
-                                let slice = remaining.min(tokio::time::Duration::from_millis(500));
-                                tokio::time::sleep(slice).await;
+                            if !sleep_interruptible(delay, &cancel).await {
+                                return;
                             }
                             continue;
                         }
                     }
                     Err(e) => {
+                        if e.is_timeout() && timeout_retries < MAX_TIMEOUT_RETRIES {
+                            // Our own deadline elapsed with no answer at all --
+                            // the failure a retry actually fixes: a busy or
+                            // single-slot endpoint usually answers on the next
+                            // attempt.  Once the budget is spent the user gets
+                            // the ordinary "timed out" message, unchanged.
+                            let keep_going = pause_after_timeout(
+                                timeout_retries, 0, "Request timed out",
+                                &reqwest::header::HeaderMap::new(), &event_tx, &cancel).await;
+                            timeout_retries += 1;
+                            if !keep_going {
+                                return;
+                            }
+                            continue;
+                        }
                         emit_unreachable_error(&event_tx, &e, base_url);
                         return;
                     }
@@ -1215,8 +1292,30 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
         recovery.summary_calls += 1;
         let mut payload = serde_json::json!({"model": model, "messages":[{"role":"system","content":SUMMARY_PROMPT},{"role":"user","content":chunk}]});
         payload[&recovery.options.output_parameter] = serde_json::json!(2048);
-        let body: serde_json::Value = client.post(url).bearer_auth(key).header("api-key",key).json(&payload).send().await.map_err(|e| e.to_string())?
-            .error_for_status().map_err(|e| format!("Context summary failed; history retained: {e}"))?.json().await.map_err(|e| e.to_string())?;
+        // The summary is part of this turn, so a provider timeout gets the same
+        // retry budget here as the turn request -- a big conversation's prefill
+        // is exactly what blows the configured timeout on a slow engine.
+        let mut summary_timeouts = 0u32;
+        let body: serde_json::Value = loop {
+            match client.post(url).bearer_auth(key).header("api-key",key).json(&payload).send().await {
+                Ok(r) => {
+                    if TIMEOUT_STATUSES.contains(&r.status().as_u16()) && summary_timeouts < MAX_TIMEOUT_RETRIES {
+                        summary_timeouts += 1;
+                        sleep_interruptible(backoff_delay(summary_timeouts - 1, None), cancel).await;
+                        continue;
+                    }
+                    break r.error_for_status().map_err(|e| format!("Context summary failed; history retained: {e}"))?.json().await.map_err(|e| e.to_string())?;
+                }
+                Err(e) => {
+                    if e.is_timeout() && summary_timeouts < MAX_TIMEOUT_RETRIES {
+                        summary_timeouts += 1;
+                        sleep_interruptible(backoff_delay(summary_timeouts - 1, None), cancel).await;
+                        continue;
+                    }
+                    return Err(format!("Context summary failed; history retained: {e}"));
+                }
+            }
+        };
         if let Some(u) = body["usage"].as_object() {
             usage.prompt_tokens += u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             usage.completion_tokens += u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);

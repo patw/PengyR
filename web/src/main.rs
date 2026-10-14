@@ -367,6 +367,9 @@ enum SseEvent {
         delay_secs: f64,
         status_code: u16,
         message: String,
+        /// `"timeout"` for a provider 408/504 answer or our own deadline;
+        /// `None` for the 429/529 overload path. Serialized as `"reason"`.
+        reason: Option<String>,
     },
     ContextCompacted {
         attempt: u32,
@@ -616,6 +619,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             delay_secs,
             status_code,
             message,
+            reason,
         } => serde_json::json!({
             "type": "retrying",
             "attempt": attempt,
@@ -623,6 +627,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "delay_secs": delay_secs,
             "status_code": status_code,
             "message": message,
+            "reason": reason,
         })
         .to_string(),
         SseEvent::ContextCompacted { attempt, max_attempts, chars_removed } =>
@@ -788,6 +793,7 @@ impl WebWorker {
                         delay_secs,
                         status_code,
                         message,
+                        reason,
                     }) => {
                         push_event(SseEvent::Retrying {
                             attempt,
@@ -795,6 +801,7 @@ impl WebWorker {
                             delay_secs,
                             status_code,
                             message,
+                            reason,
                         });
                     }
                     Some(LlmEvent::ToolRequest {
@@ -3390,8 +3397,11 @@ function showRetrying(data) {{
   thinkingEl = document.createElement('div');
   thinkingEl.className = 'msg-thinking';
   const delay = (data.delay_secs != null ? data.delay_secs : 0);
+  // 'timeout' = provider 408/504 or our own llm_timeout deadline; anything
+  // else on this event is 429/529 overload.
+  const label = (data.reason === 'timeout') ? 'Timeout' : 'Overloaded';
   thinkingEl.innerHTML = '<div class="spinner-border spinner-border-sm" role="status"></div>' +
-    `<span>Overloaded — retrying in ${{delay.toFixed(1)}}s (${{data.attempt}}/${{data.max_attempts}})</span>`;
+    `<span>${{label}} — retrying in ${{delay.toFixed(1)}}s (${{data.attempt}}/${{data.max_attempts}})</span>`;
   appendToArea(thinkingEl);
 }}
 

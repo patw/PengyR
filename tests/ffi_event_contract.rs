@@ -15,6 +15,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
+use pengy_core::llm_client::MAX_TIMEOUT_RETRIES;
+
 /// Serve one fixed status + body to every request; returns the base URL.
 fn spawn_status_stub(status: u16, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -136,6 +138,126 @@ fn server_error_reaches_the_gui_as_one_error_event() {
     assert!(!event.to_string().contains("final_response"));
 }
 
+// ── Provider timeouts ────────────────────────────────────────────
+//
+// A provider that answers "I ran out of time" (408, or 504 from a proxy) is a
+// busy endpoint, not a broken request, so the turn re-sends the request.  The
+// budget is MAX_TIMEOUT_RETRIES per request; after that the ordinary timeout
+// message is reported unchanged.
+
+/// Answer `status` to the first `failures` requests, then a normal completion.
+/// Returns the base URL and a counter of requests actually served.
+fn spawn_flaky_stub(status: u16, failures: usize) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind flaky stub");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let served = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let n = {
+                let mut guard = counter.lock().unwrap();
+                *guard += 1;
+                *guard
+            };
+            let (head, body) = if n <= failures {
+                (format!("HTTP/1.1 {status} Timeout\r\n"),
+                 r#"{"error":{"message":"Request timed out","type":"timeout"}}"#.to_string())
+            } else {
+                ("HTTP/1.1 200 OK\r\n".to_string(),
+                 r#"{"choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#.to_string())
+            };
+            let resp = format!(
+                "{head}Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+    (base, served)
+}
+
+fn timeout_notices(events: &[String]) -> Vec<serde_json::Value> {
+    events.iter()
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+        .filter(|e| e["type"] == "retrying" && e["reason"] == "timeout")
+        .collect()
+}
+
+#[test]
+fn provider_timeout_is_retried_and_the_turn_completes() {
+    for status in [408u16, 504] {
+        let (base, served) = spawn_flaky_stub(status, 1);
+        let events = run_turn_through_ffi(&base);
+        let notices = timeout_notices(&events);
+
+        assert_eq!(notices.len(), 1, "{status}: {events:#?}");
+        assert_eq!(notices[0]["status_code"], status, "{events:#?}");
+        assert_eq!(notices[0]["attempt"], 1, "{events:#?}");
+        assert_eq!(notices[0]["max_attempts"], MAX_TIMEOUT_RETRIES, "{events:#?}");
+        let last: serde_json::Value =
+            serde_json::from_str(events.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "final_response", "{events:#?}");
+        assert!(last["content"].as_str().unwrap().contains("recovered"), "{events:#?}");
+        assert_eq!(*served.lock().unwrap(), 2, "{status}: one retry expected");
+    }
+}
+
+#[test]
+fn provider_timeout_budget_is_spent_then_the_timeout_message() {
+    let (base, served) = spawn_flaky_stub(408, 99);
+    let events = run_turn_through_ffi(&base);
+    let notices = timeout_notices(&events);
+
+    assert_eq!(notices.len(), MAX_TIMEOUT_RETRIES as usize, "{events:#?}");
+    assert_eq!(notices.last().unwrap()["attempt"], MAX_TIMEOUT_RETRIES, "{events:#?}");
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "error");
+    assert!(last["message"].as_str().unwrap().contains("timed out"), "{events:#?}");
+    // 1 request + the budget, and no silent extra attempt.
+    assert_eq!(*served.lock().unwrap(), MAX_TIMEOUT_RETRIES as usize + 1);
+}
+
+#[test]
+fn a_busy_endpoint_that_recovers_costs_the_user_nothing() {
+    // The point of the feature: 429-style flakiness that used to end the turn.
+    let (base, served) = spawn_flaky_stub(408, 2);
+    let events = run_turn_through_ffi(&base);
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "final_response", "{events:#?}");
+    assert_eq!(*served.lock().unwrap(), 3);
+}
+
+#[test]
+fn overload_keeps_its_own_budget_and_label() {
+    // Negative control: 429 must not be swept into the timeout budget/label.
+    let base = spawn_status_stub(429, r#"{"error":{"message":"Too Many Requests"}}"#);
+    let events = run_turn_through_ffi(&base);
+
+    assert!(timeout_notices(&events).is_empty(), "{events:#?}");
+    let overloaded: Vec<serde_json::Value> = events.iter()
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+        .filter(|e| e["type"] == "retrying")
+        .collect();
+    assert_eq!(overloaded.len(), 5, "{events:#?}");
+    assert!(overloaded.iter().all(|e| e["reason"].is_null()), "{events:#?}");
+}
+
+#[test]
+fn a_bad_request_is_never_retried() {
+    // Negative control: "the request was wrong" must fail fast, not after 3 waits.
+    let base = spawn_status_stub(400, r#"{"error":{"message":"Invalid request"}}"#);
+    let events = run_turn_through_ffi(&base);
+
+    assert!(timeout_notices(&events).is_empty(), "{events:#?}");
+    assert_eq!(events.len(), 1, "{events:#?}");
+}
+
 /// A stub that accepts the connection, waits `delay`, then answers 200 with a
 /// normal completion.  Used to prove the FFI honours the *configured* LLM
 /// timeout: with `llm_timeout = 1` the request times out first, whereas the old
@@ -168,6 +290,14 @@ fn spawn_slow_stub(delay: std::time::Duration) -> String {
 /// the regression that the FFI used to hardcode 300 and ignore the setting
 /// entirely (the GUI's Settings dialog still wrote `llm_timeout`, so the control
 /// looked live but did nothing).
+///
+/// Since timeout auto-retry landed, the turn no longer aborts on the first
+/// timeout: it spends the timeout-retry budget and *then* reports the timeout.
+/// The regression this test guards is unchanged -- a hardcoded 300s would sit
+/// through the 3s stub and hand back its completion -- so what is pinned here is
+/// that the configured 1s deadline is what ends every attempt, that the chain is
+/// bounded by MAX_TIMEOUT_RETRIES, and that the stub's late answer never reaches
+/// the GUI.
 #[test]
 fn ffi_honours_configured_llm_timeout() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,15 +314,30 @@ fn ffi_honours_configured_llm_timeout() {
 
     std::env::remove_var("PENGY_CONFIG_DIR");
 
+    let parsed: Vec<serde_json::Value> = events.iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+    let timeouts: Vec<&serde_json::Value> = parsed.iter()
+        .filter(|e| e["type"] == "retrying" && e["reason"] == "timeout")
+        .collect();
+
+    // Four attempts at 1s plus the backoff ladder: bounded, and far short of
+    // the 300s the FFI used to hardcode (which would have waited for the
+    // completion instead).
     assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "llm_timeout=1 must abort before the 3s stub answers; took {elapsed:?} \
+        elapsed < std::time::Duration::from_secs(30),
+        "the timeout chain must stay bounded by the retry budget; took {elapsed:?} \
          (a hardcoded 300s timeout would instead wait for the completion)"
     );
-    assert_eq!(events.len(), 1, "{events:#?}");
-    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
-    assert_eq!(event["type"], "error");
-    let message = event["message"].as_str().unwrap();
+    assert_eq!(timeouts.len(), MAX_TIMEOUT_RETRIES as usize, "{events:#?}");
+    assert!(
+        !events.iter().any(|e| e.contains("late")),
+        "the late completion must not reach the GUI: {events:#?}"
+    );
+
+    let last = parsed.last().expect("the turn must end with an event");
+    assert_eq!(last["type"], "error");
+    let message = last["message"].as_str().unwrap();
     assert!(message.contains("timed out"), "{message}");
     assert!(message.contains(&base), "the error must name the endpoint: {message}");
 }
