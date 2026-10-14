@@ -88,7 +88,7 @@ message(STATUS "Pengy core: ${PENGY_CORE_LIB} (static=${PENGY_RUST_STATIC})")
 # WIN32 builds a GUI-subsystem exe on Windows (no console window alongside the
 # app; Qt6::Core links the WinMain entry point for it). Ignored elsewhere.
 add_executable(pengy WIN32
-  main.cpp mainwindow.cpp chathistory.cpp chatview.cpp
+  main.cpp mainwindow.cpp toolconfirmdialog.cpp chathistory.cpp chatview.cpp
   chatinput.cpp chatworker.cpp settingsdialog.cpp tasksdialog.cpp
   resources.qrc
 )
@@ -170,6 +170,16 @@ if(PENGY_BUILD_TESTS)
   target_include_directories(pengy_chatinput_test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(pengy_chatinput_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
   add_test(NAME pengy_chatinput_test COMMAND pengy_chatinput_test)
+
+  # Tool-confirmation dialog: geometry (it used to open too small to read) and
+  # the meaning of each button, including the tab-scoped "don't ask again".
+  add_executable(pengy_toolconfirm_test
+    tests/test_toolconfirm_dialog.cpp toolconfirmdialog.cpp
+  )
+  target_compile_definitions(pengy_toolconfirm_test PRIVATE PENGY_UNIT_TEST)
+  target_include_directories(pengy_toolconfirm_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_toolconfirm_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
+  add_test(NAME pengy_toolconfirm_test COMMAND pengy_toolconfirm_test)
 
   # chathistory.cpp calls into the Rust core (pengy_ffi.h), so this test
   # target needs the same platform-specific link set as the main `pengy`

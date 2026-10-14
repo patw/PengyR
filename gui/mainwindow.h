@@ -26,7 +26,7 @@ struct TabSession {
     ChatView*   chatView = nullptr;
     ChatWorker* worker   = nullptr;
     QThread*    workerThread = nullptr;
-    bool        yoloThisTurn  = false;
+    bool        toolsApprovedForSession = false; // Memory-only; never saved to chat/config.
     bool        thinking      = false;
     bool        toolRunning   = false;
     int         promptTokens     = 0;
