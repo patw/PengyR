@@ -570,6 +570,7 @@ impl PengyCli {
                         Some("timeout") => "Timeout".to_string(),
                         Some("server") => format!("Server error (HTTP {status_code})"),
                         Some("unreachable") => "Unreachable".to_string(),
+                        Some("empty") => "Empty response".to_string(),
                         _ => format!("Overloaded (HTTP {status_code})"),
                     };
                     eprintln!(

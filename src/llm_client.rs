@@ -131,6 +131,51 @@ const TRANSIENT_STATUSES: &[u16] = &[502, 503];
 /// the "is your server running?" help is written for.
 pub const MAX_UNREACHABLE_RETRIES: u32 = 3;
 
+/// A 200 that carries no usable answer (no choices at all) is the shape a proxy
+/// answers when it loses its upstream mid-generation, so it gets one retry --
+/// the same reasoning as a 500.
+pub const MAX_EMPTY_RETRIES: u32 = 1;
+/// `kind` for a turn that ended with no answer: the endpoint answered 200 and
+/// produced nothing usable. Frontends draw it as an error, never as a reply.
+pub const ERROR_KIND_EMPTY: &str = "empty";
+
+/// A 200 that carries no choices at all.
+pub fn no_choices_help() -> String {
+    "The endpoint answered with no choices in the response, so there is no answer to \
+     deliver. Pengy retried once. This is the endpoint, not your request: the usual causes \
+     are a proxy that lost its upstream mid-generation, an engine that died while \
+     answering, or a model name the endpoint does not serve. Nothing was added to the chat."
+        .to_string()
+}
+
+/// A 200 whose message has neither content nor tool calls.  Names the causes that
+/// are actually observed: the reasoning-budget case is documented in the field
+/// (BotTalk ff4f1c1f) -- a reasoning model whose whole output allowance goes to
+/// reasoning tokens answers with empty content and finish_reason=stop.
+fn empty_reply_help(message: &serde_json::Value, finish_reason: &str, completion: Option<u64>) -> String {
+    let reasoning = message.get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let counts = completion.map(|c| format!(" (completion {c} tokens)")).unwrap_or_default();
+    let mut help = format!(
+        "The model returned an empty reply{counts}: no content and no tool calls, so the \
+         turn has no answer. Nothing was added to the chat. Usual causes: a content filter \
+         that wiped the answer; a proxy that lost its upstream mid-generation; a reasoning \
+         model that spent the whole output allowance on reasoning tokens."
+    );
+    if !reasoning.trim().is_empty() {
+        help.push_str(" This reply carried reasoning text and no answer, which points at the \
+                       reasoning budget: raise the output allowance, lower the reasoning \
+                       effort, or choose a non-reasoning model.");
+    }
+    help.push_str(&format!(
+        " The provider reported finish_reason={}. Pengy did not retry: an empty answer is \
+         the endpoint's shape, not a blip.",
+        if finish_reason.is_empty() { "unset" } else { finish_reason }));
+    help
+}
+
 /// Endpoints that have answered at least one request in this process.
 /// Keyed by base_url, so a second chat/tab cannot inherit another's confidence.
 fn answered_endpoints() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
@@ -584,6 +629,20 @@ fn emit_turn_error(
     });
 }
 
+/// Report a failed turn with a `kind` the frontends classify directly, bypassing
+/// the credential sniffing that [`emit_turn_error`] applies to endpoint text.
+fn emit_turn_error_kind(
+    event_tx: &mpsc::UnboundedSender<LlmEvent>,
+    kind: &str,
+    message: String,
+    _base_url: &str,
+) {
+    let _ = event_tx.send(LlmEvent::Error {
+        kind: kind.to_string(),
+        message,
+    });
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
@@ -794,10 +853,10 @@ pub async fn chat(
         if recovery.options.output_limit > 0 { payload[&recovery.options.output_parameter] = serde_json::json!(recovery.options.output_limit); }
 
         // ── API call with 429 / 529 exponential backoff ──────────
-        let (resp, request_started) = {
+        let (body_text, request_started) = {
             let mut last_status: Option<reqwest::StatusCode> = None;
             let mut last_body: Option<serde_json::Value> = None;
-            let mut success = None;
+            let mut success: Option<(String, std::time::Instant)> = None;
             let mut rate_retries = 0;
             let mut transient_retries = 0u32;
             // The provider answer that started this retry chain.  Reported when a
@@ -828,7 +887,31 @@ pub async fn chat(
                             // From here on, a connection failure means it went
                             // away mid-work, which is worth retrying.
                             mark_endpoint_answered(base_url);
-                            success = Some((r, request_started));
+                            let body_text = r.text().await.unwrap_or_default();
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
+                            if parsed["choices"].as_array().and_then(|a| a.first()).is_none() {
+                                // A 200 with no choices is the shape a proxy answers
+                                // when it loses its upstream mid-generation: one retry
+                                // (the 500 reasoning -- ride out a blip, do not pay
+                                // three full-cost attempts for a deterministic answer),
+                                // then a message that says what happened.
+                                if transient_retries < MAX_EMPTY_RETRIES {
+                                    let keep_going = pause_after_transient(
+                                        transient_retries, MAX_EMPTY_RETRIES, "empty",
+                                        0, "The endpoint answered with no choices",
+                                        &reqwest::header::HeaderMap::new(), &event_tx, &cancel).await;
+                                    transient_retries += 1;
+                                    if !keep_going {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                emit_turn_error_kind(&event_tx, ERROR_KIND_EMPTY,
+                                                     no_choices_help(), base_url);
+                                return;
+                            }
+                            success = Some((body_text, request_started));
                             break;
                         }
                         let code = status.as_u16();
@@ -1033,7 +1116,6 @@ pub async fn chat(
             }
         };
 
-        let body_text = resp.text().await.unwrap_or_default();
         let request_seconds = request_started.elapsed().as_secs_f64();
         let body: serde_json::Value =
             serde_json::from_str(&body_text).unwrap_or(serde_json::json!({}));
@@ -1042,15 +1124,7 @@ pub async fn chat(
         let choice = match body["choices"].as_array().and_then(|a| a.first()) {
             Some(c) => c,
             None => {
-                emit_turn_error(
-                    &event_tx,
-                    None,
-                    format!(
-                        "No choices in API response: {}",
-                        serde_json::to_string_pretty(&body).unwrap_or_default()
-                    ),
-                    base_url,
-                );
+                emit_turn_error_kind(&event_tx, ERROR_KIND_EMPTY, no_choices_help(), base_url);
                 return;
             }
         };
@@ -1371,7 +1445,25 @@ pub async fn chat(
             }
         }
 
-        // No tool calls — this is the final response
+        // No tool calls — this is the final response.  An empty one is not an
+        // answer: it used to end the turn as a completed reply, so the chat
+        // stored a blank assistant message that the next turn reads back as
+        // something the model said.  Report it as the provider anomaly it is.
+        if content.trim().is_empty() {
+            let _ = event_tx.send(LlmEvent::Error {
+                kind: ERROR_KIND_EMPTY.to_string(),
+                message: empty_reply_help(
+                    msg,
+                    choice["finish_reason"].as_str().unwrap_or(""),
+                    body["completion_tokens"].as_u64().or_else(|| {
+                        body.get("usage")
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|v| v.as_u64())
+                    }),
+                ),
+            });
+            return;
+        }
         let final_msg = ChatMessage {
             role: "assistant".into(),
             content: Some(serde_json::Value::String(content.clone())),
@@ -1450,7 +1542,12 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
             usage.total_tokens += u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         }
         if cancel.load(Ordering::Relaxed) { return Err("Context recovery cancelled.".into()); }
-        let choice = &body["choices"][0];
+        let choice = match body["choices"].as_array().and_then(|a| a.first()) {
+            Some(c) => c,
+            // serde_json's Index returns Null out of range, so this never
+            // panicked -- it just degraded to the generic "incomplete" message.
+            None => return Err("Context summary request returned no choices; original history retained.".into()),
+        };
         let text = choice["message"]["content"].as_str().unwrap_or("");
         if choice["finish_reason"] != "stop" || text.trim().is_empty() || choice["message"]["tool_calls"].as_array().is_some_and(|a| !a.is_empty()) {
             return Err("Context summary was incomplete; original history retained.".into());

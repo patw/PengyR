@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pengy_core::llm_client::{
+    MAX_EMPTY_RETRIES,
     MAX_INTERNAL_RETRIES, MAX_TIMEOUT_RETRIES, MAX_TRANSIENT_RETRIES, MAX_UNREACHABLE_RETRIES,
 };
 
@@ -57,6 +58,13 @@ extern "C" fn record_event(json: *const c_char, userdata: *mut c_void) {
 
 /// Run one turn through the FFI and return the events the frontend received.
 fn run_turn_through_ffi(base_url: &str) -> Vec<String> {
+    run_turn_with_mode(base_url, "none")
+}
+
+/// ... with a specific confirmation mode.  "none" makes every tool call wait for
+/// a confirmation this harness never sends, so a test exercising a tool round
+/// must use "safe" (read-only tools auto-approve).
+fn run_turn_with_mode(base_url: &str, tc_mode: &str) -> Vec<String> {
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let sink = Arc::as_ptr(&events) as *mut c_void;
 
@@ -64,7 +72,7 @@ fn run_turn_through_ffi(base_url: &str) -> Vec<String> {
     let key = CString::new("").unwrap(); // a fresh install has no key
     let model = CString::new("stub-model").unwrap();
     let messages = CString::new(r#"[{"role":"user","content":"hi"}]"#).unwrap();
-    let tc = CString::new("none").unwrap();
+    let tc = CString::new(tc_mode).unwrap();
     let effort = CString::new("").unwrap();
 
     let ok = pengy_core::pengy_llm_chat_run(
@@ -476,4 +484,142 @@ fn ffi_honours_configured_llm_timeout() {
     let message = last["message"].as_str().unwrap();
     assert!(message.contains("timed out"), "{message}");
     assert!(message.contains(&base), "the error must name the endpoint: {message}");
+}
+
+// ── Degenerate 200 responses ─────────────────────────────────────
+//
+// An endpoint that answers 200 and produces nothing usable is a provider
+// anomaly, not a completed answer.  Two shapes: no `choices` at all (the shape a
+// proxy answers when it loses its upstream mid-generation), and a message with
+// neither content nor tool calls (observed in the field: a reasoning model whose
+// whole output allowance goes to reasoning tokens).
+
+/// Serve each `(status, body)` in order, then repeat the last one forever.
+fn spawn_scripted_stub(replies: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted stub");
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let queue = Arc::new(Mutex::new(replies));
+    let served = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let (status, body) = {
+                let mut q = queue.lock().unwrap();
+                let next = q.first().cloned().unwrap_or((200, "{}"));
+                if q.len() > 1 { q.remove(0); }
+                next
+            };
+            let mut guard = counter.lock().unwrap();
+            *guard += 1;
+            drop(guard);
+            let resp = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+    (base, served)
+}
+
+const NO_CHOICES: &str = r#"{"choices":[],"usage":null}"#;
+const NO_CHOICES_KEY: &str = r#"{"id":"cmpl-stub","object":"chat.completions"}"#;
+const EMPTY_MESSAGE: &str = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null},"finish_reason":"stop"}],"usage":null}"#;
+
+#[test]
+fn no_choices_is_retried_then_reported_actionably() {
+    for payload in [NO_CHOICES, NO_CHOICES_KEY] {
+        let (base, served) = spawn_scripted_stub(vec![(200, payload)]);
+        let events = run_turn_through_ffi(&base);
+        let notices: Vec<serde_json::Value> = events.iter()
+            .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+            .filter(|e| e["type"] == "retrying" && e["reason"] == "empty")
+            .collect();
+
+        assert_eq!(notices.len(), MAX_EMPTY_RETRIES as usize, "{events:#?}");
+        let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "error", "{events:#?}");
+        assert_eq!(last["kind"], "empty", "{events:#?}");
+        let message = last["message"].as_str().unwrap();
+        assert!(message.contains("no choices"), "{message}");
+        // The user gets a sentence they can act on, not a raw body dump.
+        assert!(message.contains("proxy"), "{message}");
+        assert!(!message.contains("index out of range"), "{message}");
+        assert_eq!(*served.lock().unwrap(), MAX_EMPTY_RETRIES as usize + 1, "{events:#?}");
+    }
+}
+
+#[test]
+fn no_choices_that_recovers_costs_the_user_nothing() {
+    let (base, served) = spawn_scripted_stub(vec![
+        (200, NO_CHOICES),
+        (200, r#"{"choices":[{"message":{"role":"assistant","content":"answered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#),
+    ]);
+    let events = run_turn_through_ffi(&base);
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "final_response", "{events:#?}");
+    assert!(last["content"].as_str().unwrap().contains("answered"), "{events:#?}");
+    assert_eq!(*served.lock().unwrap(), 2);
+}
+
+#[test]
+fn an_empty_reply_is_reported_and_never_delivered_as_an_answer() {
+    let (base, served) = spawn_scripted_stub(vec![(200, EMPTY_MESSAGE)]);
+    let events = run_turn_through_ffi(&base);
+
+    // No blank assistant turn reaches the GUI, so nothing blank is persisted.
+    assert!(
+        !events.iter().any(|e| e.contains("final_response")),
+        "an empty reply must not be delivered as an answer: {events:#?}"
+    );
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "empty", "{events:#?}");
+    assert!(last["message"].as_str().unwrap().contains("empty reply"), "{events:#?}");
+    // An empty answer is the endpoint's shape, not a blip: no full-cost chain.
+    assert_eq!(*served.lock().unwrap(), 1, "{events:#?}");
+}
+
+#[test]
+fn an_empty_reply_with_reasoning_names_the_budget() {
+    // The field signature (BotTalk ff4f1c1f): reasoning tokens, no answer.
+    let (base, _served) = spawn_scripted_stub(vec![(200,
+        r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"thinking thinking thinking"},"finish_reason":"stop"}],"usage":{"prompt_tokens":40,"completion_tokens":1500,"total_tokens":1540}}"#)]);
+    let events = run_turn_through_ffi(&base);
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    let message = last["message"].as_str().unwrap();
+    assert_eq!(last["kind"], "empty", "{events:#?}");
+    assert!(message.contains("reasoning"), "{message}");
+    assert!(message.contains("output allowance"), "{message}");
+    assert!(message.contains("1500"), "{message}");
+}
+
+#[test]
+fn an_empty_message_with_tool_calls_is_still_a_normal_round() {
+    // Negative control: content:"" plus tool calls is a normal round, not an anomaly.
+    let (base, _served) = spawn_scripted_stub(vec![
+        (200, r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"t1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"does-not-exist.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#),
+        (200, r#"{"choices":[{"message":{"role":"assistant","content":"after the tool"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#),
+    ]);
+    let events = run_turn_with_mode(&base, "safe");
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "final_response", "{events:#?}");
+    assert!(last["content"].as_str().unwrap().contains("after the tool"), "{events:#?}");
+}
+
+#[test]
+fn a_truncated_empty_answer_keeps_the_generation_limit_path() {
+    // Negative control: finish_reason=length is already handled, and stays there.
+    let (base, _served) = spawn_scripted_stub(vec![
+        (200, r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":48,"total_tokens":58}}"#),
+    ]);
+    let events = run_turn_through_ffi(&base);
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "truncated", "{events:#?}");
+    assert!(last["message"].as_str().unwrap().contains("finish_reason=length"), "{events:#?}");
 }
