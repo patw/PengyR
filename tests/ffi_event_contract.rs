@@ -13,9 +13,12 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pengy_core::llm_client::MAX_TIMEOUT_RETRIES;
+use pengy_core::llm_client::{
+    MAX_INTERNAL_RETRIES, MAX_TIMEOUT_RETRIES, MAX_TRANSIENT_RETRIES, MAX_UNREACHABLE_RETRIES,
+};
 
 /// Serve one fixed status + body to every request; returns the base URL.
 fn spawn_status_stub(status: u16, body: &'static str) -> String {
@@ -130,12 +133,22 @@ fn server_error_reaches_the_gui_as_one_error_event() {
     let base = spawn_status_stub(500, r#"{"error":{"message":"boom"}}"#);
     let events = run_turn_through_ffi(&base);
 
-    assert_eq!(events.len(), 1, "{events:#?}");
-    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+    // A 500 now buys one retry, so the GUI sees the retry notice and then
+    // exactly one error -- the contract this test pins is that the *failure*
+    // arrives as a single terminal event, never as a final response.
+    let notices: Vec<&String> = events.iter()
+        .filter(|e| e.contains("\"retrying\""))
+        .collect();
+    assert_eq!(notices.len(), 1, "{events:#?}");
+    let event: serde_json::Value =
+        serde_json::from_str(events.last().unwrap()).unwrap();
     assert_eq!(event["type"], "error");
     assert_eq!(event["kind"], "error");
     assert!(event["message"].as_str().unwrap().contains("boom"));
-    assert!(!event.to_string().contains("final_response"));
+    assert!(
+        !events.iter().any(|e| e.contains("final_response")),
+        "a failed turn must not hand the GUI an assistant message: {events:?}"
+    );
 }
 
 // ── Provider timeouts ────────────────────────────────────────────
@@ -256,6 +269,129 @@ fn a_bad_request_is_never_retried() {
 
     assert!(timeout_notices(&events).is_empty(), "{events:#?}");
     assert_eq!(events.len(), 1, "{events:#?}");
+}
+
+// ── 5xx and dropped routes ───────────────────────────────────────
+
+#[test]
+fn server_error_is_retried_and_the_turn_completes() {
+    // A proxy/upstream restart answers 502/503 for seconds; a multi-hour task
+    // must ride that out, not end on it.
+    for status in [502u16, 503] {
+        let (base, served) = spawn_flaky_stub(status, 1);
+        let events = run_turn_through_ffi(&base);
+        let notices: Vec<serde_json::Value> = events.iter()
+            .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+            .filter(|e| e["type"] == "retrying" && e["reason"] == "server")
+            .collect();
+
+        assert_eq!(notices.len(), 1, "{status}: {events:#?}");
+        assert_eq!(notices[0]["status_code"], status, "{events:#?}");
+        assert_eq!(notices[0]["max_attempts"], MAX_TRANSIENT_RETRIES, "{events:#?}");
+        let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+        assert_eq!(last["type"], "final_response", "{events:#?}");
+        assert_eq!(*served.lock().unwrap(), 2, "{status}: one retry expected");
+    }
+}
+
+#[test]
+fn internal_server_error_gets_one_retry_only() {
+    // A 500 is often the request's own fault, so it buys one retry, not a chain.
+    let (base, served) = spawn_flaky_stub(500, 99);
+    let events = run_turn_through_ffi(&base);
+    let notices: Vec<serde_json::Value> = events.iter()
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+        .filter(|e| e["type"] == "retrying" && e["reason"] == "server")
+        .collect();
+
+    assert_eq!(notices.len(), MAX_INTERNAL_RETRIES as usize, "{events:#?}");
+    assert_eq!(notices[0]["max_attempts"], MAX_INTERNAL_RETRIES, "{events:#?}");
+    assert_eq!(*served.lock().unwrap(), MAX_INTERNAL_RETRIES as usize + 1);
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "error");
+}
+
+/// A stub that serves forever, plus the switch that takes it away.
+fn spawn_stub_with_stop(status: u16, body: &'static str) -> (String, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}/v1");
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stop2.load(Ordering::Relaxed) {
+                break; // the listener drops here: the port is closed
+            }
+            let Ok(mut sock) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+        }
+    });
+    (base, stop)
+}
+
+fn wait_for_closed_port(addr: std::net::SocketAddr) {
+    // Wake the serving loop (it breaks on the next connection) and wait until
+    // the port really refuses, so the client sees a genuine dropped route.
+    let _ = std::net::TcpStream::connect(addr);
+    for _ in 0..200 {
+        if std::net::TcpStream::connect(addr).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("port {addr} never closed");
+}
+
+#[test]
+fn a_route_that_drops_mid_session_is_retried() {
+    // The endpoint answered, then went away: a restart, an OOM kill, a
+    // sleep/wake dropping the route.  That is worth seconds, not a verdict.
+    let (base, stop) = spawn_stub_with_stop(200,
+        r#"{"choices":[{"message":{"role":"assistant","content":"first"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#);
+    let addr = base.trim_start_matches("http://").trim_end_matches("/v1").parse().unwrap();
+
+    let first = run_turn_through_ffi(&base);
+    let last: serde_json::Value = serde_json::from_str(first.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "final_response", "{first:#?}");
+
+    stop.store(true, Ordering::Relaxed);
+    wait_for_closed_port(addr);
+
+    let events = run_turn_through_ffi(&base);
+    let notices: Vec<serde_json::Value> = events.iter()
+        .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+        .filter(|e| e["type"] == "retrying" && e["reason"] == "unreachable")
+        .collect();
+    assert_eq!(notices.len(), MAX_UNREACHABLE_RETRIES as usize, "{events:#?}");
+    let last: serde_json::Value = serde_json::from_str(events.last().unwrap()).unwrap();
+    assert_eq!(last["type"], "error");
+    assert!(last["message"].as_str().unwrap().contains("Nothing answered"), "{events:#?}");
+}
+
+#[test]
+fn first_contact_refusal_is_not_retried() {
+    // Negative control: a wrong URL must produce the "is your server running?"
+    // help immediately, not after three waits.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    drop(listener); // nothing is listening, and never was
+
+    let events = run_turn_through_ffi(&base);
+    assert!(timeout_notices(&events).is_empty(), "{events:#?}");
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+    assert_eq!(event["type"], "error");
+    assert!(event["message"].as_str().unwrap().contains("Nothing answered"), "{events:#?}");
 }
 
 /// A stub that accepts the connection, waits `delay`, then answers 200 with a

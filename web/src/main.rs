@@ -47,6 +47,19 @@ fn parse_port(value: &str) -> u16 {
     }
 }
 
+/// Mid-turn persistence: a failed write is reported, never fatal.
+///
+/// By this point the model has answered and the tools have run, so a full disk
+/// must not throw a finished turn away.  The user is told once per run that
+/// history is no longer being saved; the answer still arrives.
+fn save_progress(chat: &mut chat_manager::Chat, warned: &std::cell::Cell<bool>) {
+    if chat_manager::save_chat_progress(chat).is_err() && !warned.get() {
+        warned.set(true);
+        eprintln!("Chat history is not being saved (disk full, or the chat directory \
+                   is not writable). Continuing; the answer will still be shown.");
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -753,6 +766,7 @@ impl WebWorker {
             });
 
             let mut yolo_this_turn = false;
+            let save_warned = std::cell::Cell::new(false);
 
             let push_event = |event: SseEvent| {
                 let count;
@@ -776,7 +790,7 @@ impl WebWorker {
                             .trim()
                             .to_owned();
                         chat.messages.push(message);
-                        chat_manager::save_chat_progress(&mut chat).ok();
+                        save_progress(&mut chat, &save_warned);
                         if !preamble.is_empty() {
                             push_event(SseEvent::AssistantMessage {
                                 html: render_markdown(&preamble),
@@ -874,7 +888,7 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         });
-                        chat_manager::save_chat_progress(&mut chat).ok();
+                        save_progress(&mut chat, &save_warned);
                         push_event(SseEvent::ToolResult {
                             tool_call_id: tool_call_id.clone(),
                             safe_id: safe_id(&tool_call_id),
@@ -933,7 +947,7 @@ impl WebWorker {
                             reasoning: None,
                             reasoning_details: None,
                         });
-                        chat_manager::save_chat_progress(&mut chat).ok();
+                        save_progress(&mut chat, &save_warned);
                         push_event(SseEvent::QuestionResult {
                             safe_id: safe_id(&tool_call_id),
                             tool_call_id,
@@ -963,7 +977,7 @@ impl WebWorker {
                             usage,
                             cumulative_usage,
                         });
-                        chat_manager::save_chat_progress(&mut chat).ok();
+                        save_progress(&mut chat, &save_warned);
                         done.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -994,7 +1008,7 @@ impl WebWorker {
             // (the API 400s on that next request).  Repair, then persist what
             // the turn got through.
             chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
-            chat_manager::save_chat_progress(&mut chat).ok();
+            save_progress(&mut chat, &save_warned);
 
             tool_ctx.set_sudo_provider(None);
         });
@@ -3397,9 +3411,10 @@ function showRetrying(data) {{
   thinkingEl = document.createElement('div');
   thinkingEl.className = 'msg-thinking';
   const delay = (data.delay_secs != null ? data.delay_secs : 0);
-  // 'timeout' = provider 408/504 or our own llm_timeout deadline; anything
-  // else on this event is 429/529 overload.
-  const label = (data.reason === 'timeout') ? 'Timeout' : 'Overloaded';
+  // Why the request is being re-sent: provider timeout, 5xx, a route that
+  // dropped mid-task; anything else on this event is 429/529 overload.
+  const labels = {{timeout: 'Timeout', server: 'Server error', unreachable: 'Unreachable'}};
+  const label = labels[data.reason] || 'Overloaded';
   thinkingEl.innerHTML = '<div class="spinner-border spinner-border-sm" role="status"></div>' +
     `<span>${{label}} — retrying in ${{delay.toFixed(1)}}s (${{data.attempt}}/${{data.max_attempts}})</span>`;
   appendToArea(thinkingEl);

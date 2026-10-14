@@ -116,6 +116,62 @@ pub const MAX_TIMEOUT_RETRIES: u32 = 3;
 /// upstream that ran out of time, which is the same failure seen from the client.
 pub const TIMEOUT_STATUSES: &[u16] = &[408, 504];
 
+// ── Transient server errors, and routes that drop mid-task ────────
+// 502/503 say "the proxy or upstream is not available right now" -- a restart,
+// a rolling deploy, a worker crash.  That is the same busy-endpoint failure a
+// timeout is, and a ten-second blip used to kill a multi-hour task.  500 is
+// often *deterministic* (the request trips a provider bug), so it buys one
+// retry rather than three.
+pub const MAX_TRANSIENT_RETRIES: u32 = 3;
+pub const MAX_INTERNAL_RETRIES: u32 = 1;
+const TRANSIENT_STATUSES: &[u16] = &[502, 503];
+/// A connection failure *after* this endpoint has answered is a dropped route
+/// (server restart, OOM kill, sleep/wake, a VM's address changing), not a
+/// misconfigured endpoint.  First contact keeps failing fast: that is the case
+/// the "is your server running?" help is written for.
+pub const MAX_UNREACHABLE_RETRIES: u32 = 3;
+
+/// Endpoints that have answered at least one request in this process.
+/// Keyed by base_url, so a second chat/tab cannot inherit another's confidence.
+fn answered_endpoints() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ANSWERED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ANSWERED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn endpoint_has_answered(base_url: &str) -> bool {
+    // Poison-tolerant: a panic elsewhere must not turn a save/report call into
+    // a second failure.
+    let set = answered_endpoints().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set.contains(base_url)
+}
+
+fn mark_endpoint_answered(base_url: &str) {
+    let mut set = answered_endpoints().lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    set.insert(base_url.to_string());
+}
+
+/// Whether to re-send a request that failed with a status code, and how many
+/// times: `(budget, reason)`, or `None` to fail immediately.
+///
+/// 400/401/404 and friends are the request's fault -- no amount of waiting
+/// makes the explanatory message arrive faster, so they must not be queued
+/// behind a backoff.
+fn transient_retry(status: u16) -> Option<(u32, &'static str)> {
+    if TIMEOUT_STATUSES.contains(&status) {
+        return Some((MAX_TIMEOUT_RETRIES, "timeout"));
+    }
+    if TRANSIENT_STATUSES.contains(&status) {
+        return Some((MAX_TRANSIENT_RETRIES, "server"));
+    }
+    if status == 500 {
+        return Some((MAX_INTERNAL_RETRIES, "server"));
+    }
+    None
+}
+
 // Context errors get size-reduction retries, never generic bad requests.
 const MAX_CONTEXT_RETRIES: u32 = 4;
 /// A length stop this short is context starvation, not a plausible output cap;
@@ -212,13 +268,16 @@ async fn sleep_interruptible(delay: f64, cancel: &AtomicBool) -> bool {
     }
 }
 
-/// Announce one timeout retry and sleep out.
+/// Announce one transient-failure retry and sleep out.
 ///
-/// *attempt* is the number of timeout retries already spent (0-based), so the
-/// ladder matches the 429/529 path: 1s, 2s, 4s.  Returns `false` when the user
+/// *attempt* is the number of retries already spent (0-based), so the ladder
+/// matches the 429/529 path: 1s, 2s, 4s.  *reason* is what the frontends label
+/// (`"timeout"`, `"server"`, `"unreachable"`).  Returns `false` when the user
 /// cancelled during the sleep, in which case the caller stops the turn.
-async fn pause_after_timeout(
+async fn pause_after_transient(
     attempt: u32,
+    max_attempts: u32,
+    reason: &str,
     status_code: u16,
     detail: &str,
     headers: &reqwest::header::HeaderMap,
@@ -228,11 +287,11 @@ async fn pause_after_timeout(
     let delay = backoff_delay(attempt, extract_retry_after(headers));
     let _ = event_tx.send(LlmEvent::Retrying {
         attempt: attempt + 1,
-        max_attempts: MAX_TIMEOUT_RETRIES,
+        max_attempts,
         delay_secs: (delay * 10.0).round() / 10.0,
         status_code,
         message: detail.to_string(),
-        reason: Some("timeout".into()),
+        reason: Some(reason.to_string()),
     });
     sleep_interruptible(delay, cancel).await
 }
@@ -740,7 +799,13 @@ pub async fn chat(
             let mut last_body: Option<serde_json::Value> = None;
             let mut success = None;
             let mut rate_retries = 0;
-            let mut timeout_retries = 0u32;
+            let mut transient_retries = 0u32;
+            // The provider answer that started this retry chain.  Reported when a
+            // retry itself fails with nothing more informative, so the retries
+            // never change what the user is told about the failure they care
+            // about (a transport failure carries no provider message).
+            let mut chain_error: Option<(reqwest::StatusCode, serde_json::Value)> = None;
+            let mut chain_timeout = false;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     // Cancelled during backoff — emit nothing, just return
@@ -759,6 +824,10 @@ pub async fn chat(
                     Ok(r) => {
                         let status = r.status();
                         if status.is_success() {
+                            // The endpoint is reachable and speaks our protocol.
+                            // From here on, a connection failure means it went
+                            // away mid-work, which is worth retrying.
+                            mark_endpoint_answered(base_url);
                             success = Some((r, request_started));
                             break;
                         }
@@ -794,7 +863,7 @@ pub async fn chat(
 
                         if is_context_limit_error(code, &body, detail) {
                             if recovery.options.enabled {
-                                match recover(&mut recovery, &current_messages, &client, &url, api_key, model, &cancel, &mut accumulated_usage).await {
+                                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &cancel, &mut accumulated_usage).await {
                                     Ok(Some(event)) => {
                                         let _ = event_tx.send(event);
                                         let raw = serde_json::to_value(&current_messages).unwrap();
@@ -834,16 +903,23 @@ pub async fn chat(
                             return;
                         }
 
-                        if TIMEOUT_STATUSES.contains(&code) && timeout_retries < MAX_TIMEOUT_RETRIES {
-                            // The endpoint answered, saying it ran out of time.
-                            // Same ladder as 429/529, its own smaller budget.
-                            let keep_going = pause_after_timeout(
-                                timeout_retries, code, detail, &headers, &event_tx, &cancel).await;
-                            timeout_retries += 1;
-                            if !keep_going {
-                                return;
+                        if let Some((budget, reason)) = transient_retry(code) {
+                            if transient_retries < budget {
+                                // The endpoint answered, saying it is not
+                                // available right now: 408/504 (out of time),
+                                // 502/503 (proxy/upstream gone), or 500 (one
+                                // attempt, since a 500 is often the request's
+                                // own fault).  Same ladder as 429/529.
+                                chain_error = Some((status, body.clone()));
+                                let keep_going = pause_after_transient(
+                                    transient_retries, budget, reason, code, detail,
+                                    &headers, &event_tx, &cancel).await;
+                                transient_retries += 1;
+                                if !keep_going {
+                                    return;
+                                }
+                                continue;
                             }
-                            continue;
                         }
 
                         if RETRYABLE_STATUSES.contains(&code) && rate_retries < MAX_RETRIES {
@@ -872,20 +948,63 @@ pub async fn chat(
                         }
                     }
                     Err(e) => {
-                        if e.is_timeout() && timeout_retries < MAX_TIMEOUT_RETRIES {
+                        if e.is_timeout() && transient_retries < MAX_TIMEOUT_RETRIES {
                             // Our own deadline elapsed with no answer at all --
                             // the failure a retry actually fixes: a busy or
                             // single-slot endpoint usually answers on the next
                             // attempt.  Once the budget is spent the user gets
                             // the ordinary "timed out" message, unchanged.
-                            let keep_going = pause_after_timeout(
-                                timeout_retries, 0, "Request timed out",
+                            chain_timeout = true;
+                            let keep_going = pause_after_transient(
+                                transient_retries, MAX_TIMEOUT_RETRIES, "timeout",
+                                0, "Request timed out",
                                 &reqwest::header::HeaderMap::new(), &event_tx, &cancel).await;
-                            timeout_retries += 1;
+                            transient_retries += 1;
                             if !keep_going {
                                 return;
                             }
                             continue;
+                        }
+                        if !e.is_timeout() && endpoint_has_answered(base_url)
+                            && transient_retries < MAX_UNREACHABLE_RETRIES
+                        {
+                            // Refused / DNS / TLS *after* this endpoint answered:
+                            // a restart or a dropped route, not a bad URL.  These
+                            // failures are instant, so the retries cost seconds.
+                            // First contact still fails fast, because that is the
+                            // case the "is your server running?" help is for.
+                            let keep_going = pause_after_transient(
+                                transient_retries, MAX_UNREACHABLE_RETRIES, "unreachable",
+                                0, &transport_detail(&e),
+                                &reqwest::header::HeaderMap::new(), &event_tx, &cancel).await;
+                            transient_retries += 1;
+                            if !keep_going {
+                                return;
+                            }
+                            continue;
+                        }
+                        if chain_timeout && !e.is_timeout() {
+                            // We were retrying a timeout; the retry hit something
+                            // else.  Report the timeout -- that is the failure the
+                            // user is waiting on, and the one the retries were for.
+                            let _ = event_tx.send(LlmEvent::Error {
+                                kind: ERROR_KIND_ERROR.into(),
+                                message: unreachable_help(base_url, "timed out"),
+                            });
+                            return;
+                        }
+                        if let Some((status, body)) = &chain_error {
+                            // The chain started with a provider answer; report
+                            // that, not the transport failure of a retry.
+                            let body_text = serde_json::to_string(body).unwrap_or_default();
+                            let detail = body["error"]["message"].as_str()
+                                .or_else(|| body["error"].as_str())
+                                .or_else(|| body["message"].as_str())
+                                .unwrap_or(body_text.as_str());
+                            emit_turn_error(&event_tx, Some(status.as_u16()),
+                                            format!("API error (HTTP {status}): {detail}"),
+                                            base_url);
+                            return;
                         }
                         emit_unreachable_error(&event_tx, &e, base_url);
                         return;
@@ -963,7 +1082,7 @@ pub async fn chat(
             // The truncated reply is discarded unexecuted; a retry regenerates
             // it against a smaller provider view.
             if length_suggests_context_pressure(&content, has_tool_calls, &body["usage"], recovery.options.output_limit) {
-                match recover(&mut recovery, &current_messages, &client, &url, api_key, model, &cancel, &mut accumulated_usage).await {
+                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &cancel, &mut accumulated_usage).await {
                     Ok(Some(event)) => { let _ = event_tx.send(event); continue; }
                     Err(detail) => { let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail }); return; }
                     _ => {}
@@ -1283,7 +1402,7 @@ pub async fn chat(
 
 /// Execute bounded, tool-free summary calls; commit only a smaller complete plan.
 async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &reqwest::Client,
-                 url: &str, key: &str, model: &str, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
+                 url: &str, base_url: &str, key: &str, model: &str, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
     let raw = serde_json::to_value(messages).unwrap();
     let Some(plan) = recovery.plan(raw.as_array().unwrap()) else { return Ok(None); };
     let mut summaries = vec![];
@@ -1295,21 +1414,30 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
         // The summary is part of this turn, so a provider timeout gets the same
         // retry budget here as the turn request -- a big conversation's prefill
         // is exactly what blows the configured timeout on a slow engine.
-        let mut summary_timeouts = 0u32;
+        let mut summary_retries = 0u32;
         let body: serde_json::Value = loop {
             match client.post(url).bearer_auth(key).header("api-key",key).json(&payload).send().await {
                 Ok(r) => {
-                    if TIMEOUT_STATUSES.contains(&r.status().as_u16()) && summary_timeouts < MAX_TIMEOUT_RETRIES {
-                        summary_timeouts += 1;
-                        sleep_interruptible(backoff_delay(summary_timeouts - 1, None), cancel).await;
-                        continue;
+                    let code = r.status().as_u16();
+                    if let Some((budget, _)) = transient_retry(code) {
+                        if summary_retries < budget {
+                            summary_retries += 1;
+                            sleep_interruptible(backoff_delay(summary_retries - 1, None), cancel).await;
+                            continue;
+                        }
+                    }
+                    if r.status().is_success() {
+                        mark_endpoint_answered(base_url);
                     }
                     break r.error_for_status().map_err(|e| format!("Context summary failed; history retained: {e}"))?.json().await.map_err(|e| e.to_string())?;
                 }
                 Err(e) => {
-                    if e.is_timeout() && summary_timeouts < MAX_TIMEOUT_RETRIES {
-                        summary_timeouts += 1;
-                        sleep_interruptible(backoff_delay(summary_timeouts - 1, None), cancel).await;
+                    let budget = if e.is_timeout() { MAX_TIMEOUT_RETRIES }
+                        else if endpoint_has_answered(base_url) { MAX_UNREACHABLE_RETRIES }
+                        else { 0 };
+                    if summary_retries < budget {
+                        summary_retries += 1;
+                        sleep_interruptible(backoff_delay(summary_retries - 1, None), cancel).await;
                         continue;
                     }
                     return Err(format!("Context summary failed; history retained: {e}"));
@@ -3028,6 +3156,16 @@ mod loop_tests {
             "",
             false,
         );
+        // A 500 now buys one retry, so the retry notice arrives first.  The
+        // contract under test is unchanged: the failure is an error event, and
+        // nothing terminal follows it.
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::Retrying { status_code, reason, .. } => {
+                assert_eq!(status_code, 500);
+                assert_eq!(reason.as_deref(), Some("server"));
+            }
+            other => panic!("expected the retry notice, got {other:?}"),
+        }
         match d.rx.recv().await.unwrap() {
             LlmEvent::Error { kind, message } => {
                 assert_eq!(kind, ERROR_KIND_ERROR);

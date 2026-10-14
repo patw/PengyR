@@ -278,6 +278,8 @@ struct PengyCli {
     config: Config,
     current_chat: Option<Chat>,
     no_save: bool,
+    /// Report a failed mid-turn save once, not per write.
+    save_warned: std::cell::Cell<bool>,
     yolo_this_turn: bool,
     output_mode: String,
     truncation_failed: bool,
@@ -320,6 +322,7 @@ impl PengyCli {
             config,
             current_chat: None,
             no_save,
+            save_warned: std::cell::Cell::new(false),
             yolo_this_turn: false,
             output_mode: "pretty".to_string(),
             truncation_failed: false,
@@ -561,8 +564,12 @@ impl PengyCli {
                     expecting_api = true; // will show "Thinking..." again after sleep
                     // A timeout carries no HTTP status when it is our own
                     // deadline, so the label stands alone there.
+                    // A client-side timeout and a dropped route carry no HTTP
+                    // status, so their labels stand alone.
                     let label = match reason.as_deref() {
                         Some("timeout") => "Timeout".to_string(),
+                        Some("server") => format!("Server error (HTTP {status_code})"),
+                        Some("unreachable") => "Unreachable".to_string(),
                         _ => format!("Overloaded (HTTP {status_code})"),
                     };
                     eprintln!(
@@ -838,13 +845,21 @@ impl PengyCli {
 
     /// Persist mid-turn, so a crash can't take the turn's tool calls with it.
     ///
-    /// One small per-chat file write; the whole store is not touched.
+    /// One small per-chat file write; the whole store is not touched.  A failed
+    /// write is reported once and the turn continues: the model's answer and the
+    /// tool results are already real, and losing them to a full disk is the
+    /// worse outcome.
     fn save_progress(&self) {
         if self.no_save {
             return;
         }
         if let Some(chat) = self.current_chat.as_ref() {
-            chat_manager::save_chat(chat).ok();
+            if chat_manager::save_chat(chat).is_err() && !self.save_warned.get() {
+                self.save_warned.set(true);
+                eprintln!("Chat history is not being saved (disk full, or the chat \
+                           directory is not writable). Continuing; the answer will \
+                           still be shown.");
+            }
         }
     }
 
