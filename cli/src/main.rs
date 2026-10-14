@@ -280,6 +280,8 @@ struct PengyCli {
     no_save: bool,
     /// Report a failed mid-turn save once, not per write.
     save_warned: std::cell::Cell<bool>,
+    /// Report the headless-confirmation notice once, not per tool call.
+    no_user_notice: std::cell::Cell<bool>,
     yolo_this_turn: bool,
     output_mode: String,
     truncation_failed: bool,
@@ -323,6 +325,7 @@ impl PengyCli {
             current_chat: None,
             no_save,
             save_warned: std::cell::Cell::new(false),
+            no_user_notice: std::cell::Cell::new(false),
             yolo_this_turn: false,
             output_mode: "pretty".to_string(),
             truncation_failed: false,
@@ -624,6 +627,17 @@ impl PengyCli {
                                     yolo_turn: false,
                                     answers: None,
                                     unavailable: false,
+                                });
+                            }
+                            5 => {
+                                // No user available: decline, and say why to the
+                                // model.  Not an abort -- the run carries on.
+                                let _ = confirm_tx.send(Confirmation {
+                                    tool_call_id,
+                                    confirmed: false,
+                                    yolo_turn: false,
+                                    answers: None,
+                                    unavailable: true,
                                 });
                             }
                             _ => {
@@ -973,6 +987,19 @@ impl PengyCli {
     // ── Tool confirmation ────────────────────────────────────────
 
     fn prompt_tool_confirmation(&mut self) -> u8 {
+        if !std::io::stdin().is_terminal() {
+            // Headless (cron, script, CI): there is nobody to ask.  This used to
+            // fall through `unwrap_or("1")` and EXECUTE the tool -- an unattended
+            // run silently approving write tools it never showed anyone.
+            // 5 = "no user available": the model is told, and the run carries on.
+            if !self.no_user_notice.get() {
+                self.no_user_notice.set(true);
+                eprintln!("No terminal to confirm tool calls (non-interactive run). \
+                           The model is being told; set tool_confirmation to all|safe \
+                           to run tools unattended.");
+            }
+            return 5;
+        }
         loop {
             let input = self.prompt(&format!(
                 "  [1] Execute  [2] Yes to all this turn  [3] Decline  [4] Abort run  {}[1/2/3/4]{} ",

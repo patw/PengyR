@@ -668,6 +668,13 @@ pub struct Confirmation {
 /// Identical to `NO_USER_ANSWER` in the Python and C++ editions.
 pub const NO_USER_ANSWER: &str = "No user is available to answer (non-interactive run). If what you found makes one option clearly the most reasonable, take it and state that assumption in your reply. If it would be a pure guess, leave that part undone and say what you need.";
 
+/// Sent back for a tool call that needs confirmation when the frontend has
+/// nobody to ask (a CLI run with no TTY on stdin -- cron, scripts, CI).
+/// "Declined by user" is a lie there and reads as a refusal, which made
+/// unattended runs stop with nothing done.
+/// Identical to `NO_USER_CONFIRM` in the Python and C++ editions.
+pub const NO_USER_CONFIRM: &str = "No user is available to confirm this tool (non-interactive run). Do not treat this as a refusal. If running this tool is clearly the right next step, say so in your reply and continue without it; if it was optional, carry on with the rest of the task. Never claim the tool ran.";
+
 /// Tool confirmation mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ToolConfirmation {
@@ -1381,10 +1388,15 @@ pub async fn chat(
                                     declined: false,
                                 });
                             }
-                            _ => {
-                                // Declined or channel closed
-                                let declined_msg =
-                                    "Tool execution was declined by user.".to_string();
+                            conf => {
+                                // Declined, or nobody is available to confirm
+                                // (headless CLI): "declined by user" reads as a
+                                // refusal and stopped unattended runs cold.
+                                let declined_msg = if conf.as_ref().is_some_and(|c| c.unavailable) {
+                                    NO_USER_CONFIRM.to_string()
+                                } else {
+                                    "Tool execution was declined by user.".to_string()
+                                };
                                 current_messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(serde_json::Value::String(declined_msg.clone())),
@@ -3273,5 +3285,88 @@ mod loop_tests {
         }
         assert!(d.rx.try_recv().is_err(), "no final response may follow");
         d.handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_headless_decline_tells_the_model_the_truth() {
+        // A headless run (cron, script, CI) has nobody to confirm.  "Declined by
+        // user" reads as a refusal and stopped unattended runs cold; the model
+        // must be told that no user is available, and the run must carry on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        let (base, _seen) = stub_server(vec![
+            serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "",
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": format!("{{\"path\":\"{}\",\"content\":\"x\"}}", path.display())
+                }}]}, "finish_reason": "tool_calls"}]}),
+            serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "carried on"},
+                "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+        ]);
+
+        let mut d = start_chat(&base, vec![user_msg("go")], ToolConfirmation::None, "", false);
+        d.rx.recv().await.unwrap(); // AssistantToolCalls
+        d.rx.recv().await.unwrap(); // ToolRequest
+        d.confirm_tx
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: false,
+                yolo_turn: false,
+                answers: None,
+                unavailable: true,
+            })
+            .unwrap();
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::ToolResult { content, declined, .. } => {
+                assert!(declined);
+                assert!(content.contains("No user is available"), "{content}");
+                assert!(!content.contains("declined by user"), "{content}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        // The run carries on to a further model round.
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::FinalResponse { content, .. } => assert!(content.contains("carried on")),
+            other => panic!("expected FinalResponse, got {other:?}"),
+        }
+        assert!(!path.exists(), "a declined tool must not run");
+    }
+
+    #[tokio::test]
+    async fn a_real_decline_keeps_its_wording() {
+        // Negative control: a user who really declined must not be reported as
+        // "no user available".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("y.txt");
+        let (base, _seen) = stub_server(vec![
+            serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "",
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {
+                    "name": "write_file",
+                    "arguments": format!("{{\"path\":\"{}\",\"content\":\"x\"}}", path.display())
+                }}]}, "finish_reason": "tool_calls"}]}),
+            serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "stopped"},
+                "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}),
+        ]);
+
+        let mut d = start_chat(&base, vec![user_msg("go")], ToolConfirmation::None, "", false);
+        d.rx.recv().await.unwrap();
+        d.rx.recv().await.unwrap();
+        d.confirm_tx
+            .send(Confirmation {
+                tool_call_id: "tc1".into(),
+                confirmed: false,
+                yolo_turn: false,
+                answers: None,
+                unavailable: false,
+            })
+            .unwrap();
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::ToolResult { content, .. } => {
+                assert!(content.contains("declined by user"), "{content}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
     }
 }

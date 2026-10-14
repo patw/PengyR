@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use std::pin::Pin;
@@ -317,6 +317,74 @@ struct WebWorker {
     cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
     cancel: Arc<AtomicBool>,
     sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)>,
+    /// Attached SSE consumers.  The prompt lease keys on this: a confirm,
+    /// question or sudo prompt waits indefinitely while someone is watching, and
+    /// is bounded when nobody is (see `prompt_watchdog`).
+    viewers: Arc<AtomicUsize>,
+    /// True while a confirm/question/sudo prompt is awaiting an answer.
+    pending_prompt: Arc<AtomicBool>,
+}
+
+/// Increments the viewer count for the lifetime of one SSE stream.
+struct ViewerGuard(Arc<AtomicUsize>);
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Prompt lease for a web run with nobody watching.
+///
+/// A prompt waits indefinitely while a browser is attached -- v1.11.4 removed
+/// the silent expiry precisely so a prompt cannot expire under a user who
+/// stepped away.  With no viewer attached, a notice is emitted each minute, and
+/// after the lease the run is cancelled *with a notice*: a worker blocked
+/// forever on a prompt nobody can see keeps its task alive and leaves the chat
+/// showing an active run forever.
+const PROMPT_LEASE_MINUTES: u32 = 30;
+
+fn prompt_watchdog(
+    events: Arc<Mutex<Vec<SseEvent>>>,
+    event_count_tx: tokio::sync::watch::Sender<usize>,
+    viewers: Arc<AtomicUsize>,
+    pending: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut idle_minutes = 0u32;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if done.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if !pending.load(Ordering::Relaxed) || viewers.load(Ordering::Relaxed) > 0 {
+                idle_minutes = 0;
+                continue;
+            }
+            idle_minutes += 1;
+            let expiring = idle_minutes >= PROMPT_LEASE_MINUTES;
+            let message = if expiring {
+                format!("No browser has been attached to this chat for {PROMPT_LEASE_MINUTES} \
+                         minutes, so the waiting run is being stopped. Open the chat to \
+                         answer prompts, then send the message again.")
+            } else {
+                "Waiting for you to answer in this chat — no browser is currently \
+                 attached. Open the chat to continue, or press Stop.".to_string()
+            };
+            let count = {
+                let mut ev = events.lock().unwrap();
+                ev.push(SseEvent::Notice { message });
+                ev.len()
+            };
+            event_count_tx.send_replace(count);
+            if expiring {
+                cancel.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -383,6 +451,11 @@ enum SseEvent {
         /// `"timeout"` for a provider 408/504 answer or our own deadline;
         /// `None` for the 429/529 overload path. Serialized as `"reason"`.
         reason: Option<String>,
+    },
+    /// A harness notice (history not being saved, a prompt nobody is answering):
+    /// shown to the user, never an answer, and the run keeps going.
+    Notice {
+        message: String,
     },
     ContextCompacted {
         attempt: u32,
@@ -643,6 +716,8 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "reason": reason,
         })
         .to_string(),
+        SseEvent::Notice { message } =>
+            serde_json::json!({"type": "notice", "message": message}).to_string(),
         SseEvent::ContextCompacted { attempt, max_attempts, chars_removed } =>
             serde_json::json!({
                 "type": "context_compacted", "attempt": attempt,
@@ -660,6 +735,8 @@ impl WebWorker {
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
             Arc::new((Mutex::new(None), Condvar::new()));
+        let viewers = Arc::new(AtomicUsize::new(0));
+        let pending_prompt = Arc::new(AtomicBool::new(false));
 
         // Append-only event log shared by all SSE streams, with a watch channel
         // that notifies streams when new events are appended.
@@ -681,6 +758,8 @@ impl WebWorker {
             cmd_tx,
             cancel: cancel.clone(),
             sudo_state: sudo_state.clone(),
+            viewers: viewers.clone(),
+            pending_prompt: pending_prompt.clone(),
         });
 
         *tools::USER_AGENT.lock().unwrap() = config.user_agent.clone();
@@ -769,14 +848,31 @@ impl WebWorker {
             let save_warned = std::cell::Cell::new(false);
 
             let push_event = |event: SseEvent| {
+                // A prompt event means the run is now blocked on an answer; the
+                // watchdog bounds that wait when nobody is attached.
+                // A prompt event means the run is now blocked on an answer; the
+                // watchdog bounds that wait when nobody is attached.  Tool
+                // requests are the confirm surface (the browser answers via
+                // /confirm); sudo and ask_user_question are their own events.
+                let is_prompt = matches!(event,
+                    SseEvent::ToolRequest { .. }
+                    | SseEvent::SudoRequest { .. }
+                    | SseEvent::QuestionRequest { .. });
                 let count;
                 {
                     let mut ev = events.lock().unwrap();
                     ev.push(event);
                     count = ev.len();
                 }
+                if is_prompt {
+                    pending_prompt.store(true, Ordering::Relaxed);
+                }
                 event_count_tx.send_replace(count);
             };
+
+            prompt_watchdog(events.clone(), event_count_tx.clone(),
+                            viewers.clone(), pending_prompt.clone(),
+                            cancel.clone(), done.clone());
 
             loop {
                 match event_rx.recv().await {
@@ -1251,7 +1347,7 @@ async fn chat_stream(
 ) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
     // Browser sends Last-Event-ID on auto-reconnect. Resume right after it
     // so no messages are replayed twice.
-    let (events, event_count_rx, done, start_index) = {
+    let (events, event_count_rx, done, start_index, viewers) = {
         let workers = state.workers.lock().unwrap();
         match workers.get(&chat_id) {
             Some(w) => {
@@ -1285,6 +1381,7 @@ async fn chat_stream(
                     w.event_count_tx.subscribe(),
                     w.done.clone(),
                     start_index,
+                    w.viewers.clone(),
                 )
             }
             None => {
@@ -1300,7 +1397,16 @@ async fn chat_stream(
         }
     };
 
-    let stream = async_stream(start_index, events, event_count_rx, done);
+    // One attached viewer for the lifetime of this stream: the prompt lease keys
+    // on the count (see `prompt_watchdog`).
+    viewers.fetch_add(1, Ordering::Relaxed);
+    let guard_stream = futures_util::stream::once(async move {
+        let _guard = ViewerGuard(viewers);
+        None::<Result<Event, Infallible>>
+    })
+    .filter_map(|item| async move { item });
+
+    let stream = guard_stream.chain(async_stream(start_index, events, event_count_rx, done));
     Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(KeepAlive::default())
 }
@@ -1379,6 +1485,8 @@ async fn chat_confirm(
 
     match worker {
         Some(w) => {
+            // The prompt was answered: stop the unattended-prompt lease.
+            w.pending_prompt.store(false, Ordering::Relaxed);
             let _ = w.cmd_tx.send(WorkerCommand::Confirm {
                 confirmed: data.confirmed.unwrap_or(false),
                 tool_call_id: data.tool_call_id.unwrap_or_default(),
@@ -1408,6 +1516,7 @@ async fn chat_sudo(
 
     match worker {
         Some(w) => {
+            w.pending_prompt.store(false, Ordering::Relaxed);
             let (lock, cvar) = &*w.sudo_state;
             *lock.lock().unwrap() = Some(data.password);
             cvar.notify_one();
@@ -3795,6 +3904,11 @@ function handleEvent(data) {{
       break;
     case 'context_compacted':
       showContextCompacted(data);
+      break;
+    case 'notice':
+      // A harness notice (history not being saved, a prompt nobody is
+      // answering): shown, never an answer, and the run keeps going.
+      appendRecoveryNotice(data.message || '');
       break;
     case 'final_response':
       hideThinking();
