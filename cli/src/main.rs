@@ -1005,7 +1005,13 @@ impl PengyCli {
                 "  [1] Execute  [2] Yes to all this turn  [3] Decline  [4] Abort run  {}[1/2/3/4]{} ",
                 BOLD, RESET
             ));
-            match input.as_deref().unwrap_or("1").trim() {
+            // Ctrl-C / Ctrl-D (no line at all) aborts, as in the Python
+            // edition.  It used to read as "1" and *execute* the tool the user
+            // was trying to get away from.
+            let Some(input) = input else {
+                return 4;
+            };
+            match input.trim() {
                 "1" | "" => return 1,
                 "2" => return 2,
                 "3" => return 3,

@@ -22,3 +22,7 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 chrono = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# test-util: the prompt-lease tests run on a paused clock instead of waiting 30 minutes.
+tokio = { version = "1", features = ["full", "test-util"] }

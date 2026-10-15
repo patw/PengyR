@@ -344,6 +344,15 @@ impl Drop for ViewerGuard {
 /// showing an active run forever.
 const PROMPT_LEASE_MINUTES: u32 = 30;
 
+///
+/// `pending` must be set only by a prompt that actually waits for an answer --
+/// an auto-approved tool request is not one, or every long unattended run would
+/// be "stopped" 30 minutes after its first tool call.  On expiry the waits are
+/// woken, not just flagged: a confirm or question wait sits in `cmd_rx.recv()`
+/// and a sudo wait on its condvar, and neither looks at `cancel`.  `cmd_tx` is
+/// weak so the watchdog never keeps the channel open after Stop drops the
+/// worker (Stop relies on that close to end the wait).
+#[allow(clippy::too_many_arguments)]
 fn prompt_watchdog(
     events: Arc<Mutex<Vec<SseEvent>>>,
     event_count_tx: tokio::sync::watch::Sender<usize>,
@@ -351,6 +360,8 @@ fn prompt_watchdog(
     pending: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    cmd_tx: tokio::sync::mpsc::WeakUnboundedSender<WorkerCommand>,
+    sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)>,
 ) {
     tokio::spawn(async move {
         let mut idle_minutes = 0u32;
@@ -381,10 +392,42 @@ fn prompt_watchdog(
             event_count_tx.send_replace(count);
             if expiring {
                 cancel.store(true, Ordering::Relaxed);
+                pending.store(false, Ordering::Relaxed);
+                if let Some(tx) = cmd_tx.upgrade() {
+                    let _ = tx.send(WorkerCommand::Cancel);
+                }
+                wake_sudo_wait(&sudo_state);
                 return;
             }
         }
     });
+}
+
+/// Whether pushing `event` means the run is now waiting for the user.
+fn arms_prompt_lease(event: &SseEvent) -> bool {
+    matches!(event,
+        SseEvent::ToolRequest { auto_approved: false, .. }
+        | SseEvent::QuestionRequest { .. })
+}
+
+/// Count `stream` as an attached viewer until it is dropped.
+fn attach_viewer<S: Stream>(stream: S, viewers: Arc<AtomicUsize>) -> impl Stream<Item = S::Item> {
+    viewers.fetch_add(1, Ordering::Relaxed);
+    let guard = ViewerGuard(viewers);
+    // The guard is owned by the closure, so it drops with the stream when the
+    // browser disconnects.  (It used to live inside a `stream::once` future,
+    // which dropped it on the first poll: every stream counted as gone at once.)
+    stream.map(move |item| {
+        let _attached = &guard;
+        item
+    })
+}
+
+/// Release a sudo provider blocked on its condvar, answering "no password".
+fn wake_sudo_wait(sudo_state: &(Mutex<Option<Option<String>>>, Condvar)) {
+    let (lock, cvar) = sudo_state;
+    *lock.lock().unwrap() = Some(None);
+    cvar.notify_all();
 }
 
 #[derive(Clone)]
@@ -474,6 +517,9 @@ enum WorkerCommand {
         yolo_turn: bool,
         answers: Option<Vec<String>>,
     },
+    /// Stop a run blocked on a prompt (the prompt lease expired).  The worker
+    /// treats it like Stop's closed channel: it leaves the loop and saves.
+    Cancel,
 }
 
 fn safe_id(tool_call_id: &str) -> String {
@@ -732,6 +778,7 @@ fn sse_event_to_json(event: &SseEvent) -> String {
 impl WebWorker {
     fn start_with_messages(chat: Chat, config: Config, messages: Vec<ChatMessage>) -> Arc<Self> {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCommand>();
+        let cmd_weak = cmd_tx.downgrade();
         let cancel = Arc::new(AtomicBool::new(false));
         let sudo_state: Arc<(Mutex<Option<Option<String>>>, Condvar)> =
             Arc::new((Mutex::new(None), Condvar::new()));
@@ -777,6 +824,7 @@ impl WebWorker {
             let events_sudo = events.clone();
             let event_count_tx_sudo = event_count_tx.clone();
             let sudo_state_provider = sudo_state.clone();
+            let pending_sudo = pending_prompt.clone();
             tool_ctx.set_sudo_provider(Some(Box::new(move |host: Option<&str>| {
                 let count;
                 {
@@ -786,6 +834,8 @@ impl WebWorker {
                     });
                     count = ev.len();
                 }
+                // The run now waits for a password: the prompt lease applies.
+                pending_sudo.store(true, Ordering::Relaxed);
                 event_count_tx_sudo.send_replace(count);
                 let (lock, cvar) = &*sudo_state_provider;
                 let mut guard = lock.lock().unwrap();
@@ -849,15 +899,13 @@ impl WebWorker {
 
             let push_event = |event: SseEvent| {
                 // A prompt event means the run is now blocked on an answer; the
-                // watchdog bounds that wait when nobody is attached.
-                // A prompt event means the run is now blocked on an answer; the
-                // watchdog bounds that wait when nobody is attached.  Tool
-                // requests are the confirm surface (the browser answers via
-                // /confirm); sudo and ask_user_question are their own events.
-                let is_prompt = matches!(event,
-                    SseEvent::ToolRequest { .. }
-                    | SseEvent::SudoRequest { .. }
-                    | SseEvent::QuestionRequest { .. });
+                // watchdog bounds that wait when nobody is attached.  Only a tool
+                // request that needs confirming is one -- an auto-approved
+                // request runs at once, and counting it left the lease armed for
+                // the rest of the run, which then stopped every unattended run
+                // ~30 minutes after its first tool call.  The sudo provider
+                // pushes its own event and arms the lease itself.
+                let is_prompt = arms_prompt_lease(&event);
                 let count;
                 {
                     let mut ev = events.lock().unwrap();
@@ -872,7 +920,8 @@ impl WebWorker {
 
             prompt_watchdog(events.clone(), event_count_tx.clone(),
                             viewers.clone(), pending_prompt.clone(),
-                            cancel.clone(), done.clone());
+                            cancel.clone(), done.clone(),
+                            cmd_weak, sudo_state.clone());
 
             loop {
                 match event_rx.recv().await {
@@ -944,6 +993,7 @@ impl WebWorker {
                                     yolo_turn,
                                     ..
                                 }) => {
+                                    pending_prompt.store(false, Ordering::Relaxed);
                                     if yolo_turn {
                                         yolo_this_turn = true;
                                     }
@@ -955,7 +1005,8 @@ impl WebWorker {
                                         unavailable: false,
                                     });
                                 }
-                                None => break,
+                                // Stop (channel closed) or an expired lease.
+                                Some(WorkerCommand::Cancel) | None => break,
                             }
                         }
                     }
@@ -1014,6 +1065,7 @@ impl WebWorker {
                             Some(WorkerCommand::Confirm {
                                 confirmed, answers, ..
                             }) => {
+                                pending_prompt.store(false, Ordering::Relaxed);
                                 let _ = confirm_tx.send(Confirmation {
                                     tool_call_id,
                                     confirmed,
@@ -1022,7 +1074,7 @@ impl WebWorker {
                                     unavailable: false,
                                 });
                             }
-                            None => break,
+                            Some(WorkerCommand::Cancel) | None => break,
                         }
                     }
                     Some(LlmEvent::QuestionResult {
@@ -1105,6 +1157,10 @@ impl WebWorker {
             // the turn got through.
             chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
             save_progress(&mut chat, &save_warned);
+            // A run stopped by its prompt lease stays registered (Stop removes
+            // its worker; the lease cannot), so mark it finished: open streams
+            // end and the chat page no longer shows an active run.
+            done.store(true, Ordering::Relaxed);
 
             tool_ctx.set_sudo_provider(None);
         });
@@ -1399,14 +1455,7 @@ async fn chat_stream(
 
     // One attached viewer for the lifetime of this stream: the prompt lease keys
     // on the count (see `prompt_watchdog`).
-    viewers.fetch_add(1, Ordering::Relaxed);
-    let guard_stream = futures_util::stream::once(async move {
-        let _guard = ViewerGuard(viewers);
-        None::<Result<Event, Infallible>>
-    })
-    .filter_map(|item| async move { item });
-
-    let stream = guard_stream.chain(async_stream(start_index, events, event_count_rx, done));
+    let stream = attach_viewer(async_stream(start_index, events, event_count_rx, done), viewers);
     Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(KeepAlive::default())
 }
@@ -1548,6 +1597,10 @@ async fn chat_stop(
         let mut workers = state.workers.lock().unwrap();
         if let Some(w) = workers.remove(&chat_id) {
             w.cancel.store(true, Ordering::Relaxed);
+            // Dropping the worker ends a confirm or question wait (its channel
+            // closes), but a sudo wait blocks on a condvar and would hold its
+            // thread forever.
+            wake_sudo_wait(&w.sudo_state);
         }
     }
     Json(serde_json::json!({"status": "stopped"}))
@@ -4960,5 +5013,107 @@ mod tests {
                 .count()
                 <= 100
         );
+    }
+
+    // ── Prompt lease ─────────────────────────────────────────────
+
+    fn tool_request(auto_approved: bool) -> SseEvent {
+        SseEvent::ToolRequest {
+            name: "write_file".into(),
+            args: serde_json::json!({}),
+            tool_call_id: "tool-1".into(),
+            safe_id: "tc_tool1".into(),
+            summary: String::new(),
+            auto_approved,
+            cumulative_usage: Default::default(),
+        }
+    }
+
+    #[test]
+    fn only_a_prompt_that_waits_arms_the_lease() {
+        // An auto-approved request runs at once; counting it left the lease
+        // armed and stopped every unattended run ~30 minutes in.
+        assert!(!arms_prompt_lease(&tool_request(true)));
+        assert!(arms_prompt_lease(&tool_request(false)));
+        assert!(!arms_prompt_lease(&SseEvent::Notice { message: String::new() }));
+    }
+
+    #[tokio::test]
+    async fn a_viewer_counts_until_its_stream_is_dropped() {
+        let viewers = Arc::new(AtomicUsize::new(0));
+        let mut stream = Box::pin(attach_viewer(
+            futures_util::stream::iter([1, 2]).chain(futures_util::stream::pending()),
+            viewers.clone(),
+        ));
+        assert_eq!(stream.next().await, Some(1));
+        assert_eq!(stream.next().await, Some(2));
+        // Polled and still open: still attached (the old guard dropped here).
+        assert_eq!(viewers.load(Ordering::Relaxed), 1);
+        drop(stream);
+        assert_eq!(viewers.load(Ordering::Relaxed), 0);
+    }
+
+    struct Lease {
+        events: Arc<Mutex<Vec<SseEvent>>>,
+        viewers: Arc<AtomicUsize>,
+        pending: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
+        sudo: Arc<(Mutex<Option<Option<String>>>, Condvar)>,
+        cmd_rx: tokio::sync::mpsc::UnboundedReceiver<WorkerCommand>,
+        _cmd_tx: tokio::sync::mpsc::UnboundedSender<WorkerCommand>,
+    }
+
+    fn start_lease(viewers: usize) -> Lease {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (count_tx, _) = tokio::sync::watch::channel(0usize);
+        let viewers = Arc::new(AtomicUsize::new(viewers));
+        let pending = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sudo = Arc::new((Mutex::new(None), Condvar::new()));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        prompt_watchdog(events.clone(), count_tx, viewers.clone(), pending.clone(),
+                        cancel.clone(), Arc::new(AtomicBool::new(false)),
+                        cmd_tx.downgrade(), sudo.clone());
+        Lease { events, viewers, pending, cancel, sudo, cmd_rx, _cmd_tx: cmd_tx }
+    }
+
+    fn notices(events: &Arc<Mutex<Vec<SseEvent>>>) -> usize {
+        events.lock().unwrap().iter().filter(|e| matches!(e, SseEvent::Notice { .. })).count()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_viewer_keeps_the_prompt_waiting() {
+        let lease = start_lease(1);
+        tokio::time::sleep(std::time::Duration::from_secs(90 * 60)).await;
+        assert_eq!(notices(&lease.events), 0);
+        assert!(!lease.cancel.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_lease_wakes_every_wait_it_stops() {
+        let mut lease = start_lease(0);
+        tokio::time::sleep(std::time::Duration::from_secs(29 * 60 + 30)).await;
+        assert_eq!(notices(&lease.events), 29);
+        assert!(!lease.cancel.load(Ordering::Relaxed));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert_eq!(notices(&lease.events), 30);
+        assert!(lease.cancel.load(Ordering::Relaxed));
+        assert!(!lease.pending.load(Ordering::Relaxed));
+        // A confirm/question wait sits in cmd_rx and a sudo wait on its condvar;
+        // setting `cancel` alone released neither.
+        assert!(matches!(lease.cmd_rx.try_recv(), Ok(WorkerCommand::Cancel)));
+        assert_eq!(*lease.sudo.0.lock().unwrap(), Some(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_viewer_returning_restarts_the_lease() {
+        let lease = start_lease(0);
+        tokio::time::sleep(std::time::Duration::from_secs(20 * 60 + 30)).await;
+        lease.viewers.store(1, Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+        lease.viewers.store(0, Ordering::Relaxed);
+        // 20 more unattended minutes: under a fresh 30-minute lease.
+        tokio::time::sleep(std::time::Duration::from_secs(20 * 60)).await;
+        assert!(!lease.cancel.load(Ordering::Relaxed));
     }
 }

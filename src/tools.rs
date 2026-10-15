@@ -307,7 +307,7 @@ fn apply_changes_definition() -> ToolDef {
                 "dry_run": {"type": "boolean", "description": "Preview only; nothing is written"},
                 "postconditions": {
                     "type": "array",
-                    "description": "Optional {path, contains, does_not_contain} checks on the edited text; a failed check cancels every edit",
+                    "description": "Optional {path, contains, does_not_contain} plain-substring checks on a file's whole edited text, comments and strings included; a failed check cancels every edit",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -870,9 +870,9 @@ async fn apply_changes(args: &serde_json::Value) -> String {
                 }
             }
             if let Some(x) = o.get("does_not_contain").and_then(|v| v.as_str()) {
-                if content.contains(x) {
+                if let Some(at) = forbidden_text_location(&content, x) {
                     errors.push(format!(
-                        "postcondition {i}: {raw} still contains forbidden text"
+                        "postcondition {i}: {raw} still contains forbidden text {at}"
                     ));
                 }
             }
@@ -1445,9 +1445,126 @@ fn match_newlines(content: &str, old: &str, new: &str) -> (String, String) {
     (crlf_old, new)
 }
 
+/// Largest LCS table (lines x lines) `match_lines` builds for one region.
+const LCS_MAX_CELLS: usize = 4_000_000;
+
+/// Matching `(i, j)` line pairs between `a` and `b`, in order.  A region small
+/// enough for the LCS table gets an exact LCS.  A larger one is split on lines
+/// that occur exactly once on each side (kept in order by a longest increasing
+/// subsequence, as patience diff does) and its gaps are matched the same way,
+/// so two edits far apart in a big file still diff as two small hunks instead
+/// of one replace spanning everything between them.  Only a large region with
+/// no such line is left unmatched.  Same algorithm as the C++ edition.
+fn match_lines(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    let mut regions = vec![(0, a.len(), 0, b.len())];
+    while let Some((mut a1, mut a2, mut b1, mut b2)) = regions.pop() {
+        while a1 < a2 && b1 < b2 && a[a1] == b[b1] {
+            pairs.push((a1, b1));
+            a1 += 1;
+            b1 += 1;
+        }
+        while a1 < a2 && b1 < b2 && a[a2 - 1] == b[b2 - 1] {
+            a2 -= 1;
+            b2 -= 1;
+            pairs.push((a2, b2));
+        }
+        let (n, m) = (a2 - a1, b2 - b1);
+        if n == 0 || m == 0 {
+            continue;
+        }
+        if n * m <= LCS_MAX_CELLS {
+            lcs_pairs(&a[a1..a2], &b[b1..b2], a1, b1, &mut pairs);
+            continue;
+        }
+        let (mut pa, mut pb) = (a1, b1);
+        for (i, j) in unique_anchors(a, b, a1, a2, b1, b2) {
+            pairs.push((i, j));
+            regions.push((pa, i, pb, j));
+            pa = i + 1;
+            pb = j + 1;
+        }
+        if pa > a1 {
+            regions.push((pa, a2, pb, b2));
+        }
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+/// Exact LCS of `am` and `bm`, pushed as pairs offset by `ao`/`bo`.
+fn lcs_pairs(am: &[&str], bm: &[&str], ao: usize, bo: usize, pairs: &mut Vec<(usize, usize)>) {
+    let (n, m) = (am.len(), bm.len());
+    let mut dp = vec![0u32; (n + 1) * (m + 1)];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * (m + 1) + j] = if am[i] == bm[j] {
+                dp[(i + 1) * (m + 1) + j + 1] + 1
+            } else {
+                dp[(i + 1) * (m + 1) + j].max(dp[i * (m + 1) + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if am[i] == bm[j] {
+            pairs.push((ao + i, bo + j));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+}
+
+/// Lines occurring exactly once in `a[a1..a2]` and once in `b[b1..b2]`, as
+/// `(i, j)` pairs: the longest run of them in the same order on both sides.
+fn unique_anchors(a: &[&str], b: &[&str], a1: usize, a2: usize, b1: usize, b2: usize) -> Vec<(usize, usize)> {
+    // line -> (count in a, index in a, count in b, index in b)
+    let mut seen: HashMap<&str, (u32, usize, u32, usize)> = HashMap::new();
+    for (i, line) in a.iter().enumerate().take(a2).skip(a1) {
+        let e = seen.entry(*line).or_insert((0, i, 0, 0));
+        e.0 += 1;
+    }
+    for (j, line) in b.iter().enumerate().take(b2).skip(b1) {
+        if let Some(e) = seen.get_mut(*line) {
+            e.2 += 1;
+            e.3 = j;
+        }
+    }
+    let mut cands: Vec<(usize, usize)> = seen
+        .values()
+        .filter(|e| e.0 == 1 && e.2 == 1)
+        .map(|e| (e.1, e.3))
+        .collect();
+    cands.sort_unstable();
+    // Longest increasing subsequence of the b indices (patience sorting).
+    let mut tails: Vec<usize> = Vec::new(); // index into cands
+    let mut prev: Vec<Option<usize>> = vec![None; cands.len()];
+    for k in 0..cands.len() {
+        let pos = tails.partition_point(|&t| cands[t].1 < cands[k].1);
+        prev[k] = if pos > 0 { Some(tails[pos - 1]) } else { None };
+        if pos == tails.len() {
+            tails.push(k);
+        } else {
+            tails[pos] = k;
+        }
+    }
+    let mut out = Vec::with_capacity(tails.len());
+    let mut k = tails.last().copied();
+    while let Some(x) = k {
+        out.push(cands[x]);
+        k = prev[x];
+    }
+    out.reverse();
+    out
+}
+
 /// Line-level opcodes (`tag`, a-range, b-range) turning `a` into `b`: common
-/// prefix/suffix trimmed, then an LCS over the middle (a middle too large for
-/// the table is reported as one replace).  Same algorithm as the C++ edition.
+/// prefix/suffix trimmed, then the middle matched by `match_lines`.  Same
+/// algorithm as the C++ edition.
 fn diff_opcodes(a: &[&str], b: &[&str]) -> Vec<(char, usize, usize, usize, usize)> {
     let mut pre = 0;
     while pre < a.len() && pre < b.len() && a[pre] == b[pre] {
@@ -1459,32 +1576,7 @@ fn diff_opcodes(a: &[&str], b: &[&str]) -> Vec<(char, usize, usize, usize, usize
     }
     let (am, bm) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
     // Matching (i, j) pairs in the middle, in order.
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
-    if !am.is_empty() && !bm.is_empty() && am.len() * bm.len() <= 4_000_000 {
-        let (n, m) = (am.len(), bm.len());
-        let mut dp = vec![0u32; (n + 1) * (m + 1)];
-        for i in (0..n).rev() {
-            for j in (0..m).rev() {
-                dp[i * (m + 1) + j] = if am[i] == bm[j] {
-                    dp[(i + 1) * (m + 1) + j + 1] + 1
-                } else {
-                    dp[(i + 1) * (m + 1) + j].max(dp[i * (m + 1) + j + 1])
-                };
-            }
-        }
-        let (mut i, mut j) = (0, 0);
-        while i < n && j < m {
-            if am[i] == bm[j] {
-                pairs.push((i, j));
-                i += 1;
-                j += 1;
-            } else if dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1] {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-    }
+    let pairs = match_lines(am, bm);
     let mut ops = Vec::new();
     if pre > 0 {
         ops.push(('=', 0, pre, 0, pre));
@@ -1526,6 +1618,43 @@ fn diff_opcodes(a: &[&str], b: &[&str]) -> Vec<(char, usize, usize, usize, usize
         merged.push(op);
     }
     merged
+}
+
+/// Where `needle` first occurs in `content`, for a failed `does_not_contain`:
+/// "at line N: <that line>", plus "(+K more)" for further matches.  The check
+/// is a plain substring test, so the match is often in a comment or string the
+/// caller didn't mean; showing the line makes that a one-look fix instead of a
+/// blind retry.  A line longer than 160 characters is cut to a window around
+/// the match.  Same text as the Python and C++ editions.
+fn forbidden_text_location(content: &str, needle: &str) -> Option<String> {
+    let pos = content.find(needle)?;
+    let more = if needle.is_empty() { 0 } else { content[pos + needle.len()..].matches(needle).count() };
+    let line_no = content[..pos].matches('\n').count() + 1;
+    let start = content[..pos].rfind('\n').map_or(0, |i| i + 1);
+    let end = content[pos..].find('\n').map_or(content.len(), |i| pos + i);
+    let raw = &content[start..end];
+    let line = raw.trim();
+    let lead = raw.len() - raw.trim_start().len();
+    let col_bytes = (pos - start).saturating_sub(lead).min(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let excerpt = if chars.len() > 160 {
+        let col = line[..col_bytes].chars().count();
+        let from = col.saturating_sub(60).min(chars.len() - 160);
+        let to = (from + 160).min(chars.len());
+        format!(
+            "{}{}{}",
+            if from > 0 { "..." } else { "" },
+            chars[from..to].iter().collect::<String>(),
+            if to < chars.len() { "..." } else { "" }
+        )
+    } else {
+        line.to_string()
+    };
+    let mut at = format!("at line {line_no}: {excerpt}");
+    if more > 0 {
+        at.push_str(&format!(" (+{more} more)"));
+    }
+    Some(at)
 }
 
 fn unified_range(start: usize, stop: usize) -> String {
@@ -2177,6 +2306,9 @@ async fn run_bash_local(
         let out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
+            let Some(status) = status else {
+                return timed_out_output(format!("Error: Command timed out after {timeout} seconds"), out, &err);
+            };
             let mut out = join_command_output(out, &err, status);
             if used_sudo {
                 out.push_str(&sudo_auth_failure_note(&ctx_blocking, None, &err));
@@ -2273,6 +2405,9 @@ async fn run_bash_remote(
         let out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
+            let Some(status) = status else {
+                return timed_out_output(format!("Error: Command timed out after {timeout} seconds"), out, &err);
+            };
             let mut out = join_command_output(out, &err, status);
             if status.code() == Some(255) && SSH_FAILURE_RE.is_match(&err) {
                 out.push_str(&format!(
@@ -2413,7 +2548,10 @@ async fn run_powershell_with(
         ctx_blocking.unregister_process(pid);
         let out = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
-        wait_result.map(|status| finish_command_output(join_command_output(out, &err, status)))
+        wait_result.map(|status| match status {
+            Some(status) => finish_command_output(join_command_output(out, &err, status)),
+            None => timed_out_output(format!("Error: Command timed out after {timeout} seconds"), out, &err),
+        })
     })
     .await;
     let _ = std::fs::remove_file(&script);
@@ -2426,26 +2564,28 @@ async fn run_powershell_with(
 }
 
 /// Wait for a command's process group leader, killing the group on timeout.
+/// `Ok(None)` means it timed out and was killed.
 fn wait_child(
     child: &mut std::process::Child,
     pid: u32,
     timeout: u64,
-) -> Result<std::process::ExitStatus, String> {
+) -> Result<Option<std::process::ExitStatus>, String> {
     if timeout > 0 {
         match wait_timeout_status(child, Duration::from_secs(timeout)) {
-            Ok(Some(status)) => Ok(status),
+            Ok(Some(status)) => Ok(Some(status)),
             Ok(None) => {
                 // Timed out — kill the process group
                 terminate_process_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
-                Err(format!("Error: Command timed out after {timeout} seconds"))
+                Ok(None)
             }
             Err(e) => Err(format!("Error running command: {e}")),
         }
     } else {
         child
             .wait()
+            .map(Some)
             .map_err(|e| format!("Error running command: {e}"))
     }
 }
@@ -2469,6 +2609,25 @@ fn finish_command_output(out: String) -> String {
     } else {
         snip_tool_output(out)
     }
+}
+
+/// A timeout's error plus whatever the command printed before it was killed:
+/// the last lines of a hung watcher or build are what explain the hang, and
+/// dropping them left the model with nothing to go on.  Same text as the
+/// Python and C++ editions.
+fn timed_out_output(error: String, out: String, err: &str) -> String {
+    let err = SUDO_PROMPT_RE.replace_all(err, "");
+    let mut partial = out;
+    if !err.is_empty() {
+        if !partial.is_empty() {
+            partial.push('\n');
+        }
+        partial.push_str(&err);
+    }
+    if partial.trim().is_empty() {
+        return error;
+    }
+    format!("{error}. Output before it was killed:\n{}", snip_tool_output(partial))
 }
 
 /// Wait for a child process with a timeout, without blocking the async runtime.
@@ -3464,20 +3623,19 @@ async fn run_python(code: String, cwd: Option<String>, ctx: Arc<ToolContext>) ->
     let result = tokio::task::spawn_blocking(move || {
         let wait_result = if timeout > 0 {
             match wait_timeout_status(&mut child, Duration::from_secs(timeout)) {
-                Ok(Some(status)) => Ok(status),
+                Ok(Some(status)) => Ok(Some(status)),
                 Ok(None) => {
                     terminate_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
-                    Err(format!(
-                        "Error: Python execution timed out after {timeout} seconds"
-                    ))
+                    Ok(None)
                 }
                 Err(e) => Err(format!("Error running Python: {e}")),
             }
         } else {
             child
                 .wait()
+                .map(Some)
                 .map_err(|e| format!("Error running Python: {e}"))
         };
         ctx_blocking.unregister_process(pid);
@@ -3485,6 +3643,13 @@ async fn run_python(code: String, cwd: Option<String>, ctx: Arc<ToolContext>) ->
         let mut s = read_and_remove(&stdout_path);
         let err = read_and_remove(&stderr_path);
         wait_result.map(|status| {
+            let Some(status) = status else {
+                return timed_out_output(
+                    format!("Error: Python execution timed out after {timeout} seconds"),
+                    s,
+                    &err,
+                );
+            };
             if !err.is_empty() {
                 s.push('\n');
                 s.push_str(&err);
@@ -4403,6 +4568,28 @@ mod tests {
         let result = run_bash("sleep 5".into(), None, false, None, Arc::new(ToolContext::new())).await;
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(result.contains("Command timed out after 1 seconds"));
+    }
+
+    /// A timeout keeps what the command printed before it was killed: the
+    /// last lines of a hung watcher are what explain the hang.
+    #[tokio::test]
+    async fn timeouts_return_output_printed_before_the_kill() {
+        let _guard = test_tool_timeout_guard();
+        let old = *TOOL_TIMEOUT.lock().unwrap();
+        *TOOL_TIMEOUT.lock().unwrap() = 1;
+        let ctx = Arc::new(ToolContext::new());
+        let bash = run_bash("echo started; echo oops >&2; sleep 5".into(), None, false, None, ctx.clone()).await;
+        let python = run_python(
+            "import sys, time; print('working', flush=True); time.sleep(5)".into(),
+            None,
+            ctx.clone(),
+        )
+        .await;
+        let silent = run_bash("sleep 5".into(), None, false, None, ctx).await;
+        *TOOL_TIMEOUT.lock().unwrap() = old;
+        assert_eq!(bash, "Error: Command timed out after 1 seconds. Output before it was killed:\nstarted\n\noops\n");
+        assert_eq!(python, "Error: Python execution timed out after 1 seconds. Output before it was killed:\nworking\n");
+        assert_eq!(silent, "Error: Command timed out after 1 seconds");
     }
 
     #[tokio::test]
@@ -6866,6 +7053,95 @@ mod hardening_tests {
         );
         assert_eq!(unified_diff("f", "a", "b"), "--- f\n+++ f\n@@ -1 +1 @@\n-a\n+b\n");
         assert_eq!(unified_diff("f", "", "x\n"), "--- f\n+++ f\n@@ -0,0 +1 @@\n+x\n");
+    }
+
+    /// `diff_opcodes` must describe `a` -> `b` exactly: ranges contiguous from
+    /// 0 to the ends, and every '=' range really equal.
+    fn assert_opcodes_rebuild(a: &[&str], b: &[&str]) {
+        let (mut ai, mut bj) = (0, 0);
+        for (tag, i1, i2, j1, j2) in diff_opcodes(a, b) {
+            assert_eq!((i1, j1), (ai, bj));
+            if tag == '=' {
+                assert_eq!(a[i1..i2], b[j1..j2]);
+            }
+            ai = i2;
+            bj = j2;
+        }
+        assert_eq!((ai, bj), (a.len(), b.len()));
+    }
+
+    /// Two edits ~2000 lines apart: the region between them is too big for
+    /// the LCS table, which used to report it as one replace — a 4000-line
+    /// "diff" for a 2-line edit.  It now splits on unique lines, in any size of
+    /// file.
+    #[test]
+    fn unified_diff_keeps_distant_edits_as_separate_hunks() {
+        for (n, x, y) in [(4024usize, 359usize, 2401usize), (3000, 359, 2459), (10000, 359, 2401)] {
+            let mut lines: Vec<String> = (1..=n).map(|i| format!("filler = {i}\n")).collect();
+            lines[x] = "name = \"bytes\"\n".into();
+            lines[x + 1] = "version = \"1.12.0\"\n".into();
+            lines[y] = "name = \"rayon\"\n".into();
+            lines[y + 1] = "version = \"1.12.0\"\n".into();
+            let old: String = lines.concat();
+            let new = old.replace("version = \"1.12.0\"", "version = \"1.12.1\"");
+            let d = unified_diff("f", &old, &new);
+            let hunks: Vec<&str> = d.lines().filter(|l| l.starts_with("@@")).collect();
+            assert_eq!(
+                hunks,
+                [format!("@@ -{},7 +{},7 @@", x - 1, x - 1), format!("@@ -{},7 +{},7 @@", y - 1, y - 1)],
+                "n={n}"
+            );
+            assert_eq!(d.lines().count(), 20, "n={n}");
+        }
+    }
+
+    #[test]
+    fn diff_opcodes_stay_exact_on_large_regions() {
+        // Unique lines with edits scattered through a region far over the cap.
+        let a: Vec<String> = (0..5000).map(|i| format!("l{i}\n")).collect();
+        let mut b = a.clone();
+        b.remove(1000);
+        b.insert(2500, "added\n".into());
+        b[4000] = "changed\n".into();
+        let (a, b): (Vec<&str>, Vec<&str>) = (a.iter().map(|x| x.as_str()).collect(), b.iter().map(|x| x.as_str()).collect());
+        assert_opcodes_rebuild(&a, &b);
+        let d = unified_diff("f", &a.concat(), &b.concat());
+        assert_eq!(d.lines().filter(|l| l.starts_with("@@")).count(), 3, "{d}");
+        // No line unique on both sides: still a correct (if coarse) diff.
+        let a: Vec<&str> = std::iter::repeat_n("x\n", 2500).chain(["a\n"]).chain(std::iter::repeat_n("x\n", 2500)).collect();
+        let b: Vec<&str> = std::iter::repeat_n("x\n", 2500).chain(["b\n"]).chain(std::iter::repeat_n("y\n", 2500)).collect();
+        assert_opcodes_rebuild(&a, &b);
+    }
+
+    #[tokio::test]
+    async fn failed_does_not_contain_shows_the_matching_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.py");
+        std::fs::write(&f, "import httpx\nimport pytest\n\ndef helper():\n    \"\"\"No longer builds an httpx.Request.\"\"\"\n    # httpx.Request was the old way\n").unwrap();
+        let r = run(
+            "apply_changes",
+            json!({
+                "changes": [replace_op(&f, "import httpx\nimport pytest", "import pytest")],
+                "postconditions": [{"path": f.to_str().unwrap(), "does_not_contain": "httpx.Request"}]
+            }),
+        )
+        .await;
+        assert!(
+            r.contains("still contains forbidden text at line 4: \"\"\"No longer builds an httpx.Request.\"\"\" (+1 more)"),
+            "{r}"
+        );
+        assert!(std::fs::read_to_string(&f).unwrap().starts_with("import httpx\n"));
+    }
+
+    #[test]
+    fn forbidden_text_location_windows_a_long_line() {
+        let line = format!("{}NEEDLE{}", "a".repeat(300), "b".repeat(300));
+        let at = forbidden_text_location(&format!("first\n  {line}\n"), "NEEDLE").unwrap();
+        assert_eq!(at, format!("at line 2: ...{}NEEDLE{}...", "a".repeat(60), "b".repeat(94)));
+        // Near the end the window still shows 160 characters.
+        let at = forbidden_text_location(&format!("{}NEEDLE", "a".repeat(300)), "NEEDLE").unwrap();
+        assert_eq!(at, format!("at line 1: ...{}NEEDLE", "a".repeat(154)));
+        assert_eq!(forbidden_text_location("abc", "x"), None);
     }
 
     #[cfg(unix)]
