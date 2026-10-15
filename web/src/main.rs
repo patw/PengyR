@@ -3515,6 +3515,17 @@ function showContextCompacted(data) {{
   appendToArea(el);
 }}
 
+// A harness notice (history not being saved, a prompt nobody is answering,
+// context recovery with the full history retained): a persistent highlighted
+// card, never an assistant answer.  Same alert-info surface as
+// showContextCompacted above, matching the Python and C++ editions.
+function appendRecoveryNotice(message) {{
+  const el = document.createElement('div');
+  el.className = 'alert alert-info py-2';
+  el.textContent = message;
+  appendToArea(el);
+}}
+
 function showRetrying(data) {{
   hideThinking();
   thinkingEl = document.createElement('div');
