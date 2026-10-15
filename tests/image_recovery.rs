@@ -89,8 +89,8 @@ async fn attachment_reference_image_recovery_preserves_history_and_retries_once(
         .unwrap()
         .iter()
         .any(|p| p["type"] == "image_url"));
-    assert_eq!(req[1]["messages"][0]["content"], "Inspect my attachment");
-    assert!(req[1]["messages"][1]["content"]
+    assert!(req[1]["messages"][0]["content"].as_str().unwrap().starts_with("Inspect my attachment\n\n"));
+    assert!(req[1]["messages"][0]["content"]
         .as_str()
         .unwrap()
         .contains("proxy adapter"));

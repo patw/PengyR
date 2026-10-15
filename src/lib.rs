@@ -10,6 +10,7 @@ pub mod chat_manager;
 pub mod config;
 pub mod context_recovery;
 pub mod image_utils;
+pub mod image_capabilities;
 pub mod llm_client;
 pub mod model_cache;
 pub mod task_manager;

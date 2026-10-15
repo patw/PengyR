@@ -495,6 +495,13 @@ enum SseEvent {
         /// `None` for the 429/529 overload path. Serialized as `"reason"`.
         reason: Option<String>,
     },
+    /// A request is (back) in flight after its announced backoff, or a
+    /// context-recovery summary call is starting: the browser swaps the
+    /// "retrying in Xs" card back to the live spinner.
+    RequestStarted {
+        stage: String,
+        attempt: u32,
+    },
     /// A harness notice (history not being saved, a prompt nobody is answering):
     /// shown to the user, never an answer, and the run keeps going.
     Notice {
@@ -762,6 +769,8 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             "reason": reason,
         })
         .to_string(),
+        SseEvent::RequestStarted { stage, attempt } =>
+            serde_json::json!({"type": "request_started", "stage": stage, "attempt": attempt}).to_string(),
         SseEvent::Notice { message } =>
             serde_json::json!({"type": "notice", "message": message}).to_string(),
         SseEvent::ContextCompacted { attempt, max_attempts, chars_removed } =>
@@ -962,6 +971,9 @@ impl WebWorker {
                             message,
                             reason,
                         });
+                    }
+                    Some(LlmEvent::RequestStarted { stage, attempt }) => {
+                        push_event(SseEvent::RequestStarted { stage, attempt });
                     }
                     Some(LlmEvent::ToolRequest {
                         name,
@@ -3965,6 +3977,13 @@ function handleEvent(data) {{
       break;
     case 'retrying':
       showRetrying(data);
+      break;
+    case 'request_started':
+      // The announced backoff is over and the request is in flight again
+      // (a retry, or a context-recovery summary call): swap the stale
+      // "retrying in Xs" card back to the live spinner.
+      hideThinking();
+      showThinking();
       break;
     case 'context_compacted':
       showContextCompacted(data);

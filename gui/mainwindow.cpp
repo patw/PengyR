@@ -845,7 +845,7 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
             notice = QString("Context recovery — full history retained.");
         session->chatView->appendMessage("notice", notice);
         if (session == tabForChat(m_activeChatId)) {
-            m_chatHistory->setRetrying(QString("Context recovery"));
+            m_chatHistory->setThinking(true);
         }
 
     } else if (type == "retrying") {
@@ -864,7 +864,15 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
                     .arg(event["delay_secs"].toDouble(), 0, 'f', 1)
                     .arg(event["attempt"].toInt())
                     .arg(event["max_attempts"].toInt()));
+
         }
+
+    } else if (type == "request_started") {
+        // The announced backoff is over and the request is in flight again
+        // (a retry, or a context-recovery summary call). Show the honest
+        // in-flight state. No delayed timer can race a newer turn.
+        if (session == tabForChat(m_activeChatId) && session->thinking && !session->toolRunning)
+            m_chatHistory->setThinking(true);
 
     } else if (type == "tool_request") {
         session->thinking = true;

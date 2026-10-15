@@ -564,7 +564,7 @@ impl PengyCli {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }
-                    expecting_api = true; // will show "Thinking..." again after sleep
+                    expecting_api = true; // RequestStarted restores the in-flight status after sleep
                     // A timeout carries no HTTP status when it is our own
                     // deadline, so the label stands alone there.
                     // A client-side timeout and a dropped route carry no HTTP
@@ -580,6 +580,14 @@ impl PengyCli {
                         "{}{} — retrying in {:.1}s ({}/{}){}  {}",
                         YELLOW, label, delay_secs, attempt, max_attempts, RESET, message
                     );
+                }
+                Some(LlmEvent::RequestStarted { stage, .. }) => {
+                    if expecting_api {
+                        eprint!("\r{}\r", " ".repeat(40));
+                    }
+                    expecting_api = true;
+                    eprint!("{}{}{}", DIM,
+                        if stage == "summary" { "Summarizing context..." } else { "Thinking..." }, RESET);
                 }
                 Some(LlmEvent::ToolRequest {
                     name,

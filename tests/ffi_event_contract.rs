@@ -230,6 +230,40 @@ fn provider_timeout_is_retried_and_the_turn_completes() {
 }
 
 #[test]
+fn every_retry_announcement_is_followed_by_a_launch_notice() {
+    // A surface that has just shown "retrying in Xs" must hear when the pause
+    // is over and the attempt is in flight, or it advertises a finished
+    // backoff for the whole (llm_timeout-bounded) attempt -- the frozen
+    // "retrying in 0.9s" hang. Each launch notice carries the same attempt
+    // number its announcement promised, and follows it, never precedes it.
+    let (base, served) = spawn_flaky_stub(408, 2);
+    let events = run_turn_through_ffi(&base);
+    let parsed: Vec<serde_json::Value> = events.iter()
+        .map(|e| serde_json::from_str(e).unwrap())
+        .collect();
+
+    let seq: Vec<(String, u32)> = parsed.iter()
+        .filter(|e| e["type"] == "retrying" || e["type"] == "request_started")
+        .map(|e| (e["type"].as_str().unwrap().to_string(),
+                 e["attempt"].as_u64().unwrap() as u32))
+        .collect();
+    assert_eq!(seq, vec![
+        ("retrying".into(), 1), ("request_started".into(), 1),
+        ("retrying".into(), 2), ("request_started".into(), 2),
+    ], "{events:#?}");
+    // The main-loop launches are turn-stage attempts.
+    for e in &parsed {
+        if e["type"] == "request_started" {
+            assert_eq!(e["stage"], "turn", "{events:#?}");
+        }
+    }
+    let last = parsed.last().unwrap();
+    assert_eq!(last["type"], "final_response", "{events:#?}");
+    assert!(last["content"].as_str().unwrap().contains("recovered"), "{events:#?}");
+    assert_eq!(*served.lock().unwrap(), 3, "{events:#?}");
+}
+
+#[test]
 fn provider_timeout_budget_is_spent_then_the_timeout_message() {
     let (base, served) = spawn_flaky_stub(408, 99);
     let events = run_turn_through_ffi(&base);

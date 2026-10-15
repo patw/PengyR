@@ -59,6 +59,39 @@ fn strip_image_url_parts(messages: &mut [ChatMessage]) {
     }
 }
 
+const CACHED_IMAGE_NOTICE: &str = "[Images omitted: this endpoint/model previously rejected image inputs. Original attachments are retained; only text and file metadata are available. This is not evidence that the underlying model lacks vision. Do not claim to have inspected the omitted images.]";
+
+fn suppress_images(messages: &mut [ChatMessage], notice: &str) {
+    let first = messages.iter().position(|m| !m.attachments.is_empty() || has_image_url_parts(std::slice::from_ref(m)));
+    for msg in messages.iter_mut() {
+        let labels: Vec<String> = msg.attachments.iter().map(|r| format!("[image: {}]", r.name)).collect();
+        msg.attachments.clear();
+        if !labels.is_empty() {
+            match &mut msg.content {
+                Some(serde_json::Value::String(text)) => { text.push('\n'); text.push_str(&labels.join(" ")); }
+                Some(serde_json::Value::Array(parts)) => parts.push(serde_json::json!({"type":"text","text":labels.join(" ")})),
+                _ => msg.content = Some(serde_json::Value::String(labels.join(" "))),
+            }
+        }
+    }
+    strip_image_url_parts(messages);
+    if let Some(first) = first {
+        match &mut messages[first].content {
+            Some(serde_json::Value::String(text)) => { text.push_str("\n\n"); text.push_str(notice); }
+            Some(serde_json::Value::Array(parts)) => parts.push(serde_json::json!({"type":"text","text":notice})),
+            _ => messages[first].content = Some(serde_json::Value::String(notice.into())),
+        }
+    }
+}
+
+fn provider_messages_with_images(messages: &[ChatMessage], keep_turns: usize, rejected: bool, notice: &str) -> Vec<ChatMessage> {
+    if !rejected { return provider_messages(messages, keep_turns); }
+    let mut filtered = messages.to_vec();
+    suppress_images(&mut filtered, notice);
+    // Suppress references before resolution: no derivative image is rehydrated.
+    provider_messages(&filtered, keep_turns)
+}
+
 fn is_image_input_error(status_code: u16, body: &serde_json::Value, error_text: &str) -> bool {
     if status_code != 400 {
         return false;
@@ -313,6 +346,24 @@ async fn sleep_interruptible(delay: f64, cancel: &AtomicBool) -> bool {
     }
 }
 
+/// Retry decisions close 31 seconds after the first retry is approved. This
+/// limits admission of additional attempts, not the total wall time: an already
+/// admitted request retains its own deadline and an approved backoff may
+/// outlast the window. Fast failures retain their attempt-count budgets; a
+/// full retry at the default 300-second timeout prevents approving another.
+const RETRY_CHAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(31);
+
+/// Whether the chain may launch another attempt: the first decision opens the
+/// clock, later ones spend it. One shared clock for every retry path (rate,
+/// transient, timeout, unreachable, recovery summary) without threading a
+/// deadline through each.
+fn retry_chain_open(started: &mut Option<std::time::Instant>, grace: std::time::Duration) -> bool {
+    match *started {
+        None => { *started = Some(std::time::Instant::now()); true }
+        Some(t0) => std::time::Instant::now().duration_since(t0) < grace,
+    }
+}
+
 /// Announce one transient-failure retry and sleep out.
 ///
 /// *attempt* is the number of retries already spent (0-based), so the ladder
@@ -338,7 +389,17 @@ async fn pause_after_transient(
         message: detail.to_string(),
         reason: Some(reason.to_string()),
     });
-    sleep_interruptible(delay, cancel).await
+    if !sleep_interruptible(delay, cancel).await {
+        return false;
+    }
+    // The announced pause is over and the attempt is launching. Say so, or
+    // every frontend keeps advertising "retrying in Xs" for the whole (up to
+    // `llm_timeout`) in-flight attempt.
+    let _ = event_tx.send(LlmEvent::RequestStarted {
+        stage: "turn".into(),
+        attempt: attempt + 1,
+    });
+    true
 }
 
 fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<f64> {
@@ -429,6 +490,20 @@ pub enum LlmEvent {
         /// Frontends label the two differently.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// A request is (back) in flight: a retry attempt just launched after its
+    /// announced backoff, or a context-recovery summary call is starting.
+    /// [`LlmEvent::Retrying`] announces a pause; this announces the pause is
+    /// over, so a frontend can stop advertising the finished backoff
+    /// ("retrying in 0.9s") while the attempt runs -- bounded by `llm_timeout`,
+    /// with no further events until it resolves.
+    #[serde(rename = "request_started")]
+    RequestStarted {
+        /// `"turn"` for the chat-completion request, `"summary"` for a
+        /// context-recovery summary call.
+        stage: String,
+        /// 1-based attempt number now in flight.
+        attempt: u32,
     },
     #[serde(rename = "context_compacted")]
     ContextCompacted {
@@ -826,8 +901,8 @@ pub async fn chat(
         return;
     }
     let mut recovery = Recovery::new(&serde_json::to_value(&current_messages).unwrap().as_array().unwrap(), base_url, model, options);
-    let mut image_rejected = false;
-    let mut rejection_notice = String::new();
+    let mut image_rejected = crate::image_capabilities::images_rejected(base_url, model);
+    let mut rejection_notice = CACHED_IMAGE_NOTICE.to_string();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -837,8 +912,8 @@ pub async fn chat(
         // request time so provider payloads never leak back into chat JSON.
         let raw = serde_json::to_value(&current_messages).unwrap();
         let reduced: Vec<ChatMessage> = serde_json::from_value(serde_json::Value::Array(recovery.apply(raw.as_array().unwrap()))).unwrap();
-        let mut api_messages = provider_messages(&reduced, attachment_context_keep_turns);
-        if image_rejected { strip_image_url_parts(&mut api_messages); api_messages.push(ChatMessage::new("user", Some(serde_json::json!(rejection_notice)))); }
+        image_rejected = image_rejected || crate::image_capabilities::images_rejected(base_url, model);
+        let mut api_messages = provider_messages_with_images(&reduced, attachment_context_keep_turns, image_rejected, &rejection_notice);
         // Proxy envelopes are opaque state tied to one model and upstream.
         // Keep them in persisted chat history, but don't leak them to a
         // different selected model (including model overrides in a tab).
@@ -872,6 +947,9 @@ pub async fn chat(
             // about (a transport failure carries no provider message).
             let mut chain_error: Option<(reqwest::StatusCode, serde_json::Value)> = None;
             let mut chain_timeout = false;
+            // Shared retry-admission clock across failure categories.
+            // An admitted request retains its own per-attempt deadline.
+            let mut retry_chain_started: Option<std::time::Instant> = None;
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     // Cancelled during backoff — emit nothing, just return
@@ -903,7 +981,9 @@ pub async fn chat(
                                 // (the 500 reasoning -- ride out a blip, do not pay
                                 // three full-cost attempts for a deterministic answer),
                                 // then a message that says what happened.
-                                if transient_retries < MAX_EMPTY_RETRIES {
+                                if transient_retries < MAX_EMPTY_RETRIES
+                                    && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
+                                {
                                     let keep_going = pause_after_transient(
                                         transient_retries, MAX_EMPTY_RETRIES, "empty",
                                         0, "The endpoint answered with no choices",
@@ -942,25 +1022,22 @@ pub async fn chat(
                             // messages would miss attachment refs, which get
                             // resolved back into image parts on the next turn.
                             image_rejected = true;
+                            crate::image_capabilities::remember_image_rejection(base_url, model);
                             rejection_notice = image_rejection_notice(&body, detail).into();
-                            strip_image_url_parts(&mut request_messages);
-                            request_messages.push(ChatMessage::new("user", Some(
-                                serde_json::Value::String(image_rejection_notice(&body, detail).into()),
-                            )));
+                            suppress_images(&mut request_messages, &rejection_notice);
                             payload["messages"] = serde_json::to_value(&request_messages).unwrap();
                             continue;
                         }
 
                         if is_context_limit_error(code, &body, detail) {
                             if recovery.options.enabled {
-                                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &cancel, &mut accumulated_usage).await {
+                                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &event_tx, &cancel, &mut accumulated_usage).await {
                                     Ok(Some(event)) => {
                                         let _ = event_tx.send(event);
                                         let raw = serde_json::to_value(&current_messages).unwrap();
                                         let reduced: Vec<ChatMessage> = serde_json::from_value(serde_json::Value::Array(recovery.apply(raw.as_array().unwrap()))).unwrap();
-                                        request_messages = provider_messages(&reduced, attachment_context_keep_turns);
+                                        request_messages = provider_messages_with_images(&reduced, attachment_context_keep_turns, image_rejected, &rejection_notice);
                                         strip_cross_model_proxy_state(&mut request_messages, model);
-                                        if image_rejected { strip_image_url_parts(&mut request_messages); request_messages.push(ChatMessage::new("user", Some(serde_json::json!(rejection_notice)))); }
                                         payload["messages"] = serde_json::to_value(&request_messages).unwrap();
                                         continue;
                                     }
@@ -994,7 +1071,9 @@ pub async fn chat(
                         }
 
                         if let Some((budget, reason)) = transient_retry(code) {
-                            if transient_retries < budget {
+                            if transient_retries < budget
+                                && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
+                            {
                                 // The endpoint answered, saying it is not
                                 // available right now: 408/504 (out of time),
                                 // 502/503 (proxy/upstream gone), or 500 (one
@@ -1012,7 +1091,9 @@ pub async fn chat(
                             }
                         }
 
-                        if RETRYABLE_STATUSES.contains(&code) && rate_retries < MAX_RETRIES {
+                        if RETRYABLE_STATUSES.contains(&code) && rate_retries < MAX_RETRIES
+                            && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
+                        {
                             let ra = extract_retry_after(&headers);
                             let delay = backoff_delay(rate_retries, ra);
                             rate_retries += 1;
@@ -1034,11 +1115,17 @@ pub async fn chat(
                             if !sleep_interruptible(delay, &cancel).await {
                                 return;
                             }
+                            let _ = event_tx.send(LlmEvent::RequestStarted {
+                                stage: "turn".into(),
+                                attempt: rate_retries,
+                            });
                             continue;
                         }
                     }
                     Err(e) => {
-                        if e.is_timeout() && transient_retries < MAX_TIMEOUT_RETRIES {
+                        if e.is_timeout() && transient_retries < MAX_TIMEOUT_RETRIES
+                            && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
+                        {
                             // Our own deadline elapsed with no answer at all --
                             // the failure a retry actually fixes: a busy or
                             // single-slot endpoint usually answers on the next
@@ -1057,6 +1144,7 @@ pub async fn chat(
                         }
                         if !e.is_timeout() && endpoint_has_answered(base_url)
                             && transient_retries < MAX_UNREACHABLE_RETRIES
+                            && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
                         {
                             // Refused / DNS / TLS *after* this endpoint answered:
                             // a restart or a dropped route, not a bad URL.  These
@@ -1163,7 +1251,7 @@ pub async fn chat(
             // The truncated reply is discarded unexecuted; a retry regenerates
             // it against a smaller provider view.
             if length_suggests_context_pressure(&content, has_tool_calls, &body["usage"], recovery.options.output_limit) {
-                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &cancel, &mut accumulated_usage).await {
+                match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &event_tx, &cancel, &mut accumulated_usage).await {
                     Ok(Some(event)) => { let _ = event_tx.send(event); continue; }
                     Err(detail) => { let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail }); return; }
                     _ => {}
@@ -1506,10 +1594,14 @@ pub async fn chat(
 
 /// Execute bounded, tool-free summary calls; commit only a smaller complete plan.
 async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &reqwest::Client,
-                 url: &str, base_url: &str, key: &str, model: &str, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
+                 url: &str, base_url: &str, key: &str, model: &str,
+                 event_tx: &mpsc::UnboundedSender<LlmEvent>, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
     let raw = serde_json::to_value(messages).unwrap();
     let Some(plan) = recovery.plan(raw.as_array().unwrap()) else { return Ok(None); };
     let mut summaries = vec![];
+    // One wall-clock grace for the whole recovery: every chunk's summary calls
+    // and their retries share it (see `RETRY_CHAIN_GRACE`).
+    let mut chain_started: Option<std::time::Instant> = None;
     for chunk in &plan.chunks {
         if cancel.load(Ordering::Relaxed) { return Err("Context recovery cancelled.".into()); }
         recovery.summary_calls += 1;
@@ -1520,13 +1612,30 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
         // is exactly what blows the configured timeout on a slow engine.
         let mut summary_retries = 0u32;
         let body: serde_json::Value = loop {
+            // A summary call is an LLM request the frontends would otherwise
+            // sit through blind (up to `llm_timeout` each, retries included).
+            let _ = event_tx.send(LlmEvent::RequestStarted {
+                stage: "summary".into(),
+                attempt: summary_retries + 1,
+            });
             match client.post(url).bearer_auth(key).header("api-key",key).json(&payload).send().await {
                 Ok(r) => {
                     let code = r.status().as_u16();
-                    if let Some((budget, _)) = transient_retry(code) {
-                        if summary_retries < budget {
+                    if let Some((budget, reason)) = transient_retry(code) {
+                        if summary_retries < budget && retry_chain_open(&mut chain_started, RETRY_CHAIN_GRACE) {
+                            let delay = backoff_delay(summary_retries, None);
+                            let _ = event_tx.send(LlmEvent::Retrying {
+                                attempt: summary_retries + 1,
+                                max_attempts: budget,
+                                delay_secs: (delay * 10.0).round() / 10.0,
+                                status_code: code,
+                                message: format!("Context summary failed (HTTP {code}); retrying"),
+                                reason: Some(reason.to_string()),
+                            });
                             summary_retries += 1;
-                            sleep_interruptible(backoff_delay(summary_retries - 1, None), cancel).await;
+                            if !sleep_interruptible(delay, cancel).await {
+                                return Err("Context recovery cancelled.".into());
+                            }
                             continue;
                         }
                     }
@@ -1539,9 +1648,20 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
                     let budget = if e.is_timeout() { MAX_TIMEOUT_RETRIES }
                         else if endpoint_has_answered(base_url) { MAX_UNREACHABLE_RETRIES }
                         else { 0 };
-                    if summary_retries < budget {
+                    if summary_retries < budget && retry_chain_open(&mut chain_started, RETRY_CHAIN_GRACE) {
+                        let delay = backoff_delay(summary_retries, None);
+                        let _ = event_tx.send(LlmEvent::Retrying {
+                            attempt: summary_retries + 1,
+                            max_attempts: budget,
+                            delay_secs: (delay * 10.0).round() / 10.0,
+                            status_code: 0,
+                            message: format!("Context summary failed ({e}); retrying"),
+                            reason: Some(if e.is_timeout() { "timeout" } else { "unreachable" }.to_string()),
+                        });
                         summary_retries += 1;
-                        sleep_interruptible(backoff_delay(summary_retries - 1, None), cancel).await;
+                        if !sleep_interruptible(delay, cancel).await {
+                            return Err("Context recovery cancelled.".into());
+                        }
                         continue;
                     }
                     return Err(format!("Context summary failed; history retained: {e}"));
@@ -1637,6 +1757,28 @@ fn response_tokens_per_second(body: &serde_json::Value, seconds: f64) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_chain_grace_covers_the_longest_ladder() {
+        // 1 + 2 + 4 + 8 + 16: the overload ladder's own sleeps, so every retry
+        // a ladder announced still fits inside the grace, whatever
+        // `llm_timeout` is configured to (the grace must not read it, or a
+        // small test timeout leaks into every other chain).
+        assert_eq!(RETRY_CHAIN_GRACE, std::time::Duration::from_secs(31));
+    }
+
+    #[test]
+    fn retry_chain_open_opens_then_consumes() {
+        let mut started = None;
+        assert!(retry_chain_open(&mut started, std::time::Duration::from_millis(60)));
+        assert!(started.is_some(), "the first decision opens the budget");
+        // Inside the budget the chain stays open.
+        assert!(retry_chain_open(&mut started, std::time::Duration::from_secs(60)));
+        std::thread::sleep(std::time::Duration::from_millis(70));
+        // Past the budget it closes, and stays closed.
+        assert!(!retry_chain_open(&mut started, std::time::Duration::from_millis(60)));
+        assert!(!retry_chain_open(&mut started, std::time::Duration::from_millis(60)));
+    }
 
     #[test]
     fn context_error_requires_explicit_signal() {
@@ -2360,9 +2502,15 @@ mod loop_tests {
             sequence.push((200, completion("HARBOR_17 /tmp/harbor-17 audit pending", serde_json::Value::Null, (10, 5))));
             let (base, requests) = stub_server_sequence(sequence);
             let mut d = start_chat(&base, messages.clone(), ToolConfirmation::All, "", false);
-            for attempt in 1..=4 {
+            // Attempts 1-3 replay the reserved provider-only plan with no new
+            // requests; the fourth (reserved) attempt pays for the history
+            // summary, and that one summary call announces itself first.
+            for attempt in 1..=3 {
                 assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { attempt: n, .. } if n == attempt));
             }
+            assert!(matches!(d.rx.recv().await.unwrap(),
+                LlmEvent::RequestStarted { stage, attempt: n, .. } if stage == "summary" && n == 1));
+            assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { attempt: n, .. } if n == 4));
             assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content.contains("HARBOR_17")));
             d.handle.await.unwrap();
             assert!(d.rx.recv().await.is_none());
@@ -2414,6 +2562,9 @@ mod loop_tests {
         let (base, requests) = stub_server(vec![length_stop(lead_in, serde_json::Value::Null, 14),
             completion("HARBOR_17", serde_json::Value::Null, (20, 10)), completion("recovered", serde_json::Value::Null, (30, 5))]);
         let mut d = start_chat(&base, messages.clone(), ToolConfirmation::All, "", false);
+        // The summary call announces itself before the plan is committed.
+        assert!(matches!(d.rx.recv().await.unwrap(),
+            LlmEvent::RequestStarted { stage, .. } if stage == "summary"));
         assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { .. }));
         assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content == "recovered"));
         d.handle.await.unwrap();
@@ -2433,6 +2584,9 @@ mod loop_tests {
         let (base, _requests) = stub_server(vec![length_stop("Writing:", serde_json::json!([call]), 40),
             completion("HARBOR_17", serde_json::Value::Null, (20, 10)), completion("recovered", serde_json::Value::Null, (30, 5))]);
         let mut d = start_chat(&base, recoverable_history(), ToolConfirmation::All, "", false);
+        // The summary call announces itself before the plan is committed.
+        assert!(matches!(d.rx.recv().await.unwrap(),
+            LlmEvent::RequestStarted { stage, .. } if stage == "summary"));
         assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::ContextCompacted { .. }));
         assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::FinalResponse { content, .. } if content == "recovered"));
         d.handle.await.unwrap();
@@ -2458,6 +2612,7 @@ mod loop_tests {
         let mut blank=completion("",serde_json::Value::Null,(10,48));blank["choices"][0]["finish_reason"]=serde_json::json!("length");
         let (base,requests)=stub_server(vec![blank,completion("HARBOR_17; /tmp/harbor-17; audit pending",serde_json::Value::Null,(20,10)),completion("recovered",serde_json::Value::Null,(30,5))]);
         let mut d=start_chat(&base,messages.clone(),ToolConfirmation::All,"",false);
+        assert!(matches!(d.rx.recv().await.unwrap(),LlmEvent::RequestStarted{stage,..} if stage == "summary"));
         assert!(matches!(d.rx.recv().await.unwrap(),LlmEvent::ContextCompacted{message:Some(_),..}));
         assert!(matches!(d.rx.recv().await.unwrap(),LlmEvent::FinalResponse{content,usage,..} if content=="recovered" && usage.total_tokens==123));
         d.handle.await.unwrap();assert!(d.rx.recv().await.is_none());
@@ -2948,7 +3103,32 @@ mod loop_tests {
             d.handle.await.unwrap();
             assert!(failed);
             assert_eq!(requests.lock().unwrap().len(), 2);
+            assert!(!crate::image_capabilities::images_rejected(&base,"stub-model"));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cached_image_rejection_omits_new_read_image_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("new.png");
+        image::RgbImage::from_pixel(32,32,image::Rgb([10,120,200])).save(&file).unwrap();
+        let args = serde_json::json!({"path":file.to_str().unwrap()});
+        let (base, requests) = stub_server(vec![
+            completion("",serde_json::json!([tool_call("tc1","read_image",&args)]),(10,5)),
+            completion("metadata only",serde_json::Value::Null,(10,5))]);
+        crate::image_capabilities::remember_image_rejection(&base,"stub-model");
+        let mut d = start_chat(&base,vec![user_msg("look")],ToolConfirmation::All,"",false);
+        while let Some(event) = d.rx.recv().await {
+            if let LlmEvent::Error { message, .. } = event { panic!("{message}"); }
+        }
+        d.handle.await.unwrap();
+        let req = requests.lock().unwrap();
+        assert_eq!(req.len(),2);
+        for request in req.iter() {
+            let msgs: Vec<ChatMessage> = serde_json::from_value(request["messages"].clone()).unwrap();
+            assert!(!has_image_url_parts(&msgs));
+        }
+        assert!(req[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().contains("new.png"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3274,6 +3454,15 @@ mod loop_tests {
                 assert_eq!(reason.as_deref(), Some("server"));
             }
             other => panic!("expected the retry notice, got {other:?}"),
+        }
+        // The retry's launch notice sits between the announcement and the
+        // second failure that spends the 500's single-retry budget.
+        match d.rx.recv().await.unwrap() {
+            LlmEvent::RequestStarted { stage, attempt, .. } => {
+                assert_eq!(stage, "turn");
+                assert_eq!(attempt, 1);
+            }
+            other => panic!("expected the launch notice, got {other:?}"),
         }
         match d.rx.recv().await.unwrap() {
             LlmEvent::Error { kind, message } => {
