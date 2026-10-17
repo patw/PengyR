@@ -1900,7 +1900,6 @@ fn rewrite_sudo_for_askpass(command: &str) -> String {
 struct AskpassHelper {
     dir: PathBuf,
     path: PathBuf,
-    pw_path: PathBuf,
 }
 
 impl AskpassHelper {
@@ -1912,6 +1911,7 @@ impl AskpassHelper {
         let mut dir = std::env::temp_dir();
         dir.push(format!("pengy-askpass-{}-{nanos}", std::process::id()));
         std::fs::create_dir(&dir)?;
+        LIVE_ASKPASS.lock().unwrap().insert(dir.clone());
         let pw_path = dir.join("pw");
         std::fs::write(&pw_path, password)?;
         let path = dir.join("askpass.sh");
@@ -1923,15 +1923,40 @@ impl AskpassHelper {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
             std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        Ok(Self { dir, path, pw_path })
+        Ok(Self { dir, path })
     }
 }
 
 impl Drop for AskpassHelper {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_file(&self.pw_path);
-        let _ = std::fs::remove_dir(&self.dir);
+        remove_askpass_dir(&self.dir);
+    }
+}
+
+/// Every askpass directory not yet removed.  `Drop` removes a helper when its
+/// command exits, but a CLI dying on SIGTERM/SIGINT re-raises the signal
+/// without running destructors, which would leave the 0600 password file in
+/// the temp directory.
+static LIVE_ASKPASS: Mutex<std::collections::BTreeSet<PathBuf>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn remove_askpass_dir(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("askpass.sh"));
+    let _ = std::fs::remove_file(dir.join("pw"));
+    let _ = std::fs::remove_dir(dir);
+    LIVE_ASKPASS.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+}
+
+/// Remove every live askpass helper (the CLI's signal path, before exit).
+pub fn cleanup_askpass_helpers() {
+    let dirs: Vec<PathBuf> = LIVE_ASKPASS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    for dir in dirs {
+        remove_askpass_dir(&dir);
     }
 }
 

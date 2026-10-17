@@ -1,3 +1,5 @@
+mod sigwatch;
+
 use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage};
 use pengy_core::config::{self, Config};
@@ -285,6 +287,8 @@ struct PengyCli {
     yolo_this_turn: bool,
     output_mode: String,
     truncation_failed: bool,
+    /// One-shot run: any SIGINT/SIGTERM/SIGHUP ends the process, never just the turn.
+    single_shot: bool,
     rt: tokio::runtime::Runtime,
     rl: Editor<PengyHelper, FileHistory>,
     hist_path: std::path::PathBuf,
@@ -329,6 +333,7 @@ impl PengyCli {
             yolo_this_turn: false,
             output_mode: "pretty".to_string(),
             truncation_failed: false,
+            single_shot: false,
             rt,
             rl,
             hist_path,
@@ -423,6 +428,7 @@ impl PengyCli {
     }
 
     fn run_single_shot(&mut self, prompt_text: &str) {
+        self.single_shot = true;
         self.set_sudo_provider();
 
         if self.no_save {
@@ -507,7 +513,9 @@ impl PengyCli {
         let ctx_for_task = self.tool_ctx.clone();
         *ctx_for_task.recovery.lock().unwrap() = pengy_core::context_recovery::Options::configured(&self.config, if self.no_save { "" } else { &chat.id });
 
-        self.rt.spawn(async move {
+        // Before the task starts: a signal from here on is this turn's.
+        let _signals = sigwatch::TurnGuard::install(self.tool_ctx.clone(), self.single_shot);
+        let task = self.rt.spawn(async move {
             llm_client::chat(
                 &bu,
                 &ak,
@@ -531,9 +539,14 @@ impl PengyCli {
 
         let mut expecting_api = true;
         let aborted = false;
+        let mut interrupted = 0;
 
         loop {
-            match event_rx.blocking_recv() {
+            let Some(next) = self.next_event(&mut event_rx) else {
+                interrupted = sigwatch::pending();
+                break;
+            };
+            match next {
                 Some(LlmEvent::AssistantToolCalls { message }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
@@ -827,6 +840,14 @@ impl PengyCli {
             }
         }
 
+        if interrupted != 0 {
+            // The watcher has already killed the tool's process group.  Stop
+            // the turn's task too; an in-flight API request is just dropped.
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            task.abort();
+            eprint!("\r{}\r", " ".repeat(40));
+        }
+
         // An abort or an error leaves the loop mid-turn, where the last
         // assistant message can hold tool_calls with no result behind them
         // (the API 400s on that next request).  Repair, then persist what the
@@ -835,6 +856,41 @@ impl PengyCli {
             if let Some(chat) = self.current_chat.as_mut() {
                 chat.messages = chat_manager::clean_dangling_tool_calls(&chat.messages);
                 chat_manager::save_chat(chat).ok();
+            }
+        }
+
+        if interrupted != 0 {
+            if sigwatch::terminates(interrupted) {
+                // Die by the signal rather than exiting 0: a caller that
+                // stopped us must not read the run as a success.
+                let message = format!("Interrupted by {}.", sigwatch::name(interrupted));
+                if self.output_mode == "json" {
+                    println!("{}", serde_json::json!({"error": {"type": "interrupted", "message": message}}));
+                }
+                eprintln!("\n{message}");
+                sigwatch::die(interrupted);
+            }
+            println!("{}Interrupted.{}", DIM, RESET);
+        }
+    }
+
+    /// The next event from the turn's task, or `None` once a signal arrived.
+    ///
+    /// Polls instead of `blocking_recv` so a signal is noticed within 100 ms
+    /// even while a request or a tool is still running.
+    fn next_event(
+        &self,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<LlmEvent>,
+    ) -> Option<Option<LlmEvent>> {
+        loop {
+            if sigwatch::pending() != 0 {
+                return None;
+            }
+            let poll = async {
+                tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+            };
+            if let Ok(event) = self.rt.block_on(poll) {
+                return Some(event);
             }
         }
     }
