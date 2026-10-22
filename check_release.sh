@@ -25,7 +25,35 @@ echo "  build_deb.sh:    auto-detected from Cargo.toml → $DEB_DERIVED"
 if [ -n "$CARGO_VER" ]; then
     ok "Version: $CARGO_VER (single source of truth in Cargo.toml)"
 else
-    warn "Could not parse version from Cargo.toml"
+    fail "Could not parse version from Cargo.toml"
+fi
+
+# The number also lives in gui/Info.plist (TWO keys) and in three Cargo.lock
+# entries. All of them have drifted before, and a wrong Info.plist is invisible
+# until someone runs the .dmg. Compare each against Cargo.toml.
+PLIST_VERS=$(awk '/<key>CFBundleVersion<\/key>|<key>CFBundleShortVersionString<\/key>/ { getline; gsub(/^[[:space:]]*<string>|<\/string>[[:space:]]*$/, ""); print }' gui/Info.plist | sort -u)
+echo "  gui/Info.plist:  $(echo $PLIST_VERS)"
+if [ "$PLIST_VERS" = "$CARGO_VER" ]; then
+    ok "Info.plist agrees ($CARGO_VER, both keys)"
+else
+    fail "Info.plist version drift — $(echo $PLIST_VERS) != $CARGO_VER"
+fi
+
+# Only the workspace members carry the app version; crates.io crates sit on the
+# same numbers (regex 1.12.4, imgref 1.12.2) and must never be caught by this.
+LOCK_VERS=$(awk '
+  /^name = "pengy/ { n=$0; sub(/^name = "/,"",n); sub(/"$/,"",n); want=1; next }
+  want && /^version = "/ { v=$0; sub(/^version = "/,"",v); sub(/"$/,"",v); print n "=" v; want=0 }
+' Cargo.lock)
+echo "  Cargo.lock:      $(echo $LOCK_VERS | tr '\n' ' ')"
+LOCK_BAD=$(echo "$LOCK_VERS" | grep -v "=$CARGO_VER$" || true)
+LOCK_COUNT=$(echo "$LOCK_VERS" | grep -c "=" || true)
+if [ -n "$LOCK_BAD" ]; then
+    fail "Cargo.lock version drift (want $CARGO_VER): $(echo $LOCK_BAD | tr '\n' ' ')"
+elif [ "$LOCK_COUNT" -ne 3 ]; then
+    warn "Expected 3 pengy* entries in Cargo.lock, found $LOCK_COUNT"
+else
+    ok "Cargo.lock agrees (pengy-core/cli/web = $CARGO_VER)"
 fi
 
 # ── 2. Icon dimensions ──────────────────────────────────────────────
@@ -112,7 +140,6 @@ if [ -f target/release/libpengy_core.rlib ] || [ -f target/release/libpengy_core
     ok "Rust core already built (skipping rebuild)"
 else
     echo "  Building Rust workspace..."
-    cargo build --release --workspace > /tmp/pengyr_build.log 2>&1
     if cargo build --release --workspace > /tmp/pengyr_build.log 2>&1; then
         ok "Rust workspace built successfully"
     else
@@ -149,8 +176,8 @@ done
 
 # ── 10. Rust tests ──────────────────────────────────────────────────
 echo "--- Rust tests ---"
-if cargo test --quiet > /tmp/pengyr_tests.log 2>&1; then
-    ok "cargo test passes"
+if cargo test --workspace --quiet > /tmp/pengyr_tests.log 2>&1; then
+    ok "cargo test --workspace passes"
 else
     warn "cargo test failed — check /tmp/pengyr_tests.log"
     tail -5 /tmp/pengyr_tests.log
