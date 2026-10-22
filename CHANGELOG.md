@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.12.5
 
 - **HTTPS trusts the operating system's roots, not a copy compiled into the binary.** reqwest was built with `rustls-tls`, which embeds webpki-roots: a frozen copy of the Mozilla list that kept trusting `emSign ECC Root CA - G3` after the eMudhra compromise (2026-10) had distros remove it. The core, CLI and web crates now use `rustls-tls-native-roots`, so the LLM client, downloads and fetches verify against the OS store (`/etc/ssl/certs` on Linux, the system store on Windows and macOS) and pick up future removals with OS updates. primp (web search) cannot be limited to native roots — it always merges its own webpki list — so `Cargo.lock` moves webpki-roots 1.0.8 → 1.0.10, the first release without that root. `pengy-cli`, `pengy-web` and `libpengy_core.a` no longer contain it.
 
