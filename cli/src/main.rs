@@ -59,6 +59,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/attach",
     "/attachments",
     "/compact",
+    "/auto-compact",
     "/redact",
     "/tasks",
     "/task",
@@ -69,7 +70,7 @@ const SLASH_COMMANDS: &[&str] = &[
 ];
 
 /// Sub-arguments worth completing once the command is fully typed.
-const SLASH_ARGS: &[(&str, &[&str])] = &[("/yolo", &["all", "safe", "none"])];
+const SLASH_ARGS: &[(&str, &[&str])] = &[("/yolo", &["all", "safe", "none"]), ("/auto-compact", &["off", "auto", "262144", "1048576"])];
 
 #[derive(Clone)]
 struct PengyHelper;
@@ -1152,6 +1153,7 @@ impl PengyCli {
             "/attach" => self.cmd_attach(),
             "/attachments" => self.cmd_attachments(),
             "/compact" => self.cmd_compact(),
+            "/auto-compact" => self.cmd_auto_compact(args),
             "/redact" => self.cmd_redact(args),
             "/tasks" => self.cmd_tasks(),
             "/task" => self.cmd_task(args),
@@ -1195,6 +1197,7 @@ impl PengyCli {
             ("/yolo [all|safe|none]", "Set tool confirmation mode"),
             ("/system [message...]", "Show or set the system message"),
             ("/compact", "Compact context by eliding old tool results"),
+            ("/auto-compact [off|auto|tokens] [percent]", "Show/set selected-model proactive compaction; percent is shared"),
             (
                 "/redact [N]",
                 "Delete the last N messages (default 1) — repeatable up to the top",
@@ -1956,6 +1959,24 @@ impl PengyCli {
             "{}User agent changed:{} {} -> {}{}{}",
             GREEN, RESET, old, BOLD, self.config.user_agent, RESET
         );
+    }
+
+    fn cmd_auto_compact(&mut self, args: &[&str]) {
+        let model = self.current_chat.as_ref().and_then(|c|c.model.clone()).filter(|s|!s.is_empty()).unwrap_or_else(||self.config.model.clone());
+        if !args.is_empty() {
+            let result = (|| -> Result<(),String> {
+                if args.len()>2 { return Err("Usage: /auto-compact [off|auto|tokens] [percent]".into()); }
+                let mode = if ["off","auto"].contains(&args[0]) {args[0]} else {"explicit"};
+                let window = if mode=="explicit" {args[0].parse::<u64>().map_err(|_|"Invalid window; use off, auto, or positive tokens")?} else {0};
+                let percent = if args.len()==2 {Some(args[1].parse::<u64>().map_err(|_|"Invalid threshold")?)} else {None};
+                config::set_compaction_policy(&mut self.config,&model,mode,window,percent)?;
+                self.save_config();Ok(())
+            })();
+            if let Err(error)=result {println!("{error}");return;}
+        }
+        let (mode,window)=config::compaction_policy(&self.config,&model);
+        let label=if mode=="explicit" {format!("explicit {window} tokens")}else{mode};
+        println!("Proactive compaction for {}: {label}; threshold {}%. Reactive recovery unchanged.",if model.is_empty(){"(no model selected)"}else{&model},self.config.compact_at_percent);
     }
 
     fn cmd_context_keep(&mut self, args: &[&str]) {

@@ -2231,6 +2231,10 @@ struct SettingsForm {
     tool_output_max_chars: Option<String>,
     download_max_mb: Option<String>,
     context_keep_turns: Option<String>,
+    compaction_model: Option<String>,
+    compaction_mode: Option<String>,
+    compaction_window: Option<String>,
+    compact_at_percent: Option<String>,
 }
 
 async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
@@ -2295,10 +2299,21 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
         }
     }
 
+    if let Some(mode)=&form.compaction_mode {
+        let selected=form.compaction_model.as_deref().unwrap_or(&config.model).trim().to_string();
+        let result=(|| -> Result<(),String> {
+            if selected!=config.model {return Err("Compaction model does not match selected model".into());}
+            let window=if mode=="explicit" {form.compaction_window.as_deref().unwrap_or("0").parse::<u64>().map_err(|_|"Invalid window")?}else{0};
+            let percent=form.compact_at_percent.as_deref().map(|s|s.parse::<u64>().map_err(|_|"Invalid threshold".to_string())).transpose()?;
+            let selected=selected.to_string();
+            config::set_compaction_policy(&mut config,&selected,mode,window,percent)
+        })();
+        if let Err(error)=result {return (StatusCode::BAD_REQUEST,error).into_response();}
+    }
     config::save_config(&config).ok();
 
     let chats = chat_manager::load_index();
-    Html(templates::settings_page(&config, &chats, true))
+    Html(templates::settings_page(&config, &chats, true)).into_response()
 }
 
 // ── Base64 decode helper ─────────────────────────────────────────
@@ -4260,6 +4275,8 @@ function submitQuestion(override) {{
     }
 
     pub fn settings_page(config: &Config, chats: &[ChatSummary], saved: bool) -> String {
+        let compaction_json=serde_json::json!({"context_window":config.context_window,"context_windows":config.context_windows,"context_window_modes":config.context_window_modes,"context_window_auto":config.context_window_auto}).to_string().replace('<',"\\u003c").replace('>',"\\u003e").replace('&',"\\u0026");
+        let compaction_controls=include_str!("../templates/compaction-settings.html").replace("{{COMPACTION_JSON}}",&compaction_json).replace("{{COMPACT_PERCENT}}",&config.compact_at_percent.to_string());
         let sidebar = {
             let mut html = String::new();
             for c in chats {
@@ -4372,6 +4389,7 @@ function submitQuestion(override) {{
         </div>
         <div id="modelsList" class="mt-2 d-none"></div>
       </div>
+      {compaction_controls}
       <div class="mb-3">
         <label class="form-label fw-semibold">Tool Confirmation</label>
         <select name="tool_confirmation" class="form-select">
@@ -4463,6 +4481,7 @@ async function fetchModels() {{
         badge.textContent = m;
         badge.addEventListener('click', () => {{
           document.getElementById('modelInput').value = m;
+          document.getElementById('modelInput').dispatchEvent(new Event('change'));
           list.querySelectorAll('.badge').forEach(b => b.classList.remove('active', 'fw-bold'));
           badge.classList.add('active', 'fw-bold');
         }});
@@ -5144,6 +5163,16 @@ mod tests {
         let data:serde_json::Value=serde_json::from_str(&sse_event_to_json(&ev)).unwrap();
         assert_eq!(data["reason"],"proactive");
         assert_eq!(data["message"],"Compacting before the window fills");
+    }
+
+    #[test]
+    fn settings_page_exposes_compaction_modes_and_escapes_model_keys() {
+        let mut c=Config::default();c.model="local".into();c.context_window_modes.insert("local".into(),"off".into());
+        c.context_windows.insert("</script><script>bad()</script>".into(),1048576);
+        let page=templates::settings_page(&c,&[],false);
+        for field in ["compaction_mode","compaction_window","compact_at_percent","Auto-discover"] {assert!(page.contains(field));}
+        assert!(!page.contains("</script><script>bad()"));
+        assert!(page.contains("\\u003c/script"));
     }
 
 }

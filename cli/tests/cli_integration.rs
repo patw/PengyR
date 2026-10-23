@@ -701,3 +701,17 @@ fn single_shot_no_save_does_not_touch_disk() {
         .unwrap_or(false);
     assert!(!has_any_chat);
 }
+
+#[test]
+fn auto_compact_command_is_per_model_and_does_not_change_reactive_recovery() {
+    let h=Harness::new();
+    std::fs::write(h.config_path().join("settings.json"),r#"{"model":"local","auto_context_recovery":true,"context_windows":{"fast":1048576}}"#).unwrap();
+    let output=h.run(&["/auto-compact", "/auto-compact 262144 80", "/auto-compact off", "/auto-compact auto"]);
+    assert!(output.contains("Proactive compaction"),"{output}");
+    let c:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(h.config_path().join("settings.json")).unwrap()).unwrap();
+    assert_eq!(c["context_window_modes"]["local"],"auto");assert_eq!(c["context_windows"]["local"],262144);
+    assert_eq!(c["context_windows"]["fast"],1048576);assert_eq!(c["compact_at_percent"],80);assert_eq!(c["auto_context_recovery"],true);
+    h.run(&["/auto-compact 0", "/auto-compact off 101", "/auto-compact invalid"]);
+    let after:serde_json::Value=serde_json::from_str(&std::fs::read_to_string(h.config_path().join("settings.json")).unwrap()).unwrap();assert_eq!(after,c);
+    assert!(h.run(&["/help"]).contains("/auto-compact"));
+}

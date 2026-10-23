@@ -1,4 +1,5 @@
 #include "settingsdialog.h"
+#include "compactionsettings.h"
 #include "pengy_ffi.h"
 #include <QVBoxLayout>
 #include <QFormLayout>
@@ -183,6 +184,9 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_llmTimeout->setValue(config["llm_timeout"].toInt(300));
     llmForm->addRow(labelWithTip("LLM timeout:", "HTTP timeout in seconds for each LLM API request. Increase if your model is slow to respond."), m_llmTimeout);
 
+    m_compaction = new CompactionSettings(config, m_model);
+    llmForm->addRow(m_compaction);
+
     tabs->addTab(llmTab, "LLM");
 
     // ── Tools tab ───────────────────────────────────────────────
@@ -310,6 +314,7 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["tool_timeout"] = m_toolTimeout->value();
         m_config["tool_output_max_chars"] = m_toolOutputMax->value();
         m_config["download_max_mb"] = m_downloadMax->value();
+        m_config = m_compaction->apply(m_config);
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

@@ -121,13 +121,16 @@ fn siblings(base: &str) -> String {
         .unwrap_or(base.trim_end_matches('/'))
         .into()
 }
-/// Explicit override (including model zero) always wins. Never probe when off.
+/// Per-model mode wins, then legacy explicit window overrides. Never probe when off.
 pub async fn resolve(
     base: &str,
     model: &str,
     key: &str,
     options: &crate::context_recovery::Options,
 ) -> Option<Window> {
+    let mode = options.context_window_modes.get(model).map(String::as_str);
+    if mode == Some("off") { return None; }
+    if mode != Some("auto") {
     if let Some(&tokens) = options.context_windows.get(model) {
         return (tokens > 0).then_some(Window {
             tokens,
@@ -140,7 +143,8 @@ pub async fn resolve(
             input_only: false,
         });
     }
-    if !options.enabled || !options.window_auto {
+    }
+    if !options.enabled || (!options.window_auto && mode != Some("auto")) {
         return None;
     }
     let path = route(base, model);
@@ -263,6 +267,13 @@ pub fn remember_error(base: &str, model: &str, message: &str) -> Option<Window> 
 mod tests {
     use super::*;
     use serde_json::json;
+    #[tokio::test]
+    async fn per_model_off_and_auto_do_not_change_global_or_other_models() {
+        let mut o=crate::context_recovery::Options::default();o.context_window=1048576;
+        o.context_window_modes.insert("local".into(),"off".into());
+        assert!(resolve("http://localhost:1/v1","local","",&o).await.is_none());
+        assert_eq!(resolve("http://localhost:1/v1","fast","",&o).await.unwrap().tokens,1048576);
+    }
     #[test]
     fn current_model_shapes_and_route_prefixes() {
         let body = json!({"data":[{"id":"local","meta":{"n_ctx":262144}},{"id":"fast","context_window":1048576},{"id":"constrained","max_input_tokens":131072}]});

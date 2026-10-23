@@ -1075,7 +1075,9 @@ pub async fn chat(
                         }
 
                         if is_context_limit_error(code, &body, detail) {
-                            if recovery.options.enabled && recovery.options.window_auto && recovery.options.context_window == 0 && !recovery.options.context_windows.contains_key(model) {
+                            let mode = recovery.options.context_window_modes.get(model).map(String::as_str);
+                            let discovery_on = mode == Some("auto") || (mode != Some("off") && recovery.options.window_auto && recovery.options.context_window == 0 && !recovery.options.context_windows.contains_key(model));
+                            if recovery.options.enabled && discovery_on {
                                 let message = body["error"]["message"].as_str().unwrap_or(detail);
                                 if let Some(discovered) = crate::context_windows::remember_error(base_url, model, message) { window = Some(discovered); pressure.set_window(discovered.tokens); }
                             }

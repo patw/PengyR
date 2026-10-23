@@ -157,6 +157,11 @@ endif()
 option(PENGY_BUILD_TESTS "Build lightweight Qt GUI tests" OFF)
 if(PENGY_BUILD_TESTS)
   enable_testing()
+  find_package(Qt6 REQUIRED COMPONENTS Test)
+  add_executable(pengy_compaction_settings_test tests/test_compactionsettings.cpp)
+  target_include_directories(pengy_compaction_settings_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_compaction_settings_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Test)
+  add_test(NAME pengy_compaction_settings_test COMMAND pengy_compaction_settings_test)
   add_executable(pengy_chatview_markdown_test
     tests/test_chatview_markdown.cpp chatview.cpp
   )

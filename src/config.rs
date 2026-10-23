@@ -64,6 +64,8 @@ pub struct Config {
     #[serde(default)]
     pub context_windows: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
+    pub context_window_modes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
     pub context_window_auto: bool,
     #[serde(default = "default_compact_at_percent")]
     pub compact_at_percent: u64,
@@ -201,6 +203,7 @@ impl Default for Config {
             output_token_parameter: default_output_token_parameter(),
             context_window: 0,
             context_windows: Default::default(),
+            context_window_modes: Default::default(),
             context_window_auto: false,
             compact_at_percent: default_compact_at_percent(),
             empty_reply_thinking_off: String::new(),
@@ -338,6 +341,7 @@ pub fn load_config() -> Config {
                     if let Some(b) = obj.get("context_window_auto").and_then(|v| v.as_bool()) { config.context_window_auto = b; }
                     if let Some(n) = obj.get("compact_at_percent").and_then(|v| v.as_u64()) { config.compact_at_percent = n; }
                     if let Some(v) = obj.get("context_windows") { config.context_windows = serde_json::from_value(v.clone()).unwrap_or_default(); }
+                    if let Some(v) = obj.get("context_window_modes") { config.context_window_modes = serde_json::from_value(v.clone()).unwrap_or_default(); }
                     if let Some(s) = obj.get("empty_reply_thinking_off").and_then(|v| v.as_str()) { config.empty_reply_thinking_off = s.into(); }
                     if let Some(v) = obj.get("empty_reply_thinking_off_models") { config.empty_reply_thinking_off_models = serde_json::from_value(v.clone()).unwrap_or_default(); }
                     let known = serde_json::to_value(Config::default()).unwrap();
@@ -581,6 +585,7 @@ mod tests {
             output_token_parameter: default_output_token_parameter(),
             context_window: 0,
             context_windows: Default::default(),
+            context_window_modes: Default::default(),
             context_window_auto: false,
             compact_at_percent: default_compact_at_percent(),
             empty_reply_thinking_off: String::new(),
@@ -698,6 +703,21 @@ mod tests {
         assert_eq!(c2.model, "test-model");
     }
     #[test]
+    fn per_model_policy_modes_preserve_other_models_and_reactive_recovery() {
+        let mut c=Config::default();c.model="local".into();c.context_windows.insert("fast".into(),1048576);
+        set_compaction_policy(&mut c,"local","explicit",262144,Some(80)).unwrap();
+        assert_eq!(compaction_policy(&c,"local"),("explicit".into(),262144));
+        set_compaction_policy(&mut c,"local","off",0,None).unwrap();
+        assert_eq!(c.context_windows["local"],262144);assert_eq!(c.context_windows["fast"],1048576);
+        assert!(c.auto_context_recovery);assert!(!c.context_window_auto);
+        set_compaction_policy(&mut c,"local","auto",0,None).unwrap();
+        assert_eq!(compaction_policy(&c,"local").0,"auto");
+        assert!(set_compaction_policy(&mut c,"local","explicit",0,None).is_err());
+        assert!(set_compaction_policy(&mut c,"local","off",0,Some(101)).is_err());
+        assert!(set_compaction_policy(&mut c,"","auto",0,None).is_err());
+    }
+
+    #[test]
     fn proactive_defaults_and_future_settings_roundtrip() {
         let c: Config = serde_json::from_value(serde_json::json!({
             "context_window":262144,"context_windows":{"fast":1048576,"constrained":131072,"off":0},
@@ -716,4 +736,21 @@ mod tests {
         assert!(defaults.empty_reply_thinking_off.is_empty());
     }
 
+}
+
+pub fn compaction_policy(config: &Config, model: &str) -> (String, u64) {
+    let window = config.context_windows.get(model).copied().unwrap_or(config.context_window);
+    let mode = config.context_window_modes.get(model).filter(|s| ["off","auto","explicit"].contains(&s.as_str())).cloned()
+        .unwrap_or_else(|| if window>0 {"explicit".into()} else if config.context_windows.contains_key(model) || !config.context_window_auto {"off".into()} else {"auto".into()});
+    (mode, window)
+}
+pub fn set_compaction_policy(config: &mut Config, model: &str, mode: &str, window: u64, percent: Option<u64>) -> Result<(), String> {
+    if model.trim().is_empty() {return Err("Select a model before changing proactive compaction".into());}
+    if !["off","auto","explicit"].contains(&mode) {return Err("Mode must be off, auto, or explicit".into());}
+    if mode=="explicit" && !(1..=2147483647).contains(&window) {return Err("Explicit window must be 1–2147483647 tokens".into());}
+    if percent.is_some_and(|p| !(1..=100).contains(&p)) {return Err("Threshold must be 1–100 percent".into());}
+    config.context_window_modes.insert(model.into(), mode.into());
+    if mode=="explicit" {config.context_windows.insert(model.into(),window);}
+    if let Some(p)=percent {config.compact_at_percent=p;}
+    Ok(())
 }
