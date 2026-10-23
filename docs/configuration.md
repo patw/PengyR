@@ -25,6 +25,19 @@ PengyR stores its settings in `~/.config/pengy/settings.json`. This file is shar
 | `theme_mode` | string | `system` | GUI only. `system` (follow OS), `light`, or `dark`. |
 | `theme_accent` | string | `default` | GUI only. `default`, `blue`, `teal`, `green`, `orange`, `red`, `pink`, or `purple`. |
 
+## Context pressure and reply recovery (all editions)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `context_window` | uint | `0` | Explicit combined window in tokens. Zero is off unless discovery is explicitly opted in. |
+| `context_windows` | map<string,uint> | `{}` | Per-model override, including zero to disable that model. Examples: local 262144, fast 1048576, constrained local 131072. |
+| `context_window_auto` | bool | `false` | Opt into bounded, route-cached discovery when no explicit override applies. |
+| `compact_at_percent` | uint | `75` | Proactive prompt threshold percentage, 1–100. An explicit output reserve may lower it. |
+| `empty_reply_thinking_off` | string | `""` | One reasoning-only empty-stop retry: `reasoning_effort` or `enable_thinking`, only when supported. Empty disables. |
+| `empty_reply_thinking_off_models` | map<string,string> | `{}` | Per-model thinking-off mechanism override; empty disables that model. |
+
+These advanced fields are edited in JSON; no model table or legacy context-window default is used. Without valid reported usage, the first request stays reactive. Full policy, bootstrap, hysteresis, budget and parity caveats: [context recovery](context-recovery.md).
+
 ## Web-only settings
 
 | Field | Type | Default | Description |

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Rust-first opt-in proactive context compaction using provider-reported prompt usage; explicit per-model/global windows and bounded optional discovery, output reserve, hysteresis, and reserved reactive budget. No tokenizer or legacy model assumptions; first uncalibrated requests stay reactive. Full transcript remains unchanged.
+- Live Strata 256K validation: history summary and a 249K-character mid-turn tool result fit without errors; the identical unreduced tool view was rejected at 405K tokens. Window discovery and conservative parsing of Strata’s exact overflow message are tested.
+- Bounded summary requests use an explicitly configured thinking-off mechanism: live DeepSeek Flash testing exposed reasoning exhausting the 2,048-token summary allowance. Unknown providers remain unchanged.
+- One additional reduction retry for long length stops with no requested output cap; configured one-shot thinking-off retry for reasoning-only empty stop replies. Truncated tools are never executed and discarded usage is counted.
+- Preserve unknown shared configuration settings; forward proactive reason/message through web SSE without a duplicate assistant notice. Python/C++ behavior and shared fixtures now match.
+
 ## v1.12.5
 
 - **HTTPS trusts the operating system's roots, not a copy compiled into the binary.** reqwest was built with `rustls-tls`, which embeds webpki-roots: a frozen copy of the Mozilla list that kept trusting `emSign ECC Root CA - G3` after the eMudhra compromise (2026-10) had distros remove it. The core, CLI and web crates now use `rustls-tls-native-roots`, so the LLM client, downloads and fetches verify against the OS store (`/etc/ssl/certs` on Linux, the system store on Windows and macOS) and pick up future removals with OS updates. primp (web search) cannot be limited to native roots — it always merges its own webpki list — so `Cargo.lock` moves webpki-roots 1.0.8 → 1.0.10, the first release without that root. `pengy-cli`, `pengy-web` and `libpengy_core.a` no longer contain it.

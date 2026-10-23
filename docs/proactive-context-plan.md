@@ -1,0 +1,21 @@
+# Proactive context compaction — Rust-first implementation
+
+Approved by Pat 2026-10-23. Target workload: 256K–1M windows; constrained local models can use 128K. No legacy model defaults or model-specific tokenizer assumptions.
+
+## Contract
+
+- Default unchanged: `context_window=0`, `context_windows={}`, `context_window_auto=false`, `compact_at_percent=75`. Per-model override wins (including zero); positive global wins over discovery. Auto mode explicitly permits discovery when the global value is zero. Explicit windows represent combined input/output budgets.
+- Learn from positive per-request `usage.prompt_tokens` paired with actual sent text/schema/argument characters. No sample means send normally; reactive recovery remains available. No warm-up/count request or hardcoded divisor. In-process, validated per-chat/per-route calibration survives user turns; restart/reopened uncached chats bootstrap again. Missing usage never becomes a zero sample. Multimodal requests do not calibrate a text-only estimator.
+- Estimate using ceiling integer arithmetic. Include actual provider messages/tool definitions, exclude HTTP JSON escaping and non-input controls. A last-average density is approximate, particularly for prose-to-log shifts.
+- Check once per outer request/tool round. One step at most per request; at most two proactive commits per user run, sharing four total reductions, reserving at least two reactive reductions. Preserve existing attempt-four summary priority. Proactive summary calls may use at most eight of the sixteen summary-call budget, leaving eight for reactive recovery.
+- Trigger at `min(floor(window*percent/100), window-output_limit)` for combined windows; input-only discoveries do not subtract output reserve. Reject explicit output_limit >= combined window. Unknown window/no sample/no reducing plan sends anyway.
+- After a reduction below threshold, rearm at threshold + ceil(5% window). If still over threshold, allow another step on a subsequent request. At the hard input budget bypass hysteresis. Reactive recovery ignores hysteresis. Failed proactive summaries commit nothing, suppress further proactive summaries that run, and permit the original request unless cancelled.
+- Discovery is opt-in and bounded: exact selected-model `/models` metadata first, then endpoint `/props` and `/health` when model binding is provable. Preserve base-path prefixes; append `/models` to API base and remove only terminal `/v1` for sibling endpoints. Short total deadline, route cache TTL and negative cache, atomic per-route cache files. Structured model metadata preferred to conservatively parsed explicit context-error limits.
+- `ContextCompacted.reason="proactive"` and a truthful pre-request message; legacy events omit reason. CLI/Qt keep messages; web forwards message/reason and renders one notice.
+- Long `length` stops with no configured output limit get at most one additional reduction retry/run. Existing short/empty policy remains. Never persist/execute truncated replies or replay completed tools.
+- Reasoning-only empty `stop` replies get one retry/run only when configured via `empty_reply_thinking_off` (global string or per-model map): `reasoning_effort` sends `"none"`; `enable_thinking` sends template kwargs false. Default disabled for unknown providers. No persisted blank reply, no saved setting mutation, all discarded usage accounted. Live fast validation also showed bounded summaries exhausting their allowance on reasoning: summary calls use the same explicitly configured thinking-off mechanism; unknown providers and ordinary conversation effort remain unchanged.
+- Provider view only; transcript untouched. No compaction sidecar without a successful plan or without chat ID. Config/cache failures never expose credentials.
+
+## Rollout
+
+Rust branch `feat/proactive-context-compaction`, off by default. Python/C++ behavioral parity implemented with shared settings and fixtures. Pat authorized feature-branch commit/push on 2026-10-23; no release/version bump or production settings changes. Add unknown-setting preservation in native editions before mixed-edition use; no version bump/push/release or production settings edits without follow-up approval. Live synthetic tests require isolated config and an explicitly authorized endpoint.

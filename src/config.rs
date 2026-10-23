@@ -58,6 +58,23 @@ pub struct Config {
     pub output_token_limit: u64,
     #[serde(default = "default_output_token_parameter")]
     pub output_token_parameter: String,
+    /// Explicit combined context window; zero disables proactive compaction unless auto is opted in.
+    #[serde(default)]
+    pub context_window: u64,
+    #[serde(default)]
+    pub context_windows: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub context_window_auto: bool,
+    #[serde(default = "default_compact_at_percent")]
+    pub compact_at_percent: u64,
+    /// Empty disables the bounded reasoning-only retry for unknown providers.
+    #[serde(default)]
+    pub empty_reply_thinking_off: String,
+    #[serde(default)]
+    pub empty_reply_thinking_off_models: std::collections::BTreeMap<String, String>,
+    /// Preserve settings owned by other editions and future versions.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     /// Number of recent user turns whose media is included in provider context.
     #[serde(default = "default_attachment_context_keep_turns")]
     pub attachment_context_keep_turns: usize,
@@ -128,6 +145,7 @@ fn default_system_message() -> String {
 fn default_tool_confirmation() -> String {
     "none".into()
 }
+fn default_compact_at_percent() -> u64 { 75 }
 fn default_auto_context_recovery() -> bool { true }
 fn default_recovery_keep_turns() -> usize { 3 }
 fn default_output_token_parameter() -> String { "max_tokens".into() }
@@ -181,6 +199,13 @@ impl Default for Config {
             recovery_keep_turns: 3,
             output_token_limit: 0,
             output_token_parameter: default_output_token_parameter(),
+            context_window: 0,
+            context_windows: Default::default(),
+            context_window_auto: false,
+            compact_at_percent: default_compact_at_percent(),
+            empty_reply_thinking_off: String::new(),
+            empty_reply_thinking_off_models: Default::default(),
+            extra: Default::default(),
             attachment_context_keep_turns: default_attachment_context_keep_turns(),
             ui_scale: default_ui_scale(),
             theme_mode: default_theme_mode(),
@@ -309,6 +334,14 @@ pub fn load_config() -> Config {
                     if let Some(n) = obj.get("recovery_keep_turns").and_then(|v| v.as_u64()) { config.recovery_keep_turns = n as usize; }
                     if let Some(n) = obj.get("output_token_limit").and_then(|v| v.as_u64()) { config.output_token_limit = n; }
                     if let Some(s) = obj.get("output_token_parameter").and_then(|v| v.as_str()) { config.output_token_parameter = s.into(); }
+                    if let Some(n) = obj.get("context_window").and_then(|v| v.as_u64()) { config.context_window = n; }
+                    if let Some(b) = obj.get("context_window_auto").and_then(|v| v.as_bool()) { config.context_window_auto = b; }
+                    if let Some(n) = obj.get("compact_at_percent").and_then(|v| v.as_u64()) { config.compact_at_percent = n; }
+                    if let Some(v) = obj.get("context_windows") { config.context_windows = serde_json::from_value(v.clone()).unwrap_or_default(); }
+                    if let Some(s) = obj.get("empty_reply_thinking_off").and_then(|v| v.as_str()) { config.empty_reply_thinking_off = s.into(); }
+                    if let Some(v) = obj.get("empty_reply_thinking_off_models") { config.empty_reply_thinking_off_models = serde_json::from_value(v.clone()).unwrap_or_default(); }
+                    let known = serde_json::to_value(Config::default()).unwrap();
+                    config.extra = obj.iter().filter(|(k, _)| known.get(*k).is_none()).map(|(k,v)| (k.clone(),v.clone())).collect();
                     if let Some(v) = obj.get("context_keep_turns") {
                         if let Some(n) = v.as_u64() {
                             config.context_keep_turns = n as usize;
@@ -546,6 +579,13 @@ mod tests {
             recovery_keep_turns: 3,
             output_token_limit: 0,
             output_token_parameter: default_output_token_parameter(),
+            context_window: 0,
+            context_windows: Default::default(),
+            context_window_auto: false,
+            compact_at_percent: default_compact_at_percent(),
+            empty_reply_thinking_off: String::new(),
+            empty_reply_thinking_off_models: Default::default(),
+            extra: Default::default(),
             attachment_context_keep_turns: 4,
             ui_scale: 150,
             theme_mode: "dark".into(),
@@ -657,4 +697,23 @@ mod tests {
         assert_eq!(c2.api_key, "sk-round-trip");
         assert_eq!(c2.model, "test-model");
     }
+    #[test]
+    fn proactive_defaults_and_future_settings_roundtrip() {
+        let c: Config = serde_json::from_value(serde_json::json!({
+            "context_window":262144,"context_windows":{"fast":1048576,"constrained":131072,"off":0},
+            "context_window_auto":true,"compact_at_percent":75,
+            "empty_reply_thinking_off_models":{"local":"reasoning_effort"},
+            "future_setting":{"keep":"me"},"open_tabs":["chat"]
+        })).unwrap();
+        assert_eq!(c.context_windows["fast"],1048576);
+        assert_eq!(c.context_windows["off"],0);
+        let json=serde_json::to_value(&c).unwrap();
+        assert_eq!(json["future_setting"]["keep"],"me");
+        assert_eq!(json["open_tabs"],serde_json::json!(["chat"]));
+        let defaults=Config::default();
+        assert_eq!(defaults.context_window,0); assert!(!defaults.context_window_auto);
+        assert!(defaults.context_windows.is_empty());assert_eq!(defaults.compact_at_percent,75);
+        assert!(defaults.empty_reply_thinking_off.is_empty());
+    }
+
 }

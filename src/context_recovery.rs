@@ -16,6 +16,14 @@ pub struct Options {
     pub chat_id: String,
     pub output_limit: u64,
     pub output_parameter: String,
+    pub context_window: u64,
+    pub context_windows: BTreeMap<String, u64>,
+    pub window_auto: bool,
+    pub compact_at_percent: u64,
+    pub thinking_off: String,
+    pub thinking_off_models: BTreeMap<String, String>,
+    #[cfg(test)]
+    pub checkpoint_dir: Option<PathBuf>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -25,6 +33,14 @@ impl Default for Options {
             chat_id: String::new(),
             output_limit: 0,
             output_parameter: "max_tokens".into(),
+            context_window: 0,
+            context_windows: BTreeMap::new(),
+            window_auto: false,
+            compact_at_percent: 75,
+            thinking_off: String::new(),
+            thinking_off_models: BTreeMap::new(),
+            #[cfg(test)]
+            checkpoint_dir: None,
         }
     }
 }
@@ -36,6 +52,14 @@ impl Options {
             chat_id: id.into(),
             output_limit: config.output_token_limit,
             output_parameter: config.output_token_parameter.clone(),
+            context_window: config.context_window,
+            context_windows: config.context_windows.clone(),
+            window_auto: config.context_window_auto,
+            compact_at_percent: config.compact_at_percent,
+            thinking_off: config.empty_reply_thinking_off.clone(),
+            thinking_off_models: config.empty_reply_thinking_off_models.clone(),
+            #[cfg(test)]
+            checkpoint_dir: None,
         }
     }
 }
@@ -206,8 +230,12 @@ fn apply(state: &State, messages: &[Value]) -> Vec<Value> {
 impl Recovery {
     pub fn new(messages: &[Value], endpoint: &str, model: &str, options: Options) -> Self {
         let path = (!options.chat_id.is_empty()).then(|| {
-            crate::config::pengy_config_dir()
-                .join("context_recovery")
+            {
+                #[cfg(test)]
+                { options.checkpoint_dir.clone().unwrap_or_else(|| crate::config::pengy_config_dir().join("context_recovery")) }
+                #[cfg(not(test))]
+                { crate::config::pengy_config_dir().join("context_recovery") }
+            }
                 .join(format!("{}.json", hash(&options.chat_id)))
         });
         let mut state = State {
@@ -256,6 +284,9 @@ impl Recovery {
             attempts: 0,
             summary_calls: 0,
         }
+    }
+    pub fn view_identity(&self) -> String {
+        hash(&serde_json::to_string(&self.state).unwrap())
     }
     pub fn apply(&self, messages: &[Value]) -> Vec<Value> {
         if self.options.enabled {

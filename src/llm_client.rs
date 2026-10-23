@@ -511,6 +511,8 @@ pub enum LlmEvent {
         max_attempts: u32,
         chars_removed: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
     /// A turn that failed for a reason the user has to act on.
@@ -901,6 +903,26 @@ pub async fn chat(
         return;
     }
     let mut recovery = Recovery::new(&serde_json::to_value(&current_messages).unwrap().as_array().unwrap(), base_url, model, options);
+    let mut window = crate::context_windows::resolve(base_url, model, api_key, &recovery.options).await;
+    if !(1..=100).contains(&recovery.options.compact_at_percent) {
+        emit_config_error(&event_tx, "compact_at_percent must be between 1 and 100".into()); return;
+    }
+    if window.is_some_and(|w| !w.input_only && recovery.options.output_limit >= w.tokens) {
+        emit_config_error(&event_tx, "output_token_limit must be smaller than the combined context_window".into()); return;
+    }
+    let thinking_off = recovery.options.thinking_off_models.get(model).unwrap_or(&recovery.options.thinking_off).clone();
+    if !["", "reasoning_effort", "enable_thinking"].contains(&thinking_off.as_str()) {
+        emit_config_error(&event_tx, "empty_reply_thinking_off must be empty, reasoning_effort, or enable_thinking".into()); return;
+    }
+    let pressure_key = if recovery.options.chat_id.is_empty() { String::new() } else {
+        serde_json::to_string(&[base_url, model, &recovery.options.chat_id]).unwrap()
+    };
+    let raw = serde_json::to_value(&current_messages).unwrap();
+    let mut pressure = crate::context_pressure::Pressure::load(&pressure_key, raw.as_array().unwrap(), &recovery.view_identity(), window.map(|w|w.tokens).unwrap_or(0));
+    let mut proactive_commits = 0u32;
+    let mut proactive_failed = false;
+    let mut long_length_retried = false;
+    let mut thinking_disabled = false;
     let mut image_rejected = crate::image_capabilities::images_rejected(base_url, model);
     let mut rejection_notice = CACHED_IMAGE_NOTICE.to_string();
     loop {
@@ -921,18 +943,41 @@ pub async fn chat(
         // Only this provider request is compacted. Events and persisted history
         // continue to use the unmodified current_messages.
         let mut request_messages = api_messages;
+        let tool_definitions = tools::tool_definitions_json();
+        if recovery.options.enabled && !proactive_failed && proactive_commits < 2 && recovery.attempts < 2 {
+            if let Some(w) = window {
+                let (threshold, hard) = crate::context_pressure::budgets(w.tokens, recovery.options.compact_at_percent, recovery.options.output_limit, w.input_only);
+                let estimate = pressure.estimate(crate::context_pressure::input_chars(&serde_json::to_value(&request_messages).unwrap(), &tool_definitions));
+                if pressure.should_compact(estimate, threshold, hard) {
+                    match recover_with_reason(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &event_tx, &cancel, &mut accumulated_usage, true).await {
+                        Ok(Some(event)) => {
+                            proactive_commits += 1;
+                            let _ = event_tx.send(event);
+                            let reduced: Vec<ChatMessage> = serde_json::from_value(serde_json::Value::Array(recovery.apply(raw.as_array().unwrap()))).unwrap();
+                            request_messages = provider_messages_with_images(&reduced, attachment_context_keep_turns, image_rejected, &rejection_notice);
+                            strip_cross_model_proxy_state(&mut request_messages, model);
+                            let after = pressure.estimate(crate::context_pressure::input_chars(&serde_json::to_value(&request_messages).unwrap(), &tool_definitions));
+                            pressure.compacted(after, threshold);
+                        }
+                        Err(_) | Ok(None) => { proactive_failed = true; }
+                    }
+                    if cancel.load(Ordering::Relaxed) { return; }
+                }
+            }
+        }
         let mut context_retries = 0;
         // Build API request payload
         let mut payload = serde_json::json!({
             "model": model,
             "messages": request_messages,
-            "tools": tools::tool_definitions_json(),
+            "tools": tool_definitions,
             "tool_choice": "auto",
         });
         if !reasoning_effort.is_empty() {
             payload["reasoning_effort"] = serde_json::Value::String(reasoning_effort.to_string());
         }
         if recovery.options.output_limit > 0 { payload[&recovery.options.output_parameter] = serde_json::json!(recovery.options.output_limit); }
+        if thinking_disabled { apply_thinking_off(&mut payload, &thinking_off); }
 
         // ── API call with 429 / 529 exponential backoff ──────────
         let (body_text, request_started) = {
@@ -1030,6 +1075,10 @@ pub async fn chat(
                         }
 
                         if is_context_limit_error(code, &body, detail) {
+                            if recovery.options.enabled && recovery.options.window_auto && recovery.options.context_window == 0 && !recovery.options.context_windows.contains_key(model) {
+                                let message = body["error"]["message"].as_str().unwrap_or(detail);
+                                if let Some(discovered) = crate::context_windows::remember_error(base_url, model, message) { window = Some(discovered); pressure.set_window(discovered.tokens); }
+                            }
                             if recovery.options.enabled {
                                 match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &event_tx, &cancel, &mut accumulated_usage).await {
                                     Ok(Some(event)) => {
@@ -1059,6 +1108,7 @@ pub async fn chat(
                                         max_attempts: MAX_CONTEXT_RETRIES,
                                         chars_removed: saved,
                                         message: None,
+                                        reason: None,
                                     });
                                     continue;
                                 }
@@ -1224,6 +1274,12 @@ pub async fn chat(
             }
         };
 
+        // Pair provider usage with the exact successful payload, including inner-loop reductions.
+        if recovery.options.enabled && window.is_some() {
+            pressure.record(crate::context_pressure::input_chars(&payload["messages"], &payload["tools"]), body["usage"]["prompt_tokens"].as_u64());
+            let raw = serde_json::to_value(&current_messages).unwrap();
+            pressure.save(&pressure_key, raw.as_array().unwrap(), &recovery.view_identity());
+        }
         // Accumulate usage
         if let Some(usage) = body["usage"].as_object() {
             accumulated_usage.prompt_tokens += usage
@@ -1250,7 +1306,10 @@ pub async fn chat(
             let has_tool_calls = tool_calls.is_some_and(|calls| !calls.is_empty());
             // The truncated reply is discarded unexecuted; a retry regenerates
             // it against a smaller provider view.
-            if length_suggests_context_pressure(&content, has_tool_calls, &body["usage"], recovery.options.output_limit) {
+            let short_or_empty = length_suggests_context_pressure(&content, has_tool_calls, &body["usage"], recovery.options.output_limit);
+            let extra_long_attempt = !short_or_empty && recovery.options.output_limit == 0 && !long_length_retried;
+            if short_or_empty || extra_long_attempt {
+                if extra_long_attempt { long_length_retried = true; }
                 match recover(&mut recovery, &current_messages, &client, &url, base_url, api_key, model, &event_tx, &cancel, &mut accumulated_usage).await {
                     Ok(Some(event)) => { let _ = event_tx.send(event); continue; }
                     Err(detail) => { let _ = event_tx.send(LlmEvent::Error { kind: "error".into(), message: detail }); return; }
@@ -1550,17 +1609,24 @@ pub async fn chat(
         // stored a blank assistant message that the next turn reads back as
         // something the model said.  Report it as the provider anomaly it is.
         if content.trim().is_empty() {
+            let has_reasoning = ["reasoning", "reasoning_content"].iter().any(|k| msg[*k].as_str().is_some_and(|v| !v.trim().is_empty()));
+            if choice["finish_reason"] == "stop" && has_reasoning && !thinking_disabled && !thinking_off.is_empty() {
+                thinking_disabled = true;
+                let _ = event_tx.send(LlmEvent::Retrying { attempt: 1, max_attempts: 1, delay_secs: 0.0, status_code: 200,
+                    message: "Reasoning-only empty reply; retrying once with thinking off".into(), reason: Some("empty".into()) });
+                let _ = event_tx.send(LlmEvent::RequestStarted { stage: "turn".into(), attempt: 2 });
+                continue;
+            }
             let _ = event_tx.send(LlmEvent::Error {
                 kind: ERROR_KIND_EMPTY.to_string(),
-                message: empty_reply_help(
-                    msg,
-                    choice["finish_reason"].as_str().unwrap_or(""),
-                    body["completion_tokens"].as_u64().or_else(|| {
-                        body.get("usage")
-                            .and_then(|u| u.get("completion_tokens"))
-                            .and_then(|v| v.as_u64())
-                    }),
-                ),
+                message: {
+                    let help = empty_reply_help(
+                        msg, choice["finish_reason"].as_str().unwrap_or(""),
+                        body["completion_tokens"].as_u64().or_else(|| body["usage"]["completion_tokens"].as_u64()),
+                    );
+                    if thinking_disabled { help.replace("Pengy did not retry: an empty answer is the endpoint's shape, not a blip.", "Pengy retried once with thinking off but still received no answer.") }
+                    else { help }
+                },
             });
             return;
         }
@@ -1592,12 +1658,29 @@ pub async fn chat(
     }
 }
 
+fn apply_thinking_off(payload: &mut serde_json::Value, mechanism: &str) {
+    match mechanism {
+        "reasoning_effort" => { payload["reasoning_effort"] = serde_json::json!("none"); }
+        "enable_thinking" => {
+            payload.as_object_mut().unwrap().remove("reasoning_effort");
+            payload["chat_template_kwargs"] = serde_json::json!({"enable_thinking":false});
+        }
+        _ => {}
+    }
+}
+
 /// Execute bounded, tool-free summary calls; commit only a smaller complete plan.
 async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &reqwest::Client,
                  url: &str, base_url: &str, key: &str, model: &str,
                  event_tx: &mpsc::UnboundedSender<LlmEvent>, cancel: &AtomicBool, usage: &mut Usage) -> Result<Option<LlmEvent>, String> {
+    recover_with_reason(recovery, messages, client, url, base_url, key, model, event_tx, cancel, usage, false).await
+}
+async fn recover_with_reason(recovery: &mut Recovery, messages: &[ChatMessage], client: &reqwest::Client,
+                 url: &str, base_url: &str, key: &str, model: &str,
+                 event_tx: &mpsc::UnboundedSender<LlmEvent>, cancel: &AtomicBool, usage: &mut Usage, proactive: bool) -> Result<Option<LlmEvent>, String> {
     let raw = serde_json::to_value(messages).unwrap();
     let Some(plan) = recovery.plan(raw.as_array().unwrap()) else { return Ok(None); };
+    if proactive && recovery.summary_calls + plan.chunks.len() > 8 { return Ok(None); }
     let mut summaries = vec![];
     // One wall-clock grace for the whole recovery: every chunk's summary calls
     // and their retries share it (see `RETRY_CHAIN_GRACE`).
@@ -1607,6 +1690,10 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
         recovery.summary_calls += 1;
         let mut payload = serde_json::json!({"model": model, "messages":[{"role":"system","content":SUMMARY_PROMPT},{"role":"user","content":chunk}]});
         payload[&recovery.options.output_parameter] = serde_json::json!(2048);
+        // Bounded summaries need answer tokens, not an exhausted reasoning allowance.
+        // Only use the mechanism explicitly configured for this endpoint/model.
+        let mechanism = recovery.options.thinking_off_models.get(model).unwrap_or(&recovery.options.thinking_off);
+        apply_thinking_off(&mut payload, mechanism);
         // The summary is part of this turn, so a provider timeout gets the same
         // retry budget here as the turn request -- a big conversation's prefill
         // is exactly what blows the configured timeout on a slow engine.
@@ -1689,7 +1776,8 @@ async fn recover(recovery: &mut Recovery, messages: &[ChatMessage], client: &req
     Ok(recovery.commit(plan,summaries,raw.as_array().unwrap())?.map(|v| LlmEvent::ContextCompacted {
         attempt:v["attempt"].as_u64().unwrap() as u32, max_attempts:4,
         chars_removed:v["chars_removed"].as_u64().unwrap() as usize,
-        message:v["message"].as_str().map(String::from),
+        reason: proactive.then(|| "proactive".into()),
+        message: if proactive { Some(format!("Compacting before the window fills — {} fewer characters. Full history retained.", v["chars_removed"])) } else { v["message"].as_str().map(String::from) },
     }))
 }
 
@@ -1821,7 +1909,7 @@ mod tests {
 
     #[test]
     fn context_event_serde() {
-        let event = LlmEvent::ContextCompacted { attempt: 1, max_attempts: 4, chars_removed: 9000, message: None };
+        let event = LlmEvent::ContextCompacted { attempt: 1, max_attempts: 4, chars_removed: 9000, message: None, reason: None };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(json, r#"{"type":"context_compacted","attempt":1,"max_attempts":4,"chars_removed":9000}"#);
         assert!(matches!(serde_json::from_str::<LlmEvent>(&json).unwrap(), LlmEvent::ContextCompacted { .. }));
@@ -2310,12 +2398,20 @@ mod loop_tests {
         reasoning_effort: &str,
         preserve_reasoning: bool,
     ) -> Driver {
+        start_chat_options(base_url, model, messages, mode, reasoning_effort, preserve_reasoning, crate::context_recovery::Options::default())
+    }
+    fn start_chat_options(
+        base_url: &str, model: &str, messages: Vec<ChatMessage>, mode: ToolConfirmation,
+        reasoning_effort: &str, preserve_reasoning: bool, options: crate::context_recovery::Options,
+    ) -> Driver {
         let (event_tx, rx) = mpsc::unbounded_channel();
         let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let base_url = base_url.to_string();
         let model = model.to_string();
         let effort = reasoning_effort.to_string();
+        let ctx = Arc::new(tools::ToolContext::new());
+        *ctx.recovery.lock().unwrap() = options;
         let handle = tokio::spawn(async move {
             chat(
                 &base_url,
@@ -2330,7 +2426,7 @@ mod loop_tests {
                 event_tx,
                 confirm_rx,
                 cancel,
-                Arc::new(tools::ToolContext::new()),
+                ctx,
             )
             .await;
         });
@@ -2594,9 +2690,10 @@ mod loop_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn long_partial_length_still_fails_safely_with_token_counts() {
+    async fn explicit_output_cap_long_partial_still_fails_safely_with_token_counts() {
         let (base, requests) = stub_server(vec![length_stop("A long partial answer", serde_json::Value::Null, 4096)]);
-        let mut d = start_chat(&base, recoverable_history(), ToolConfirmation::All, "", false);
+        let options = crate::context_recovery::Options { output_limit: 4096, ..Default::default() };
+        let mut d = start_chat_options(&base, "stub-model", recoverable_history(), ToolConfirmation::All, "", false, options);
         assert!(matches!(d.rx.recv().await.unwrap(), LlmEvent::Error { kind, message }
             if kind == "truncated" && message.contains("completion 4,096 tokens") && message.contains("did not retry automatically")));
         d.handle.await.unwrap();
@@ -3558,4 +3655,239 @@ mod loop_tests {
             other => panic!("expected ToolResult, got {other:?}"),
         }
     }
+    async fn drain(mut d: Driver) -> Vec<LlmEvent> {
+        let mut events=vec![];
+        while let Some(e)=tokio::time::timeout(std::time::Duration::from_secs(10),d.rx.recv()).await.expect("bounded stub turn") { events.push(e); }
+        d.handle.await.unwrap(); events
+    }
+    fn seed_pressure(base: &str, model: &str, messages: &[ChatMessage], options: &crate::context_recovery::Options, tokens: u64) {
+        let raw=serde_json::to_value(messages).unwrap();
+        let recovery=Recovery::new(raw.as_array().unwrap(),base,model,options.clone());
+        let provider=provider_messages_with_images(messages,4,false,CACHED_IMAGE_NOTICE);
+        let chars=crate::context_pressure::input_chars(&serde_json::to_value(provider).unwrap(),&tools::tool_definitions_json()).unwrap();
+        let key=serde_json::to_string(&[base,model,&options.chat_id]).unwrap();
+        let mut p=crate::context_pressure::Pressure::load(&key,raw.as_array().unwrap(),&recovery.view_identity(),options.context_window);
+        p.record(Some(chars),Some(tokens));p.save(&key,raw.as_array().unwrap(),&recovery.view_identity());
+    }
+
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_discovery_is_opt_in_and_matches_selected_model() {
+        let (base, req)=stub_server(vec![serde_json::json!({"data":[{"id":"stub-model","context_window":1048576}]})]);
+        let off=crate::context_recovery::Options::default();
+        assert!(crate::context_windows::resolve(&base,"stub-model","test-key",&off).await.is_none());
+        assert_eq!(req.lock().unwrap().len(),0);
+        let auto=crate::context_recovery::Options{window_auto:true,..Default::default()};
+        assert_eq!(crate::context_windows::resolve(&base,"stub-model","test-key",&auto).await.unwrap().tokens,1048576);
+        assert_eq!(req.lock().unwrap().len(),1);
+        assert_eq!(crate::context_windows::resolve(&base,"stub-model","test-key",&auto).await.unwrap().tokens,1048576);
+        assert_eq!(req.lock().unwrap().len(),1);
+        let explicit=crate::context_recovery::Options{context_window:262144,..auto.clone()};
+        assert_eq!(crate::context_windows::resolve(&base,"stub-model","test-key",&explicit).await.unwrap().tokens,262144);
+        let mut disabled=auto;disabled.context_windows.insert("stub-model".into(),0);
+        assert!(crate::context_windows::resolve(&base,"stub-model","test-key",&disabled).await.is_none());
+    }
+
+    #[tokio::test(flavor="multi_thread")]
+    async fn calibration_survives_user_turns_and_fast_stays_below_threshold() {
+        for (window,expect) in [(262144,true),(1048576,false)] {
+            let messages=recoverable_history();
+            let mut replies=vec![completion("first answer",serde_json::Value::Null,(200000,5))];
+            if expect{replies.push(completion("checkpoint",serde_json::Value::Null,(20,5)));}
+            replies.push(completion("second answer",serde_json::Value::Null,(100,5)));
+            let (base,req)=stub_server(replies);
+            let options=crate::context_recovery::Options{context_window:window,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+            let events=drain(start_chat_options(&base,"stub-model",messages.clone(),ToolConfirmation::All,"",false,options.clone())).await;
+            assert!(!events.iter().any(|e|matches!(e,LlmEvent::ContextCompacted{..})));
+            let mut next=messages;
+            if let Some(LlmEvent::FinalResponse{message:Some(m),..})=events.last(){next.push(m.clone());}else{panic!("{events:?}");}
+            next.push(user_msg("continue"));
+            let events=drain(start_chat_options(&base,"stub-model",next,ToolConfirmation::All,"",false,options)).await;
+            assert_eq!(events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{..})).count(),usize::from(expect));
+            assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{content,..}) if content=="second answer"));
+            assert_eq!(req.lock().unwrap().len(),if expect{3}else{2});
+        }
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn missing_usage_never_seeds_a_first_request_estimate() {
+        let mut first=completion("first answer",serde_json::Value::Null,(250000,5));
+        first.as_object_mut().unwrap().remove("usage");
+        let (base,req)=stub_server(vec![first,completion("second answer",serde_json::Value::Null,(250000,5))]);
+        let options=crate::context_recovery::Options{context_window:262144,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+        let mut messages=recoverable_history();
+        let events=drain(start_chat_options(&base,"stub-model",messages.clone(),ToolConfirmation::All,"",false,options.clone())).await;
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})));
+        messages.push(ChatMessage::new("assistant",Some(serde_json::json!("first answer"))));messages.push(user_msg("continue"));
+        let events=drain(start_chat_options(&base,"stub-model",messages,ToolConfirmation::All,"",false,options)).await;
+        assert!(!events.iter().any(|e|matches!(e,LlmEvent::ContextCompacted{..})));
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})));assert_eq!(req.lock().unwrap().len(),2);
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_budget_leaves_two_reactive_attempts_across_tool_rounds() {
+        let cases:Vec<serde_json::Value>=serde_json::from_str(include_str!("../tests/fixtures/context_recovery_reserve.json")).unwrap();
+        let messages:Vec<ChatMessage>=serde_json::from_value(cases[0]["messages"].clone()).unwrap();
+        let invalid=serde_json::json!({"path":"/file/that/does/not/exist"});
+        let tools=|id|completion("",serde_json::json!([tool_call(id,"read_file",&invalid)]),(260000,5));
+        let overflow=serde_json::json!({"error":{"code":"context_length_exceeded","message":"context length exceeded"}});
+        let (base,req)=stub_server_sequence(vec![(200,tools("one")),(200,tools("two")),(400,overflow.clone()),(400,overflow),(200,completion("checkpoint",serde_json::Value::Null,(20,5))),(200,completion("answer",serde_json::Value::Null,(100,5)))]);
+        let options=crate::context_recovery::Options{context_window:262144,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+        seed_pressure(&base,"stub-model",&messages,&options,260000);
+        let events=drain(start_chat_options(&base,"stub-model",messages,ToolConfirmation::All,"",false,options)).await;
+        let compact:Vec<_>=events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{..})).collect();
+        assert_eq!(compact.len(),4,"{events:?}");
+        for (i,e) in compact.iter().enumerate(){assert!(matches!(e,LlmEvent::ContextCompacted{attempt,..} if *attempt==i as u32+1));}
+        assert_eq!(compact.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{reason:Some(r),..} if r=="proactive")).count(),2);
+        assert_eq!(events.iter().filter(|e|matches!(e,LlmEvent::ToolRequest{..})).count(),2);
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})),"{events:?}");
+        assert_eq!(req.lock().unwrap().len(),6);
+    }
+
+    #[tokio::test(flavor="multi_thread")]
+    async fn impossible_output_reserve_is_rejected_before_a_request() {
+        let (base,req)=stub_server(vec![]);
+        let options=crate::context_recovery::Options{context_window:262144,output_limit:262144,..Default::default()};
+        let events=drain(start_chat_options(&base,"stub-model",vec![user_msg("answer")],ToolConfirmation::All,"",false,options)).await;
+        assert!(matches!(events.last(),Some(LlmEvent::Error{message,..}) if message.contains("must be smaller")));
+        assert_eq!(req.lock().unwrap().len(),0);
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_threshold_edges_unknown_and_no_plan() {
+        for (window,tokens,reduce) in [(262144,196608,true),(262144,196607,false),(0,250000,false)] {
+            let messages=recoverable_history();
+            let original=serde_json::to_value(&messages).unwrap();
+            let replies=if reduce {vec![completion("checkpoint",serde_json::Value::Null,(20,5)),completion("answer",serde_json::Value::Null,(100,5))]}else{vec![completion("answer",serde_json::Value::Null,(100,5))]};
+            let (base,req)=stub_server(replies);
+            let options=crate::context_recovery::Options{context_window:window,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+            let checkpoint_dir=options.checkpoint_dir.clone().unwrap();
+            seed_pressure(&base,"stub-model",&messages,&options,tokens);
+            let events=drain(start_chat_options(&base,"stub-model",messages.clone(),ToolConfirmation::All,"",false,options)).await;
+            let compact:Vec<_>=events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{..})).collect();
+            assert_eq!(compact.len(),usize::from(reduce));
+            if reduce {assert!(matches!(compact[0],LlmEvent::ContextCompacted{attempt:1,reason:Some(r),message:Some(m),..} if r=="proactive" && m.contains("before the window fills")));}
+            assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{content,..}) if content=="answer"),"{events:?}");
+            assert_eq!(req.lock().unwrap().len(),if reduce{2}else{1});
+            if !reduce { assert_eq!(std::fs::read_dir(&checkpoint_dir).unwrap().count(),0); }
+            if reduce {
+                let requests=req.lock().unwrap();
+                let source=requests[0]["messages"][1]["content"].as_str().unwrap();
+                assert!(!source.contains("current"));
+                let remaining=requests[1]["messages"].as_array().unwrap();
+                assert_eq!(remaining.last().unwrap()["content"],messages.last().unwrap().content.clone().unwrap());
+            }
+            assert_eq!(serde_json::to_value(messages).unwrap(),original);
+        }
+        let messages=vec![user_msg("protected active task")];
+        let (base,req)=stub_server(vec![completion("answer",serde_json::Value::Null,(200000,5))]);
+        let options=crate::context_recovery::Options{context_window:262144,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+        seed_pressure(&base,"stub-model",&messages,&options,200000);
+        let events=drain(start_chat_options(&base,"stub-model",messages,ToolConfirmation::All,"",false,options)).await;
+        assert!(!events.iter().any(|e|matches!(e,LlmEvent::ContextCompacted{..})));
+        assert_eq!(req.lock().unwrap().len(),1);
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_cold_start_sends_then_tool_round_compacts_without_reexecution() {
+        let dir=tempfile::tempdir().unwrap();let file=dir.path().join("logs.txt");
+        let logs="log line: id=1234567890; value=abcdefghijk\n".repeat(4000);
+        std::fs::write(&file,&logs).unwrap();
+        let args=serde_json::json!({"path":file});
+        let first=completion("",serde_json::json!([tool_call("tc1","read_file",&args)]),(180000,5));
+        let (base,req)=stub_server(vec![first,completion("answer",serde_json::Value::Null,(50000,5))]);
+        let messages=vec![user_msg("read logs")];
+        let options=crate::context_recovery::Options{context_window:262144,..Default::default()};
+        let events=drain(start_chat_options(&base,"stub-model",messages,ToolConfirmation::All,"",false,options)).await;
+        assert!(matches!(events.first(),Some(LlmEvent::AssistantToolCalls{..})),"{events:?}");
+        assert_eq!(events.iter().filter(|e|matches!(e,LlmEvent::ToolRequest{..})).count(),1);
+        assert!(events.iter().any(|e|matches!(e,LlmEvent::ToolResult{content,..} if content.contains("log line:"))));
+        assert_eq!(events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{reason:Some(r),..} if r=="proactive")).count(),1);
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})));
+        let req=req.lock().unwrap();assert_eq!(req.len(),2);
+        let body=req[1]["messages"].as_array().unwrap().iter().find(|m|m["role"]=="tool").unwrap()["content"].as_str().unwrap();
+        assert!(body.len()<10000);
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_failed_summary_sends_original_and_preserves_protected_turns() {
+        let messages=recoverable_history();
+        let (base,req)=stub_server_sequence(vec![(400,serde_json::json!({"error":"summary failed"})),(200,completion("answer",serde_json::Value::Null,(200000,5)))]);
+        let options=crate::context_recovery::Options{context_window:262144,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+        seed_pressure(&base,"stub-model",&messages,&options,200000);
+        let events=drain(start_chat_options(&base,"stub-model",messages.clone(),ToolConfirmation::All,"",false,options)).await;
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})),"{events:?}");
+        assert!(!events.iter().any(|e|matches!(e,LlmEvent::ContextCompacted{..})));
+        let req=req.lock().unwrap();assert_eq!(req.len(),2);
+        assert!(req[0].get("tools").is_none());
+        assert_eq!(req[1]["messages"],serde_json::to_value(provider_messages_with_images(&messages,4,false,CACHED_IMAGE_NOTICE)).unwrap());
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn proactive_one_step_preserves_reactive_400_path() {
+        let mut messages=recoverable_history();
+        messages[1].reasoning=Some(serde_json::json!("historical reasoning ".repeat(2000)));
+        let (base,req)=stub_server_sequence(vec![(400,serde_json::json!({"error":{"code":"context_length_exceeded","message":"maximum context length is 262144"}})),(200,completion("checkpoint",serde_json::Value::Null,(20,5))),(200,completion("answer",serde_json::Value::Null,(100,5)))]);
+        let options=crate::context_recovery::Options{context_window:262144,chat_id:uuid::Uuid::new_v4().to_string(),checkpoint_dir:Some(tempfile::tempdir().unwrap().keep()),..Default::default()};
+        seed_pressure(&base,"stub-model",&messages,&options,240000);
+        let events=drain(start_chat_options(&base,"stub-model",messages,ToolConfirmation::All,"",false,options)).await;
+        let compact:Vec<_>=events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{..})).collect();
+        assert_eq!(compact.len(),2,"{events:?}");
+        assert!(matches!(compact[0],LlmEvent::ContextCompacted{attempt:1,reason:Some(r),..} if r=="proactive"));
+        assert!(matches!(compact[1],LlmEvent::ContextCompacted{attempt:2,reason:None,..}));
+        assert_eq!(req.lock().unwrap().len(),3);
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn long_length_gets_one_reduction_and_never_executes_truncated_tools() {
+        let dir=tempfile::tempdir().unwrap();let target=dir.path().join("must-not-exist");
+        let call=tool_call("unsafe","write_file",&serde_json::json!({"path":target,"content":"no"}));
+        for success in [true,false] {
+            let last=if success{completion("answer",serde_json::Value::Null,(100,5))}else{length_stop("still partial",serde_json::Value::Null,393216)};
+            let (base,req)=stub_server(vec![length_stop("partial",serde_json::json!([call]),393216),completion("checkpoint",serde_json::Value::Null,(20,5)),last]);
+            let events=drain(start_chat(&base,recoverable_history(),ToolConfirmation::All,"",false)).await;
+            assert_eq!(events.iter().filter(|e|matches!(e,LlmEvent::ContextCompacted{..})).count(),1);
+            assert!(!events.iter().any(|e|matches!(e,LlmEvent::AssistantToolCalls{..}|LlmEvent::ToolRequest{..})));
+            if success{assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})));}
+            else{assert!(matches!(events.last(),Some(LlmEvent::Error{kind,..}) if kind=="truncated"));}
+            assert_eq!(req.lock().unwrap().len(),3);assert!(!target.exists());
+        }
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn summary_uses_only_explicitly_configured_thinking_off() {
+        for mechanism in ["", "reasoning_effort", "enable_thinking"] {
+            let (base,req)=stub_server_sequence(vec![
+                (400,serde_json::json!({"error":{"code":"context_length_exceeded"}})),
+                (200,completion("checkpoint",serde_json::Value::Null,(20,5))),
+                (200,completion("answer",serde_json::Value::Null,(100,5)))]);
+            let options=crate::context_recovery::Options{thinking_off:mechanism.into(),..Default::default()};
+            let events=drain(start_chat_options(&base,"stub-model",recoverable_history(),ToolConfirmation::All,"high",false,options)).await;
+            assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})),"{events:?}");
+            let req=req.lock().unwrap();assert_eq!(req.len(),3);
+            assert!(req[1].get("tools").is_none());assert_eq!(req[1]["max_tokens"],2048);
+            match mechanism {
+                "reasoning_effort"=>assert_eq!(req[1]["reasoning_effort"],"none"),
+                "enable_thinking"=>assert_eq!(req[1]["chat_template_kwargs"]["enable_thinking"],false),
+                _=>{assert!(req[1].get("reasoning_effort").is_none());assert!(req[1].get("chat_template_kwargs").is_none());}
+            }
+            assert_eq!(req[2]["reasoning_effort"],"high","ordinary chat effort changed");
+        }
+    }
+    #[tokio::test(flavor="multi_thread")]
+    async fn reasoning_only_stop_retries_once_with_configured_mechanism() {
+        for mechanism in ["reasoning_effort","enable_thinking",""] {
+            for success in [true,false] {
+                let mut empty=completion("",serde_json::Value::Null,(100,200));empty["choices"][0]["message"]["reasoning_content"]=serde_json::json!("thoughts only");
+                let mut responses=vec![empty.clone()];
+                if !mechanism.is_empty(){responses.push(if success{completion("ok",serde_json::Value::Null,(100,2))}else{empty});}
+                let (base,req)=stub_server(responses);
+                let options=crate::context_recovery::Options{thinking_off:mechanism.into(),..Default::default()};
+                let events=drain(start_chat_options(&base,"stub-model",vec![user_msg("answer")],ToolConfirmation::All,"high",true,options)).await;
+                assert!(!events.iter().any(|e|matches!(e,LlmEvent::AssistantToolCalls{..})));
+                let req=req.lock().unwrap();
+                if mechanism.is_empty(){assert_eq!(req.len(),1);assert!(matches!(events.last(),Some(LlmEvent::Error{..})));}
+                else {
+                    assert_eq!(req.len(),2);assert_eq!(req[0]["reasoning_effort"],"high");
+                    if mechanism=="reasoning_effort"{assert_eq!(req[1]["reasoning_effort"],"none");}
+                    else{assert_eq!(req[1]["chat_template_kwargs"]["enable_thinking"],false);}
+                    assert_eq!(req[0]["messages"],req[1]["messages"]);
+                    if success{assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{content,usage,..}) if content=="ok" && usage.completion_tokens==202));}
+                    else{assert!(matches!(events.last(),Some(LlmEvent::Error{kind,..}) if kind==ERROR_KIND_EMPTY));}
+                }
+            }
+        }
+    }
+
 }

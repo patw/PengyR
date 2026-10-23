@@ -559,7 +559,7 @@ impl PengyCli {
                     self.current_chat.as_mut().unwrap().messages.push(message);
                     self.save_progress();
                 }
-                Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message }) => {
+                Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message, .. }) => {
                     if expecting_api {
                         eprint!("\r{}\r", " ".repeat(40));
                     }

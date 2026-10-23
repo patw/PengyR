@@ -511,6 +511,8 @@ enum SseEvent {
         attempt: u32,
         max_attempts: u32,
         chars_removed: usize,
+        reason: Option<String>,
+        message: Option<String>,
     },
     Error {
         message: String,
@@ -773,10 +775,11 @@ fn sse_event_to_json(event: &SseEvent) -> String {
             serde_json::json!({"type": "request_started", "stage": stage, "attempt": attempt}).to_string(),
         SseEvent::Notice { message } =>
             serde_json::json!({"type": "notice", "message": message}).to_string(),
-        SseEvent::ContextCompacted { attempt, max_attempts, chars_removed } =>
+        SseEvent::ContextCompacted { attempt, max_attempts, chars_removed, reason, message } =>
             serde_json::json!({
                 "type": "context_compacted", "attempt": attempt,
                 "max_attempts": max_attempts, "chars_removed": chars_removed,
+                "reason": reason, "message": message,
             }).to_string(),
         SseEvent::Error { message } => {
             serde_json::json!({"type": "error", "message": message}).to_string()
@@ -951,9 +954,8 @@ impl WebWorker {
                             });
                         }
                     }
-                    Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message }) => {
-                        push_event(SseEvent::ContextCompacted { attempt, max_attempts, chars_removed });
-                        if let Some(message) = message { push_event(SseEvent::AssistantMessage { html: format!("<p>{}</p>", escape_html(&message)) }); }
+                    Some(LlmEvent::ContextCompacted { attempt, max_attempts, chars_removed, message, reason }) => {
+                        push_event(SseEvent::ContextCompacted { attempt, max_attempts, chars_removed, message, reason });
                     }
                     Some(LlmEvent::Retrying {
                         attempt,
@@ -3576,7 +3578,7 @@ function showContextCompacted(data) {{
   showThinking();
   const el = document.createElement('div');
   el.className = 'alert alert-info py-2';
-  el.textContent = `Context limit — retrying with ${{Number(data.chars_removed).toLocaleString()}} fewer tool-output characters; attempt ${{data.attempt}} of ${{data.max_attempts}}`;
+  el.textContent = data.message || `Context limit — retrying with ${{Number(data.chars_removed).toLocaleString()}} fewer tool-output characters; attempt ${{data.attempt}} of ${{data.max_attempts}}`;
   appendToArea(el);
 }}
 
@@ -5135,4 +5137,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(20 * 60)).await;
         assert!(!lease.cancel.load(Ordering::Relaxed));
     }
+    #[test]
+    fn proactive_event_forwards_reason_and_message_to_one_notice() {
+        let ev=SseEvent::ContextCompacted{attempt:1,max_attempts:4,chars_removed:9000,
+            reason:Some("proactive".into()),message:Some("Compacting before the window fills".into())};
+        let data:serde_json::Value=serde_json::from_str(&sse_event_to_json(&ev)).unwrap();
+        assert_eq!(data["reason"],"proactive");
+        assert_eq!(data["message"],"Compacting before the window fills");
+    }
+
 }

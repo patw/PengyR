@@ -9,6 +9,8 @@ pub mod attachments;
 pub mod chat_manager;
 pub mod config;
 pub mod context_recovery;
+pub mod context_pressure;
+pub mod context_windows;
 pub mod image_utils;
 pub mod image_capabilities;
 pub mod llm_client;
