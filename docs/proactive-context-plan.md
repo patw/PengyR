@@ -18,4 +18,4 @@ Approved by Pat 2026-10-23. Target workload: 256K–1M windows; constrained loca
 
 ## Rollout
 
-Rust branch `feat/proactive-context-compaction`, off by default. Python/C++ behavioral parity implemented with shared settings and fixtures. Pat authorized feature-branch commit/push on 2026-10-23; no release/version bump or production settings changes. Add unknown-setting preservation in native editions before mixed-edition use; no version bump/push/release or production settings edits without follow-up approval. Live synthetic tests require isolated config and an explicitly authorized endpoint.
+Implemented and regression-tested across Python/Rust/C++, with live validation through Rust on fast and Strata. Pat authorized merge to `main`, version **1.13.0**, changelog finalization and main-branch pushes on 2026-10-23. No tag or release is created: local testing comes first. Defaults remain off, production settings are untouched, and live synthetic tests require an isolated config and an explicitly authorized endpoint. See `proactive-context-local-testing.md`.

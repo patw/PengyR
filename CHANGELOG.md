@@ -1,12 +1,15 @@
 # Changelog
 
-## Unreleased
+## v1.13.0 — 2026-10-23
 
-- Rust-first opt-in proactive context compaction using provider-reported prompt usage; explicit per-model/global windows and bounded optional discovery, output reserve, hysteresis, and reserved reactive budget. No tokenizer or legacy model assumptions; first uncalibrated requests stay reactive. Full transcript remains unchanged.
-- Live Strata 256K validation: history summary and a 249K-character mid-turn tool result fit without errors; the identical unreduced tool view was rejected at 405K tokens. Window discovery and conservative parsing of Strata’s exact overflow message are tested.
-- Bounded summary requests use an explicitly configured thinking-off mechanism: live DeepSeek Flash testing exposed reasoning exhausting the 2,048-token summary allowance. Unknown providers remain unchanged.
-- One additional reduction retry for long length stops with no requested output cap; configured one-shot thinking-off retry for reasoning-only empty stop replies. Truncated tools are never executed and discarded usage is counted.
-- Preserve unknown shared configuration settings; forward proactive reason/message through web SSE without a duplicate assistant notice. Python/C++ behavior and shared fixtures now match.
+Source version for local testing; not tagged or published yet.
+
+- **Opt-in proactive context compaction in Python, Rust and C++.** Set `context_window` or per-model `context_windows`, or explicitly opt into bounded discovery with `context_window_auto`. Defaults remain off; `compact_at_percent` defaults to 75. No legacy model-window table or fixed characters/token divisor.
+- **Provider-calibrated pressure before every tool round.** Pair actual request text/schema/argument characters with `usage.prompt_tokens`. Cold starts send normally; validated calibration survives later turns in the same process. Output reserve, hysteresis, and bounded proactive steps preserve reactive recovery capacity.
+- **Reuse the provider-only recovery ladder.** Historical reasoning, tool previews/stubs, and protected-turn history summaries reduce the outgoing view only. Original transcripts and tool outputs remain intact; completed tools are never replayed. Failed proactive summaries keep the previous view and still permit the request. CLI, desktop and web render an accurate proactive notice.
+- **Bounded reply recovery.** Long `length` stops with no requested output cap get one additional reduction attempt. Reasoning-only empty `stop` replies get one thinking-off retry when a supported endpoint/model mechanism is configured. Bounded summaries use only that explicitly configured mechanism; normal conversation effort is unchanged.
+- **Shared configuration and caches.** Native editions preserve unknown settings. Route-specific window caches and checkpoints share formats across all editions; discovery recognizes selected-model metadata and Strata's explicit context-limit message without confusing prompt size with window size.
+- **Validation and local testing guide.** Shared arithmetic and loop fixtures cover 128K/256K/1M windows, thresholds, budgets, missing usage, failure safety and reply retries. Rust live tests passed on DeepSeek V4.1 Flash and Strata/Qwen 3.8, including a 249K-character mid-turn tool result whose unreduced view was genuinely refused. Python/C++ ports are regression-tested, not separately live-validated. See `docs/proactive-context-local-testing.md` and the linked live evidence.
 
 ## v1.12.5
 
