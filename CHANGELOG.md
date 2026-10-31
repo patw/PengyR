@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Settings → Extras installs the starter skills, in one press.** New fourth tab (between Tools and About). It detects the skills folder — no folder, or a folder without `skill_index.md`, counts as not installed — and lights up an **Install Skills** button in the accent colour only while something is missing. Installing copies the five bundled starter skills (`user_profile`, `memory`, `botskills`, `pengy_bio`, `sysinfo`) out of the Qt resource system without overwriting any existing file, and appends the skills pointer to the system message on the LLM tab exactly once (matched on the bare `skill_index.md`, so a hand-written pointer in another spelling is never doubled). The pointer is a checkbox, so it can be declined.
+- **The skills folder is a setting, and the tab shows which one is in use.** `skills_dir` (empty = `~/skills`, the documented default) can point at a synced or shared tree. Resolution is: `skills_dir` → the folder named by the system message *if it exists* → `~/skills`, so a fleet whose message says `~/Personal/skills/skill_index.md` is not mistaken for an empty install. Path field plus Browse, **Add to System Message** for a tree that is already there, **Open Folder**, and **Browse BotSkills**.
+- **Fill In My Profile starts the interview.** One press emits `promptRequested`, closes Settings, lets the main window save `skills_dir` and the system message, and only then sends the prompt that reads `user_profile/user_profile_skill.md` and interviews the user. It is enabled only when that skill is actually installed, and the tab lights exactly one action at a time: install → interview → nothing.
+- **Installed skills keep usable permissions.** Qt copies a resource file's read-only flag through, so every copied file is explicitly set to 0644 — and 0755 for `.py`/`.sh`, which the skill docs invoke as `./memory.py`. Without it a user could not edit the skills they were just given.
+- **The shared logic is one header, `gui/skillshelper.h`, with its own test target** (`pengy_skills_test`, 12 cases) covering root resolution, "installed" detection, a non-destructive install, the append-once pointer and the profile marker. It is byte-identical to PengyCPP's copy, and its rules mirror the Python edition's `pengy/core/skills_install.py`.
+- **No core change was needed.** `skills_dir` round-trips through `Config`'s `#[serde(flatten)] extra` map, so the CLI and web UI preserve it untouched.
+
 ## v1.13.1 — 2026-10-27
 
 The `ask_user_question` dialog was unreadable on COSMIC. It opened with its option list collapsed to a ~70px strip, so the choices could not be seen, let alone clicked; GNOME was unaffected.
