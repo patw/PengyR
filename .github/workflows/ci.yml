@@ -86,10 +86,17 @@ jobs:
         run: cargo build --profile ci -p pengy_core
 
       - name: Configure GUI
-        run: cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release -DRUST_TARGET_DIR=${{ github.workspace }}/target/ci
+        run: cmake -S gui -B gui/build -DCMAKE_BUILD_TYPE=Release -DPENGY_BUILD_TESTS=ON -DRUST_TARGET_DIR=${{ github.workspace }}/target/ci
 
       - name: Build GUI
         run: cmake --build gui/build --parallel
 
       - name: Verify GUI
         run: ls -lh gui/build/pengy target/ci/libpengy_core.a
+
+      # The starter skills are shipped assets, so nothing but a test of the
+      # installed tree can catch one that silently reverted.
+      - name: Starter skills test
+        run: |
+          cmake --build gui/build --parallel --target pengy_skills_test
+          QT_QPA_PLATFORM=offscreen ./gui/build/pengy_skills_test
