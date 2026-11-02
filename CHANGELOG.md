@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Eight advisories closed in the crate graph, two left documented, and the CI
+supply chain pinned to audited bytes.
+
+- **TLS and HTTP updated: rustls 0.23.40 → 0.23.46, rustls-webpki 0.103.13 → 0.103.16, h2 0.4.15 → 0.4.20, tokio 1.52.3 → 1.54.1.** rustls-webpki was accepting distrusted intermediates; the rustls set covers a TLS 1.3 handshake boundary bug, secret-leaking `Debug` impls, brotli certificate decompression to 1 GiB before authentication, and an unauthenticated ServerHello downgrade. All of it sits on the HTTPS path to the LLM provider.
+- **zstd 0.13.3 → 0.13.4 and zstd-safe 7.2.4 → 7.4.0** — 14 advisories (use-after-free, out-of-bounds reads, double free) reachable through primp decompressing responses from remote servers.
+- **zip 2.4.2 → 9.2.2** (the web chat export) and **primp 1 → 2**, which brings primp-rustls 0.23.40 → 0.23.43 and primp-h2 0.4.15 → 0.4.19. The `zip` advisories are all on the extraction path; our use is write-only, so this is hygiene rather than exposure.
+- **Residual, tracked:** primp vendors its own rustls fork, and its newest release tops out at 0.23.43 against upstream's 0.23.46 — so three rustls advisories (secret-leaking `Debug`, brotli cert decompression, ServerHello downgrade) stay live in that fork until primp refreshes. `fxhash` and `paste` are unmaintained with no fix published (pulled in by `selectors` and `rav1e`). `quinn-proto` stays in `Cargo.lock` with six advisories but is not in the compiled graph — `cargo tree -i` finds no path to it.
+- **CI now runs pinned bytes.** Every `uses:` is pinned to a commit SHA, and the AppImage tooling comes from dated linuxdeploy releases with a `sha256sum -c` check instead of the rolling `continuous` tag — that job holds `contents: write` and publishes release assets, so it was the most valuable thing to hijack. `dtolnay/rust-toolchain` gains `with: toolchain: stable`, without which pinning the ref selects no toolchain.
+
+Verified: OSV reports three remaining packages (`fxhash`, `paste`, `quinn-proto`) with their reasons recorded above; `cargo test --workspace` 338 passed with only the known dev-guest remote-test failure.
+
 ## v1.14.1 — 2026-11-02
 
 - **The new-user `pengy_bio` skill no longer ships someone else's fleet, a stale tool list, or a wrong `--no-save` rule.** It listed seven hostnames and their LAN addresses: a new user has none of those machines, and the published wheel carried the operator's network around with it. The tool section claimed 11 tools and left out ones the agent actually has, so it now tells the agent that the live tool schema is authoritative and that a tool missing from it does not exist. Single-shot mode was documented twice as not saving history while `pengy/cli/main.py` saves by default, and the cron example omitted `--no-save` — a cron job written from that page would have filled the user's chat sidebar. The chats path is `~/.config/pengy/chats/<id>.json`, not a `chats.json` array, and the dangling `../scheduler/` link pointed at a skill the bundle does not contain.
