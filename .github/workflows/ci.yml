@@ -94,9 +94,10 @@ jobs:
       - name: Verify GUI
         run: ls -lh gui/build/pengy target/ci/libpengy_core.a
 
-      # The starter skills are shipped assets, so nothing but a test of the
-      # installed tree can catch one that silently reverted.
-      - name: Starter skills test
-        run: |
-          cmake --build gui/build --parallel --target pengy_skills_test
-          QT_QPA_PLATFORM=offscreen ./gui/build/pengy_skills_test
+      # All six Qt test binaries were registered with add_test and nothing ever
+      # ran them, so a reverted skill asset -- or any of the other regressions
+      # they guard -- could ship unnoticed. The Build GUI step above already
+      # built them (PENGY_BUILD_TESTS=ON); offscreen because the runners have no
+      # display.
+      - name: Qt tests
+        run: QT_QPA_PLATFORM=offscreen ctest --test-dir gui/build --output-on-failure
