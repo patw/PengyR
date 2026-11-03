@@ -46,6 +46,12 @@ def repair(app):
             if dependency.startswith(('/System/Library/', '/usr/lib/')):
                 continue
             target = bundle_target(app, binary, dependency).resolve()
+            # A framework lists its own install ID in `otool -L`; that is not a
+            # dependency. String comparison against the ID misses it when the ID
+            # has already been rewritten to @rpath but a load command still
+            # carries the build-machine path, so compare resolved paths too.
+            if target == binary.resolve():
+                continue
             if not target.is_file() or not target.is_relative_to(app):
                 raise RuntimeError(f'Unresolved/nonportable dependency: {binary}: {dependency}')
             if dependency.startswith('@rpath/'):
