@@ -125,7 +125,12 @@ codesign --verify --deep --strict "$APP_DIR"
 # Fail packaging if a dependency still points at the developer/runner machine.
 while IFS= read -r -d '' binary; do
     if file -b "$binary" | grep -q 'Mach-O'; then
-        if otool -L "$binary" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/(opt|Cellar)/|/Users/runner/'; then
+        # A universal (fat) Mach-O prints one header per architecture before its
+        # dependency list -- "... (architecture x86_64):" -- and those headers
+        # carry the build path, so they must not count as dependencies. Same
+        # reason fix_macos_dependencies.py skips them.
+        if otool -L "$binary" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/(opt|Cellar)/|/Users/runner/' \
+                | grep -v '(architecture '; then
             echo "ERROR: nonportable dependency in $binary" >&2; exit 1
         fi
     fi
