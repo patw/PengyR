@@ -85,6 +85,37 @@ fi
             self.assertIn(['install_name_tool', '-change', '@rpath/b.dylib', '@loader_path/b.dylib', str(a)], calls)
             self.assertIn(['install_name_tool', '-id', '@rpath/a.dylib', str(a)], calls)
 
+    def test_universal_binary_section_headers_are_not_dependencies(self):
+        """`otool -L` on a fat Mach-O prints a per-arch header before each list.
+
+        aqt ships universal2 Qt frameworks, so those headers are the normal case.
+        They are labels, not dependencies; resolving one as a path fails on its
+        trailing "(architecture arm64)" text (seen on the Qt 6.10.3 macOS DMG
+        build, where Homebrew's arm64-only Qt had hidden the problem).
+        """
+        spec = importlib.util.spec_from_file_location('dependency_fix', ROOT / 'scripts/fix_macos_dependencies.py')
+        module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / 'Test.app'
+            fw = app / 'Contents/Frameworks/QtCore.framework/Versions/A'
+            fw.mkdir(parents=True)
+            core = (fw / 'QtCore'); core.touch(); core = core.resolve()
+            identity = '@rpath/QtCore.framework/Versions/A/QtCore'
+            listing = (
+                f'{core} (architecture arm64):\n'
+                f'\t{identity} (compatibility version 6.0.0, current version 6.10.3)\n'
+                f'\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\n'
+                f'{core} (architecture x86_64):\n'
+                f'\t{identity} (compatibility version 6.0.0, current version 6.10.3)\n'
+            )
+            def output(*args):
+                if args[0] == 'file': return 'Mach-O 64-bit universal'
+                if args[1] == '-D': return str(core) + ':\n' + identity + '\n'
+                return listing
+            with patch.object(module, 'output', side_effect=output), \
+                 patch.object(module.subprocess, 'run'):
+                module.repair(app)   # must not raise
+
     def test_unresolved_dependency_is_not_silently_accepted(self):
         spec = importlib.util.spec_from_file_location('dependency_fix', ROOT / 'scripts/fix_macos_dependencies.py')
         module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)

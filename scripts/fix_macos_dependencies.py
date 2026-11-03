@@ -39,6 +39,14 @@ def repair(app):
             new_identity = '@rpath/' + str(binary.relative_to(frameworks))
             subprocess.run(['install_name_tool', '-id', new_identity, str(binary)], check=True)
         for line in output('otool', '-L', str(binary)).splitlines()[1:]:
+            # A universal (fat) Mach-O prints a section header per architecture
+            # -- "/path/to/lib (architecture arm64):" -- before its dependency
+            # list. Those are labels, not dependencies, and resolving them as a
+            # path fails on the trailing "(architecture ...)" text. Universal Qt
+            # frameworks (aqt ships universal2; Homebrew ships arm64-only) make
+            # this the normal case rather than an edge case.
+            if '(architecture ' in line or line.rstrip().endswith(':'):
+                continue
             dependency = line.strip().split(' (compatibility version', 1)[0]
             # Skip the library's own install ID, whether old or just normalized.
             if dependency == identity or dependency == new_identity:
