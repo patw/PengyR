@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build PengyR for macOS
 # Prerequisites:
-#   brew install qt@6 cmake rust
+#   brew install cmake rust   (Qt comes from install-qt-action, or `brew install qt@6` locally)
 #   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 set -euo pipefail
 
@@ -21,7 +21,11 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
-QT_PREFIX="$(brew --prefix qt@6 2>/dev/null || brew --prefix qt 2>/dev/null || echo '/opt/homebrew/opt/qt@6')"
+if [[ -n "${QT_ROOT_DIR:-}" ]]; then
+    QT_PREFIX="$QT_ROOT_DIR"            # pinned by install-qt-action
+else
+    QT_PREFIX="$(brew --prefix qt@6 2>/dev/null || brew --prefix qt 2>/dev/null || echo '/opt/homebrew/opt/qt@6')"
+fi
 OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || true)"
 export CMAKE_PREFIX_PATH="$QT_PREFIX${OPENSSL_PREFIX:+;$OPENSSL_PREFIX}"
 export PATH="$QT_PREFIX/bin:$HOME/.cargo/bin:${BREW_PREFIX:+$BREW_PREFIX/bin:}$PATH"

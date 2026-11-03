@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Qt is one version everywhere: 6.12.0.** The GUI targets had drifted to 6.4.2 (Ubuntu 24.04's apt Qt, used by both CI and the release build), 6.5.3 (Windows, `win64_msvc2019_64`), and whatever `brew install qt@6` resolved to on macOS — five different Qts counting the Python edition's PySide6, none of them the version users of the other editions saw. All three platforms now install 6.12.0 through `install-qt-action`, including Linux, so CI builds what a release ships. Windows had to move to `win64_msvc2022_64`: Qt 6.12 publishes no msvc2019 archive at all. `build_macos.sh` now prefers `$QT_ROOT_DIR` instead of hard-overriding `CMAKE_PREFIX_PATH` with the Homebrew prefix, which is what pinned macOS to brew in the first place. Verified locally against the pinned Qt: the GUI links `.../6.12.0/gcc_64/lib/libQt6Core.so.6` and 6/6 Qt tests pass.
 Eight advisories closed in the crate graph, two left documented, and the CI
 supply chain pinned to audited bytes.
 
