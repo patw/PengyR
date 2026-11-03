@@ -100,7 +100,14 @@ fi
 
     def test_bundle_verifies_signatures_and_isolated_launches(self):
         script = (ROOT / 'build_macos.sh').read_text()
-        self.assertIn('-no-plugins -no-codesign', script)
+        # Deploy without Qt's QML plugin sweep, and without asking macdeployqt to
+        # sign: this script signs leaf libraries itself, at the end, once every
+        # install_name is final. Qt 6.10's macdeployqt rejects `-no-codesign`
+        # outright ("Unknown argument"), so assert the intent the flag encoded
+        # rather than the flag itself -- macdeployqt does not sign unless asked.
+        self.assertIn('-always-overwrite -no-plugins)', script)
+        self.assertNotIn('-no-codesign', script)
+        self.assertIn('codesign --force --sign -', script)
         self.assertIn('codesign --verify --deep --strict', script)
         self.assertIn('env -i PATH=/usr/bin:/bin', script)
         self.assertIn('platforms/libqcocoa.dylib', script)
