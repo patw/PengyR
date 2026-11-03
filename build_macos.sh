@@ -80,9 +80,12 @@ chmod +x "$APP_DIR/Contents/MacOS/pengy" "$APP_DIR/Contents/MacOS/pengy-cli" "$A
 cp "$ROOT/gui/Info.plist" "$APP_DIR/Contents/"
 cp "$ROOT/pengy.icns" "$APP_DIR/Contents/Resources/"
 # Deploy Widgets dependencies, not Qt's unrelated QML/optional plugin sweep.
-# Delay signing until every copied library's load commands are final.
+# Delay signing until every copied library's load commands are final -- this
+# script signs the bundle itself at the end, and macdeployqt does not sign
+# unless asked, so no "-no-codesign" here. Qt 6.10's macdeployqt rejects that
+# flag outright ("Unknown argument") and fails the build.
 QT_PLUGIN_DIR="$(qmake -query QT_INSTALL_PLUGINS)"
-DEPLOY_ARGS=(-always-overwrite -no-plugins -no-codesign)
+DEPLOY_ARGS=(-always-overwrite -no-plugins)
 for formula in brotli webp; do
     prefix="$(brew --prefix "$formula" 2>/dev/null || true)"
     [ -z "$prefix" ] || DEPLOY_ARGS+=("-libpath=$prefix/lib")
