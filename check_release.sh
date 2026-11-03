@@ -110,11 +110,15 @@ fi
 echo "--- Windows Qt version in CI ---"
 QT_VER=$(grep -oP "version:\s*'[^']+'" .github/workflows/release.yml | head -1 | grep -oP "[\d.]+")
 echo "  release.yml Qt version: $QT_VER"
-if [ -n "$QT_VER" ] && [ "$(echo "$QT_VER" | cut -d. -f2)" -eq 5 ]; then
-    ok "Qt version $QT_VER — stable LTS, widely available in aqt archives"
-else
-    warn "Qt version $QT_VER may not be available in aqt archives — verify it exists"
-fi
+# Qt publishes no Windows desktop package above 6.10.3: probed 2026-11-03 and
+# windows_x86/desktop/qt6_6113 and qt6_6120 are both 404 while qt6_6103 is 200.
+# That ceiling is why these pins drifted to 6.5.3/6.8.2 in the first place, so
+# this check names the versions known to exist for windows, mac and linux rather
+# than assuming one minor is the good one.
+case "$QT_VER" in
+    6.10.*|6.9.*|6.8.*) ok "Qt version $QT_VER — present in aqt archives for windows/mac/linux" ;;
+    *)  warn "Qt version $QT_VER not in the verified list (6.8-6.10) — check it exists for Windows before tagging" ;;
+esac
 
 # ── 6. CI release.yml LTO setting ────────────────────────────────────
 echo "--- Release LTO setting ---"
