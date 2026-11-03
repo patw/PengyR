@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.14.2 — 2026-11-02
 
 - **`run_bash`'s schema now says what it actually does.** The description was vague enough to mislead: it states that stdin is closed so a prompt fails instead of waiting, that `host` runs the command on that machine with that machine's cwd and paths (and that wrapping the command in ssh yourself is wrong), and that `elevated` must accompany an explicit root command — `elevated` alone is rejected, not ignored. Identical wording in all three editions, so the model gets one contract rather than three.
 - **Three latent macOS packaging bugs, all exposed by a universal2 Qt.** They had been invisible because Homebrew ships an arm64-only Qt. Qt 6.10's `macdeployqt` rejects the codesign-suppression flag outright and failed the build (the bundler signs explicitly at the end anyway); `otool -L` on a fat Mach-O prints a per-architecture header carrying the build path, which `fix_macos_dependencies.py` treated as a dependency and reported as "Unresolved/nonportable dependency: QtCore → itself"; and the same headers tripped the shell portability guard, reporting a clean `libqcocoa.dylib` as nonportable. Both are fixed, with a regression test plus a negative control that still rejects a genuinely missing dependency. The packaging test also stopped asserting the literal flag string and asserts the intent instead.
