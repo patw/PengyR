@@ -166,6 +166,15 @@ if(PENGY_BUILD_TESTS)
   target_link_libraries(pengy_skills_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Test)
   add_test(NAME pengy_skills_test COMMAND pengy_skills_test)
 
+  # Real Settings dialog, with only unrelated Rust metadata/cache calls stubbed.
+  add_executable(pengy_settings_extras_test
+    tests/test_settings_extras.cpp settingsdialog.cpp resources.qrc)
+  target_compile_definitions(pengy_settings_extras_test PRIVATE PENGY_RUST_EDITION)
+  target_include_directories(pengy_settings_extras_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_settings_extras_test PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Network Qt6::Svg Qt6::Test)
+  add_test(NAME pengy_settings_extras_test COMMAND pengy_settings_extras_test)
+
   add_executable(pengy_compaction_settings_test tests/test_compactionsettings.cpp)
   target_include_directories(pengy_compaction_settings_test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(pengy_compaction_settings_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Test)
