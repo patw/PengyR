@@ -140,9 +140,29 @@ fi
 
 # ── 7. Rust build ───────────────────────────────────────────────────
 echo "--- Rust build ---"
-if [ -f target/release/libpengy_core.rlib ] || [ -f target/release/libpengy_core.a ]; then
-    ok "Rust core already built (skipping rebuild)"
+# Presence alone is NOT currency (fixed 2026-11-07): a target/ left over from a
+# previous version reports success while the binary still answers with the OLD
+# version number, so a whole release was pre-flighted against stale binaries and
+# an uncompiled new module. Rebuild unless the binary reports the Cargo.toml
+# version AND no source is newer than it.
+want_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+have_ver=$(./target/release/pengy-cli --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+newer_src=""
+for f in Cargo.toml cli/Cargo.toml web/Cargo.toml; do
+    [ -f "$f" ] && [ "$f" -nt target/release/pengy-cli ] && newer_src="$f"
+done
+[ -z "$newer_src" ] && newer_src=$(find src cli/src web/src -name '*.rs' -newer target/release/pengy-cli -print -quit 2>/dev/null)
+if [ -f target/release/libpengy_core.rlib ] && [ "$have_ver" = "$want_ver" ] && [ -z "$newer_src" ]; then
+    ok "Rust core already built and current (pengy-cli reports $have_ver)"
 else
+    if [ -n "$have_ver" ] && [ "$have_ver" != "$want_ver" ]; then
+        # A plain `cargo build` will NOT replace a wrong binary: cargo's
+        # fingerprints track sources, so it reports success and leaves the stale
+        # artifact in place (measured 2026-11-07). Clean our own crates first.
+        echo "  pengy-cli reports $have_ver but Cargo.toml says $want_ver — forcing a rebuild"
+        cargo clean --release -p pengy_core -p pengy-cli -p pengy-web > /dev/null 2>&1 || true
+    fi
+    [ -n "$newer_src" ] && echo "  $newer_src is newer than target/release/pengy-cli — rebuilding"
     echo "  Building Rust workspace..."
     if cargo build --release --workspace > /tmp/pengyr_build.log 2>&1; then
         ok "Rust workspace built successfully"
@@ -153,9 +173,26 @@ fi
 
 # ── 8. GUI build ────────────────────────────────────────────────────
 echo "--- Qt GUI build ---"
+# Same currency rule, including the Rust sources the GUI links through FFI and
+# Cargo.toml (the GUI's version.h is generated from it at configure time).
+gui_newer=""
 if [ -f gui/build/pengy ]; then
-    ok "GUI already built (skipping rebuild)"
+    gui_newer=$(find gui \( -name '*.cpp' -o -name '*.h' -o -name 'CMakeLists.txt' -o -name 'Info.plist' \) \
+        -newer gui/build/pengy -print -quit 2>/dev/null)
+    [ -z "$gui_newer" ] && gui_newer=$(find src Cargo.toml -name '*.rs' -newer gui/build/pengy -print -quit 2>/dev/null)
+    [ -z "$gui_newer" ] && [ Cargo.toml -nt gui/build/pengy ] && gui_newer="Cargo.toml"
+    # The GUI links the Rust core, so a rebuilt lib forces a relink even when no
+    # source file changed (e.g. after a cargo clean).
+    if [ -z "$gui_newer" ]; then
+        for lib in target/release/libpengy_core.a target/release/libpengy_core.so; do
+            [ -f "$lib" ] && [ "$lib" -nt gui/build/pengy ] && gui_newer="$lib"
+        done
+    fi
+fi
+if [ -f gui/build/pengy ] && [ -z "$gui_newer" ]; then
+    ok "GUI already built and current"
 else
+    [ -n "$gui_newer" ] && echo "  $gui_newer is newer than gui/build/pengy — rebuilding"
     echo "  Building GUI..."
     mkdir -p gui/build && cd gui/build
     if cmake .. -DCMAKE_BUILD_TYPE=Release > /tmp/pengyr_gui.log 2>&1 && \
