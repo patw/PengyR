@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 // C FFI declarations for pengy_core library
 extern "C" {
     char* pengy_config_load();
@@ -26,6 +28,11 @@ extern "C" {
     char* pengy_title_generate(const char* chat_json);
     char* pengy_title_bulk_step(const char* chat_id, bool redo);
     char* pengy_title_bulk_targets(bool redo);
+
+    // Chat search: on_event gets each event as JSON (done last); returning
+    // false cancels before the next chat file. Blocking: call off the UI thread.
+    typedef bool (*PengySearchEventFn)(const char* event_json, void* userdata);
+    void  pengy_search_chats(const char* query, size_t limit, PengySearchEventFn on_event, void* userdata);
 
     char* pengy_tasks_load();
     bool  pengy_tasks_save(const char* json);

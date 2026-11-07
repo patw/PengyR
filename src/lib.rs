@@ -7,6 +7,7 @@
 pub mod about;
 pub mod attachments;
 pub mod chat_manager;
+pub mod chat_search;
 pub mod chat_title;
 pub mod config;
 pub mod context_recovery;
@@ -250,6 +251,34 @@ pub extern "C" fn pengy_title_bulk_step(chat_id: *const c_char, redo: bool) -> *
 #[no_mangle]
 pub extern "C" fn pengy_title_bulk_targets(redo: bool) -> *mut c_char {
     to_c(&serde_json::to_string(&chat_title::bulk_rename_targets(redo)).unwrap_or_default())
+}
+
+// ── Chat search ───────────────────────────────────────────────────
+
+/// Receives one chat-search event as JSON (see `chat_search::SearchEvent`);
+/// returning false cancels the search before the next chat file.
+pub type SearchEventFn = extern "C" fn(event_json: *const c_char, userdata: *mut c_void) -> bool;
+
+/// Search chat history (see `chat_search::search_chats`), calling `on_event`
+/// on this thread for every event, `done` last.  Blocking: call off the UI
+/// thread.  `limit` 0 means the default (`chat_search::MAX_RESULTS`).
+#[no_mangle]
+pub extern "C" fn pengy_search_chats(
+    query: *const c_char,
+    limit: usize,
+    on_event: SearchEventFn,
+    userdata: *mut c_void,
+) {
+    let query = unsafe { cstr(query) };
+    let limit = if limit == 0 { chat_search::MAX_RESULTS } else { limit };
+    let keep_going = std::cell::Cell::new(true);
+    let cancelled = || !keep_going.get();
+    chat_search::search_chats(&query, limit, &cancelled, &mut |event| {
+        let json = CString::new(serde_json::to_string(&event).unwrap_or_default()).unwrap_or_default();
+        if !on_event(json.as_ptr(), userdata) {
+            keep_going.set(false);
+        }
+    });
 }
 
 // ── Tasks ─────────────────────────────────────────────────────────

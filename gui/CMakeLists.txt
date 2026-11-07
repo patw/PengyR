@@ -90,7 +90,7 @@ message(STATUS "Pengy core: ${PENGY_CORE_LIB} (static=${PENGY_RUST_STATIC})")
 add_executable(pengy WIN32
   main.cpp mainwindow.cpp toolconfirmdialog.cpp chathistory.cpp chatview.cpp
   chatinput.cpp chatworker.cpp settingsdialog.cpp tasksdialog.cpp
-  editchatdialog.cpp bulkrename.cpp chattitle_ffi.cpp
+  editchatdialog.cpp bulkrename.cpp chattitle_ffi.cpp chatsearch_ffi.cpp
   resources.qrc
 )
 
@@ -213,11 +213,11 @@ if(PENGY_BUILD_TESTS)
   target_link_libraries(pengy_editchat_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
   add_test(NAME pengy_editchat_test COMMAND pengy_editchat_test)
 
-  # chathistory.cpp calls into the Rust core (pengy_ffi.h), so this test
+  # chathistory.cpp searches through the Rust core (chatsearch_ffi.cpp), so this test
   # target needs the same platform-specific link set as the main `pengy`
   # target above, not just Qt.
   add_executable(pengy_chathistory_test
-    tests/test_chathistory.cpp chathistory.cpp
+    tests/test_chathistory.cpp chathistory.cpp chatsearch_ffi.cpp
   )
   target_compile_definitions(pengy_chathistory_test PRIVATE PENGY_UNIT_TEST)
   if(PENGY_RUST_STATIC)

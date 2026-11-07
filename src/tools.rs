@@ -936,12 +936,19 @@ async fn apply_changes(args: &serde_json::Value) -> String {
 }
 
 fn terminate_process_group(pid: u32) {
+    // kill(2) directly, never a spawned `kill -9 -<pgid>`: procps-ng 4.0.x's
+    // kill reads "-<pgid>" after a signal option as an unknown option and
+    // signals -(its first digit) instead -- for a pgid starting with 1 that is
+    // kill(-1, SIGKILL), every process the user owns (it logged the whole
+    // desktop session out).  A pgid of 0 or 1 would mean "my group" / "all",
+    // so those are never signalled.
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("kill")
-            .arg("-9")
-            .arg(format!("-{pid}"))
-            .output();
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 1 {
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+        }
     }
     // taskkill /T walks the parent-PID tree (Windows has no process group to
     // signal).  Invoked by absolute path so a taskkill.exe earlier on PATH

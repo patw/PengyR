@@ -55,6 +55,7 @@ private slots:
     void onModelChanged(const QString& model);
     void onEffortChanged(const QString& effort);
     void editChat(const QString& chatId);
+    void onSearchHitSelected(const QString& chatId, const QList<int>& sources, const QStringList& terms);
     void bulkRenameChats(QWidget* parent);
 
 private:
@@ -77,7 +78,9 @@ private:
     void loadIntoNewTab(const QString& chatId);
 
     // ── Message helpers ───────────────────────────────────────────
-    void renderMessage(ChatView* view, const QJsonObject& msg);
+    // Renders chat["messages"][index]; the index tags user/assistant
+    // messages so a search hit can find them (ChatView::revealHits).
+    void renderMessage(ChatView* view, const QJsonObject& msg, int index);
     static QJsonObject assistantDisplayMessage(const QJsonObject& msg);
     void processResponse(TabSession* session, const QJsonArray& apiMessages);
     void handleToolConfirm(TabSession* session, const QJsonObject& toolRequest);

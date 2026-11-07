@@ -2,6 +2,7 @@ mod sigwatch;
 
 use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage};
+use pengy_core::chat_search::{self, SearchEvent};
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::task_manager;
@@ -48,6 +49,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/models",
     "/list",
     "/load",
+    "/search",
     "/baseurl",
     "/apikey",
     "/llm-timeout",
@@ -295,6 +297,8 @@ struct PengyCli {
     rl: Editor<PengyHelper, FileHistory>,
     hist_path: std::path::PathBuf,
     tool_ctx: Arc<tools::ToolContext>,
+    /// The last /search's words, marked by `/load <#> <msg#>`.
+    search_terms: Vec<String>,
 }
 
 impl PengyCli {
@@ -340,6 +344,7 @@ impl PengyCli {
             rl,
             hist_path,
             tool_ctx: Arc::new(tools::ToolContext::new()),
+            search_terms: Vec::new(),
         }
     }
 
@@ -1143,6 +1148,7 @@ impl PengyCli {
             "/models" => self.cmd_models(),
             "/list" => self.cmd_list(),
             "/load" => self.cmd_load(args),
+            "/search" => self.cmd_search(args),
             "/delete" => self.cmd_delete(args),
             "/yolo" => self.cmd_yolo(args),
             "/baseurl" => self.cmd_baseurl(args),
@@ -1212,7 +1218,8 @@ impl PengyCli {
                 "Run a Task by its /tasks index, prompting for any %placeholders%",
             ),
             ("/list", "List recent chats"),
-            ("/load <index>", "Load a chat by its /list index"),
+            ("/load <index> [msg#]", "Load a chat by its /list index; msg# (from /search) prints that message"),
+            ("/search <words>", "Search chat titles and messages (any order; \"quote\" a phrase)"),
             ("/delete <index>", "Delete a chat by its /list index"),
             ("/attach", "Show file attachment help"),
             ("/attachments", "Show durable attachment storage usage (read-only)"),
@@ -1723,11 +1730,19 @@ impl PengyCli {
     fn cmd_load(&mut self, args: &[&str]) {
         if args.is_empty() {
             println!(
-                "{}Usage: /load <index>  (use /list to see indices){}",
+                "{}Usage: /load <index> [msg#]  (use /list to see indices){}",
                 DIM, RESET
             );
             return;
         }
+        let msg_no = match args.get(1).map(|a| a.trim_start_matches('#').parse::<usize>()) {
+            None => None,
+            Some(Ok(n)) => Some(n),
+            Some(Err(_)) => {
+                println!("{}Invalid index. Use /list to see available chats.{}", RED, RESET);
+                return;
+            }
+        };
         let idx: usize = match args[0].parse::<usize>() {
             Ok(i) if i >= 1 => i - 1,
             _ => {
@@ -1766,8 +1781,109 @@ impl PengyCli {
             c.messages.len(),
             RESET
         );
+        if let Some(n) = msg_no {
+            self.show_message(n);
+            return;
+        }
         // Show tail for context
         self.cmd_tail(&["3"]);
+    }
+
+    /// Print message #n (1-based, as /show numbers it) in full, with the last
+    /// /search's words marked.
+    fn show_message(&self, n: usize) {
+        let Some(chat) = self.current_chat.as_ref() else { return };
+        let msgs = &chat.messages;
+        if n < 1 || n > msgs.len() {
+            println!("{}No message #{}; this chat has {}.{}", RED, n, msgs.len(), RESET);
+            return;
+        }
+        let msg = &msgs[n - 1];
+        let text = msg.content.as_ref().map(chat_search::text_of).unwrap_or_default();
+        let text = if text.is_empty() { "(no text)".to_string() } else { text };
+        let label = match msg.role.as_str() {
+            "user" => "You".to_string(),
+            "assistant" => "Assistant".to_string(),
+            other => {
+                let mut c = other.chars();
+                c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+            }
+        };
+        let color = if msg.role == "user" { BLUE } else { GREEN };
+        let rule = "─".repeat(terminal_width().min(60).saturating_sub(label.len() + 8));
+        println!("{}{}── #{} {} {}{}", color, BOLD, n, label, rule, RESET);
+        println!("{}", highlight_terms(&sanitize_display(&text), &self.search_terms, ""));
+        println!("{}── /show {} to read on from here{}", DIM, msgs.len() - n + 1, RESET);
+    }
+
+    fn cmd_search(&mut self, args: &[&str]) {
+        let query = args.join(" ");
+        let terms = chat_search::parse_query(&query);
+        if terms.is_empty() {
+            println!("{}Usage: /search <words>  (any order; \"quote\" a phrase){}", DIM, RESET);
+            return;
+        }
+        // Number results the way /list does, so /load <#> opens one directly.
+        let position: std::collections::HashMap<String, usize> = chat_manager::load_index()
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| (e.id, i + 1))
+            .collect();
+        let progress = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        let mut results = Vec::new();
+        let mut truncated = false;
+        chat_search::search_chats(&query, chat_search::MAX_RESULTS, &|| false, &mut |event| match event {
+            SearchEvent::Progress { scanned, total } if progress => {
+                eprint!("\r{}Searching… {}/{}{}", DIM, scanned, total, RESET);
+            }
+            SearchEvent::Progress { .. } => {}
+            SearchEvent::Done { truncated: t, .. } => truncated = t,
+            result => results.push(result),
+        });
+        if progress {
+            eprint!("\r\x1b[2K");
+        }
+        if results.is_empty() {
+            println!("{}No chats match.{}", DIM, RESET);
+            return;
+        }
+        for result in &results {
+            let SearchEvent::Result { id, title, created_at, hits, .. } = result else { continue };
+            let number = position.get(id).map_or("?".to_string(), |n| n.to_string());
+            let title = if title.is_empty() { "Untitled" } else { title.as_str() };
+            println!(
+                "{}{:>4}{}  {}{}{}  {}{}{}",
+                DIM,
+                number,
+                RESET,
+                BOLD,
+                highlight_terms(&sanitize_display(title), &terms, BOLD),
+                RESET,
+                DIM,
+                created_at.chars().take(10).collect::<String>(),
+                RESET
+            );
+            for hit in hits {
+                // #N is the message number /show uses and /load <#> <N> prints.
+                let who = if hit.role == "user" { "You:" } else { "AI: " };
+                println!(
+                    "{}      #{:<4} {}{} {}",
+                    DIM,
+                    hit.index + 1,
+                    who,
+                    RESET,
+                    highlight_terms(&sanitize_display(&hit.snippet), &terms, "")
+                );
+            }
+        }
+        let n = results.len();
+        let note = if truncated {
+            format!("First {n} chats shown; add words to narrow the search.")
+        } else {
+            format!("{n} chat{} found.", if n == 1 { "" } else { "s" })
+        };
+        println!("{}{} /load <#> to open one, /load <#> <msg#> to read a match.{}", DIM, note, RESET);
+        self.search_terms = terms;
     }
 
     fn cmd_delete(&mut self, args: &[&str]) {
@@ -2438,6 +2554,43 @@ fn take_chars(s: &str, max: usize) -> String {
 /// the cursor, clearing the screen, or skewing the box width math (visual_width
 /// counts raw chars, so stray escape bytes misalign the panel). Display-only:
 /// the raw bytes sent to the model are untouched.
+/// Mark every case-insensitive occurrence of `terms` in `text` bold yellow,
+/// returning to `base` style after each.  Left unmarked if lowercasing
+/// changes the text's length (positions would not line up).
+fn highlight_terms(text: &str, terms: &[String], base: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    if terms.is_empty() || lower.len() != chars.len() {
+        return text.to_string();
+    }
+    let mut marked = vec![false; chars.len()];
+    for term in terms {
+        let t: Vec<char> = term.chars().collect();
+        let mut i = 0;
+        while !t.is_empty() && i + t.len() <= lower.len() {
+            if lower[i..i + t.len()] == t[..] {
+                marked[i..i + t.len()].iter_mut().for_each(|m| *m = true);
+                i += t.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in chars.iter().enumerate() {
+        if marked[i] && (i == 0 || !marked[i - 1]) {
+            out.push_str(BOLD);
+            out.push_str(YELLOW);
+        }
+        out.push(*c);
+        if marked[i] && (i + 1 == chars.len() || !marked[i + 1]) {
+            out.push_str(RESET);
+            out.push_str(base);
+        }
+    }
+    out
+}
+
 fn sanitize_display(s: &str) -> String {
     fn is_csi_final(c: char) -> bool {
         ('\u{40}'..='\u{7e}').contains(&c)

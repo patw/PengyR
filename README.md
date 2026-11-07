@@ -44,7 +44,7 @@ Pre-built binaries are on the [Releases page](https://github.com/patw/PengyR/rel
 
 ```bash
 # Dependencies
-sudo apt install build-essential cmake qt6-base-dev libgl-dev
+sudo apt install build-essential cmake qt6-base-dev qt6-svg-dev libgl-dev
 curl --proto '=https' --tls v1.2 -sSf https://sh.rustup.rs | sh
 
 # Build everything (GUI + CLI + Web)
@@ -75,6 +75,8 @@ The web UI is for single-user personal use. For remote access, put it behind ngi
 - **Last-response tokens/s (GUI)** — Output tokens divided by the final successful request time, separate from cumulative token usage; excludes tool execution and retry waits.
 - **Theme system** — System/light/dark modes plus 8 accent colours; fonts scale with the UI
 - **Tasks** — Reusable prompt templates with `%placeholder%` tokens for repeat workflows
+- **Chat search** — A search box above the chat list (Ctrl+K): type to filter by title, press Enter to search message text too, then jump straight to the matching messages. CLI: `/search`, then `/load <#> <msg#>`
+- **Edit Chat & Bulk Rename** — Rename a chat, let the model generate a title, or export it as Markdown from the pencil on each chat (`/title` in the CLI); Settings → UI → Bulk Rename Chats titles your whole history, resumably, and never touches a name you typed
 - **Model discovery** — Fetch available models from your endpoint with one click
 - **File attachments** — GUI: attach files or paste images; CLI: `@path` syntax
 - **Image rendering** — Pasted and downloaded images display inline in the GUI
@@ -129,7 +131,7 @@ The same settings live in Settings in the GUI and the Web UI.
 | Model | Model name, e.g. `llama3.2`, `qwen3:8b`, `gemma3` — **no default**, see below |
 | System Message | Supports `{date}`, `{username}`, `{hostname}`, `{osinfo}` placeholders |
 | Tool Confirmation | All / Safe / None — which tools require approval |
-| Theme Mode (GUI) | System / Light / Dark — follows OS palette |
+| Theme Mode (GUI, Web) | System / Light / Dark — follows OS palette |
 | Accent Color (GUI) | Default, Blue, Teal, Green, Orange, Red, Pink, or Purple |
 | UI Scale (GUI) | 75–200% — restart for full native-widget scaling |
 
@@ -255,8 +257,10 @@ cargo test
 | `scraper` | HTML parsing for `fetch_url` |
 | `regex` | Pattern matching |
 | `walkdir` | Directory tree traversal |
+| `image` | Image attachments and preprocessing |
 | `axum` | Web framework |
-| Qt6::Core, Qt6::Widgets, Qt6::Network | GUI framework |
+| `rustyline` | CLI line editing and slash-command completion |
+| Qt6::Core, Qt6::Widgets, Qt6::Network, Qt6::Svg | GUI framework |
 | CMake ≥ 3.16 + C++17 compiler | GUI build |
 
 ---
@@ -265,7 +269,7 @@ cargo test
 
 PengyR shares `~/.config/pengy/` with Python Pengy and PengyCPP:
 - **`settings.json`** — Same format, all versions read/write it
-- **`chats.json`** — Same message schema. Chats created in any version load in any other
+- **`chats/`** — One JSON file per chat plus a rebuildable `index.json`, same schema in every edition, so a chat created in any version loads in any other (the old single `chats.json` is still read once as a migration seed)
 - **`tasks.json`** — Shared prompt-template library
 
 ---

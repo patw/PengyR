@@ -37,7 +37,7 @@ PengyR is a Rust + Qt6 rewrite of [Pengy](https://github.com/patw/pengy) — a l
 │  ┌─ Qt6 GUI (C++17) ─────────────┐  ┌─ CLI (Rust) ──────────────┐ │
 │  │ ChatHistory / ChatView /       │  │ Interactive REPL           │ │
 │  │ ChatInput / SettingsDialog     │  │ Single-shot mode           │ │
-│  │ ChatWorker (QThread → FFI)     │  │ 29 slash commands          │ │
+│  │ ChatWorker (QThread → FFI)     │  │ Slash commands             │ │
 │  └────────────┬───────────────────┘  └────────────┬──────────────┘ │
 │               │ C FFI boundary                      │ direct Rust    │
 │               │                                    │                │
@@ -65,28 +65,43 @@ PengyR/
 ├── src/
 │   ├── lib.rs                  # Public modules + C FFI exports + global tokio runtime
 │   ├── config.rs               # Settings load/save + system message rendering
-│   ├── chat_manager.rs         # Chat session CRUD + message cleaning
+│   ├── chat_manager.rs         # Per-chat files + index, title_source, redact, usage
+│   ├── chat_search.rs          # Chat search (rules in Pengy/spec.md "Chat Search")
+│   ├── chat_title.rs           # Edit Chat / Bulk Rename title generation
 │   ├── task_manager.rs         # Prompt-template Tasks CRUD (~/.config/pengy/tasks.json)
-│   ├── tools.rs                # 16 OpenAI function-calling tools
-│   └── llm_client.rs           # Async LLM chat generator (tokio channels)
-├── cli/                        # CLI binary (pengy-cli)
-│   ├── Cargo.toml
-│   └── src/main.rs             # Interactive REPL + single-shot mode + slash commands
-├── web/                        # Web UI binary (pengy-web)
-│   ├── Cargo.toml
-│   └── src/main.rs             # Axum server + SSE + Bootstrap 5 UI
+│   ├── tools.rs                # 16 OpenAI function-calling tools (17 on Windows)
+│   ├── tool_args.rs            # Tool-call argument validation and coercion
+│   ├── llm_client.rs           # Async LLM chat loop (tokio channels)
+│   ├── attachments.rs, image_utils.rs, image_capabilities.rs   # Durable image attachments
+│   ├── context_pressure.rs, context_recovery.rs, context_windows.rs  # Context management
+│   ├── model_cache.rs          # Cached model list per base URL
+│   └── about.rs                # Edition name, links and blurb
+├── cli/src/
+│   ├── main.rs                 # Interactive REPL + single-shot mode + slash commands
+│   └── sigwatch.rs             # SIGINT/SIGTERM/SIGHUP handling (see Pengy/spec.md)
+├── web/
+│   ├── src/main.rs             # Axum server + SSE + Bootstrap 5 UI
+│   └── templates/              # theme-head.html, chat-search.js, search-hits.js (shared
+│                               #   verbatim with PengyCPP), compaction-settings.html
 ├── gui/
 │   ├── CMakeLists.txt          # Cross-platform CMake (finds Qt6 + Rust lib)
-│   ├── pengy_ffi.h             # C type declarations matching Rust FFI
+│   ├── pengy_ffi.h             # C declarations matching the Rust FFI (authoritative list)
 │   ├── main.cpp                # Entry point — QApplication setup
-│   ├── mainwindow.cpp/h        # Three-pane main window, confirmation dialogs
-│   ├── chathistory.cpp/h       # Left sidebar — chat list, quick settings
-│   ├── chatview.cpp/h          # Right-top — QTextBrowser markdown, tables, tool blocks
+│   ├── mainwindow.cpp/h        # Tabbed main window, confirmation flow, search jumps
+│   ├── chathistory.cpp/h       # Left sidebar — search, chat list, quick settings  ┐
+│   ├── chatsearch.h            # ChatSearch interface (run over FFI: chatsearch_ffi.cpp)
+│   ├── editchatdialog.cpp/h    # Edit Chat: rename, Generate, Export              │ shared
+│   ├── bulkrename.cpp/h        # Settings → UI → Bulk Rename Chats                │ verbatim
+│   ├── chattitle.h             # ChatTitle interface (FFI: chattitle_ffi.cpp)      ┘ with PengyCPP
+│   ├── chatview.cpp/h          # Right-top — QTextBrowser markdown, tool blocks, revealHits
 │   ├── chatinput.cpp/h         # Right-bottom — message input
 │   ├── chatworker.cpp/h        # QThread worker — calls pengy_llm_chat_run()
-│   ├── settingsdialog.cpp/h    # Settings modal + Fetch Models button
+│   ├── settingsdialog.cpp/h    # Settings dialog (tabs) + Fetch Models
+│   ├── toolconfirmdialog.cpp/h # Tool confirmation dialog
 │   ├── tasksdialog.cpp/h       # Prompt-template Tasks manager/player
-│   └── themehelper.h           # Light/dark/accent theme + UI scale helpers
+│   ├── themehelper.h, iconhelper.h  # Light/dark/accent theme, themed SVG icons
+│   └── tests/                  # Standalone Qt test binaries (ctest)
+├── tests/                      # Rust integration tests (chat search, title FFI, storage, …)
 ├── appimage/
 │   ├── build.sh                # Bundles PengyR-x86_64.AppImage
 │   ├── pengy.desktop           # Linux desktop entry
@@ -113,6 +128,7 @@ The Rust core exposes a C ABI via `extern "C"`. The C++ GUI includes `pengy_ffi.
 | Function | Signature | Returns |
 |----------|-----------|---------|
 | `pengy_chats_load` | `() → *mut c_char` | JSON array of all chats |
+| `pengy_chat_index_load` | `() → *mut c_char` | JSON array of index summaries (sidebar; no message bodies) |
 | `pengy_chat_create` | `(title: *const c_char) → *mut c_char` | New chat JSON |
 | `pengy_chat_delete` | `(id: *const c_char) → bool` | Success |
 | `pengy_chat_save` | `(json: *const c_char) → bool` | Success |
@@ -120,6 +136,15 @@ The Rust core exposes a C ABI via `extern "C"`. The C++ GUI includes `pengy_ffi.
 | `pengy_clean_messages` | `(json: *const c_char) → *mut c_char` | Cleaned message array |
 | `pengy_messages_redact_last` | `(json: *const c_char) → *mut c_char` | Message array with the last message popped (redact "undo"; see `chat_manager::redact_last_message`) |
 | `pengy_chat_add_usage` | `(chat_json: *const c_char, usage_json: *const c_char) → *mut c_char` | Chat JSON with this turn's usage folded into the persisted running total (`chat.usage`) |
+
+### Title and Search Functions
+
+| Function | Signature | Returns |
+|----------|-----------|---------|
+| `pengy_title_generate` | `(chat_json) → *mut c_char` | `{"title"}` or `{"error", "unusable"}` — blocking (one model request) |
+| `pengy_title_bulk_step` | `(chat_id, redo: bool) → *mut c_char` | Bulk Rename's whole per-chat step on the Rust side: `{"status": renamed\|unchanged\|kept\|skipped\|failed, …}` |
+| `pengy_title_bulk_targets` | `(redo: bool) → *mut c_char` | JSON array of chat ids a run would visit |
+| `pengy_search_chats` | `(query, limit: usize, on_event, userdata) → void` | Streams chat-search events as JSON to `on_event(event_json, userdata) → bool`; returning false cancels before the next chat file. Blocking |
 
 ### Tool Functions
 
@@ -159,8 +184,8 @@ typedef struct {
 
 ```
 ┌────────────────────┬──────────────────────────────────────────────────┐
-│  + New Chat        │                                                  │
-│  ⚙ Settings        │           Chat View (Markdown)                   │
+│ [+ New Chat][⚙][☰] │                                                  │
+│ [🔍 Search chats ] │           Chat View (Markdown)                   │
 │                    │                                                  │
 │  ─────────────     │  🧑 You                                          │
 │  Chat 1            │  Can you list files in /tmp?                     │
@@ -179,9 +204,9 @@ typedef struct {
 
 ### Left Pane (Sidebar)
 - **+ New Chat button** — Creates a new chat session. Inserts one row into the chat list (`ChatHistoryWidget::addChat`) rather than reloading the whole list, so the cost doesn't scale with total chat count.
-- **⚙ Settings button** — Opens the settings dialog
-- **Tasks button** — Opens the prompt-template Tasks manager/player (`TasksDialog`)
-- **Chat history list** — Scrollable, sorted newest first; click to load; chat items have a delete button
+- **⚙ Settings and Tasks** — square icon buttons beside New Chat (tooltip + accessible name carry the label): the settings dialog and the prompt-template Tasks manager/player (`TasksDialog`)
+- **Search box** — Ctrl+K / Ctrl+Shift+F; typing filters rows by title, Enter runs a message search on a worker thread (`ChatSearch::run`) and shows results in place of the list; clicking one opens the chat and calls `ChatView::revealHits()`. Esc returns to the list. Rules: Pengy/spec.md "Chat Search"
+- **Chat history list** — Scrollable, sorted newest first; click to load; each row has Edit (pencil: `EditChatDialog` — rename, Generate, Export) and Delete buttons
 - **Quick settings panel** — Status dot, per-tab model and Effort selectors, cumulative chat token totals, and last-final-response tok/s. Tool confirmation remains in Settings.
 
 ### Input Row
@@ -218,8 +243,9 @@ when final text is empty. Existing cumulative `chat.usage` remains separate.
 - **User messages:** bold dark-blue `🧑 You` label, plain body text
 - **Assistant messages:** bold dark-green `🤖 Assistant` label, markdown-converted body
 - **Tool blocks:** collapsed by default (`▶ Tool: name [args…]`); click to expand and show args + result
+- **Reasoning cards** (collapsible) above an assistant message that returned reasoning; **notice / error cards** for harness messages, never labelled as the assistant
 - Syntax-highlighted code blocks via custom HTML rendering
-- Auto-scrolls to bottom on new content
+- Follows new content only while scrolled to the bottom; scrolling up holds position. `revealHits()` (a search jump) marks the search words in the hit messages, anchors the first and holds position until the next send — so every user/assistant `appendMessage` passes its `chat["messages"]` index as `source`
 
 ### Right-Bottom Pane (Chat Input)
 - **Attach button** — Opens file picker; supports text files and images
@@ -301,7 +327,8 @@ The main thread drives the tokio channel receiver. Tool confirmation blocks on u
 | `/new` | Start a new chat session |
 | `/show [n]` | Show the full conversation (optional: last n messages) |
 | `/tail [n]` | Show the last n messages (default 5) |
-| `/rename <title>` | Rename the current chat |
+| `/rename <title>` | Rename the current chat (marks the title `"user"`) |
+| `/title` | Generate a title with the configured model (marks it `"model"`) |
 | `/clear` | Clear the terminal screen |
 | `/export [path]` | Export the current chat as Markdown |
 | `/yolo [all\|safe\|none]` | Set tool confirmation: all (YOLO), safe (read-only), none — cycles if no arg |
@@ -315,13 +342,18 @@ The main thread drives the tokio channel receiver. Tool confirmation blocks on u
 | `/context-keep <n>` | Set context elision keep-turns (0 = keep all) |
 | `/system [message]` | Show or set the system message template |
 | `/list` | List recent chats with index, title, message count, and creation date |
-| `/load <index>` | Load a chat by its `/list` index |
+| `/load <index> [msg#]` | Load a chat by its `/list` index; with `msg#` (as `/search` and `/show` number messages), print that message with the last search's words marked instead of the last 3 |
+| `/search <words>` | Search titles and user/assistant messages (Pengy/spec.md "Chat Search"); results numbered with their `/list` index, snippets with `#msg` |
 | `/delete <index>` | Delete a chat by its `/list` index |
 | `/compact` | Elide old tool results to free context window space |
+| `/auto-compact [off\|auto\|<tokens>] [percent]` | Show/set proactive compaction for the selected model |
+| `/llm-timeout <sec>` / `/download-max <mb>` | Set LLM request timeout / default download cap |
 | `/redact [n]` | Delete the last n messages (default 1) — repeatable up to the top |
 | `/tasks` | List saved prompt-template Tasks |
 | `/task <#>` | Run a Task by its `/tasks` index, prompting for any `%placeholders%` |
 | `/attach` | Attach a text file (or use `@path` inline in your prompt) |
+| `/attachments` | Show durable attachment-storage usage (read-only) |
+| `/about` | Show edition, version and links |
 | `/quit`, `/exit`, `/q` | Exit the CLI |
 
 ### File Attachments
@@ -338,8 +370,9 @@ The Web binary (`pengy-web [port]`) runs an Axum HTTP server (default port 5000)
 
 ```bash
 pengy-web                            # localhost:5000
-pengy-web 8080                       # custom port
-pengy-web 8080 --host 0.0.0.0        # expose beyond localhost (no auth — trusted networks only)
+pengy-web --port 8080                # custom port (a bare `8080` is still accepted)
+pengy-web --port 8080 --host 0.0.0.0 # expose beyond localhost (no auth — trusted networks only)
+pengy-web --trusted-host pengy.example.com   # public hostname when reverse-proxying
 pengy-web --config-dir PATH          # custom config directory
 ```
 
@@ -352,16 +385,21 @@ The server prints its URL on startup; it does not auto-open a browser.
 │                                                             │
 │  ┌─sidebar (260px)─┐  ┌─chat area──────────────────────┐  │
 │  │  [+ New Chat]   │  │  message history (scrollable)  │  │
-│  │                 │  │                                │  │
-│  │  Chat 1   [×]  │  │  User bubble (right-aligned)   │  │
-│  │  Chat 2   [×]  │  │  🔧 tool card (collapsed)       │  │
-│  │  Chat 3   [×]  │  │  Assistant bubble (markdown)   │  │
+│  │  [🔍 Search   ] │  │                                │  │
+│  │  💬 Chat 1 [×] │  │  User bubble (right-aligned)   │  │
+│  │  💬 Chat 2 [×] │  │  🔧 tool card (collapsed)       │  │
+│  │  💬 Chat 3 [×] │  │  Assistant bubble (markdown)   │  │
 │  └─────────────────┘  │                                │  │
 │   (offcanvas on mob.) │  ┌──input + [Send]────────────┐│  │
 │                        │  └────────────────────────────┘│  │
 │                        └────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+- **Sidebar** — New Chat, the search box (Ctrl+K; `templates/chat-search.js`, shared with the other editions) and the chat list. Each row's chat bubble is the Edit Chat button (a pencil on hover): rename, Generate (`POST /chat/:id/title/generate`, which only suggests), Export.
+- **Search jumps** — results link to `/chat/:id#hits=<i>,<j>&terms=<JSON>`; user/assistant turns carry `id="msg-<index>"` (index into the stored messages, counted before the dangling-tool-call repair) and `templates/search-hits.js` marks the words and scrolls to the first hit.
+- **Theme** — `<html data-bs-theme="…" data-theme-mode="…">` from the shared `theme_mode`; `templates/theme-head.html` (shared with PengyCPP) resolves `system` before the stylesheets and defines the `--pengy-*` colour tokens. Settings has a Theme select.
+- **Model output** — `render_markdown()` escapes HTML before applying markdown, and links/images keep only `http`, `https`, `mailto`, `file` or scheme-less URLs (`safe_url`).
 
 ### Routes
 
@@ -377,19 +415,28 @@ The server prints its URL on startup; it does not auto-open a browser.
 | POST | `/chat/:id/stop` | Cancel running generation for a chat |
 | POST | `/chat/:id/delete` | Delete chat and redirect to index |
 | GET | `/chat/:id/export` | Download the chat as a Markdown file |
-| POST | `/chat/:id/rename` | Rename a chat |
+| GET | `/chat/:id/export/:format` | Export bundle (with attachments) |
+| POST | `/chat/:id/rename` | Rename a chat (marks the title `"user"`) |
+| POST | `/chat/:id/title/generate` | Suggest a model-generated title (Edit Chat); saves nothing |
 | POST | `/chat/:id/redact` | Delete the last N raw messages (default 1); 409 while a turn is in flight |
 | POST | `/chat/:id/command` | Web slash commands typed in the chat input |
 | GET | `/tasks` | List saved prompt-template Tasks with their placeholders |
 | POST | `/tasks/render` | Render a Task's template with the given placeholder values |
+| GET | `/search?q=<words>` | Chat search: `{results: [...], truncated}` |
 | GET | `/models` | Fetch available models from the endpoint (settings page Fetch button) |
+| GET | `/files?path=` | Serve a local file the model linked |
+| GET | `/attachments/:digest/:derivative` | Serve a durable attachment's display derivative |
 | GET/POST | `/settings` | View/update all config fields |
+| GET | `/about` | About page |
 
 ### SSE Event Types
 
 | Type | Payload | Browser action |
 |------|---------|---------------|
+| `assistant_message` | `html` | Append the narration written alongside tool calls |
 | `tool_request` | `name`, `args`, `auto_approved` | Append tool card; if not auto-approved, show confirmation modal |
+| `question_request` / `question_result` | questions / answers | `ask_user_question` card |
+| `request_started` / `retrying` / `context_compacted` / `notice` | status fields / message | Status line during backoff; notice card |
 | `tool_result` | `content`, `declined` | Update tool card body and badge |
 | `final_response` | `html`, `usage`, `cumulative_usage` | Append assistant bubble; `cumulative_usage` (running total across the chat, via `chat_manager::add_usage`) updates the navbar token badge |
 | `sudo_request` | `host` (string, or null for local) | Show sudo password modal naming the host |
@@ -470,16 +517,15 @@ Each frontend handles tool confirmation differently:
 
 ## Settings Dialog (Desktop)
 
-| Field | Widget | Notes |
-|-------|--------|-------|
-| Base URL | QLineEdit | OpenAI-compatible endpoint |
-| API Key | QLineEdit (masked) | Stored in settings.json (plaintext) |
-| Model | QComboBox (editable) | Pre-populated with current model; "Fetch" button calls `GET /v1/models` |
-| System Message | QTextEdit | Supports `{date}`, `{username}`, etc. templates |
-| Tool Confirmation | QComboBox | "YOLO (All)", "Safe Only", "None" |
-| Context Keep Turns | QSpinBox | Number of recent turns to keep tool results for (0 = keep all) |
-| UI Scale | QComboBox | 75%, 100%, 125%, 200% — takes effect on relaunch |
-| Tool Timeout | QSpinBox | Seconds (-1 = no timeout) |
+Five tabs (same layout in all three editions):
+
+| Tab | Fields |
+|-----|--------|
+| **UI** | UI Scale (75–200%, takes effect on relaunch); Theme mode (System / Light / Dark); Accent color; **Bulk Rename Chats** (warning with a "rename all again" checkbox, then a progress dialog; resumable via `title_source`) |
+| **LLM** | Base URL; API Key (masked, stored in settings.json); Model (editable combo, **Fetch** calls `GET /v1/models`); System Message; Reasoning effort; Preserve reasoning; LLM timeout; Proactive compaction (mode and window for the selected model, threshold for all) |
+| **Tools** | Tool Confirmation (YOLO / Safe / None); Keep tool results; Tool timeout (-1 = none); Max tool output; Max download; User Agent |
+| **Extras** | Skills folder, Install Skills, Add to System Message, Open Folder, Browse BotSkills — local operations only |
+| **About** | Edition, version, links, license |
 
 ---
 
@@ -525,8 +571,8 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `preserve_reasoning` | bool | `false` | Keep reasoning fields on assistant messages sent back to the API |
 | `context_keep_turns` | int | `0` | Recent turns whose tool results are kept; older ones elided. 0 = keep all |
 | `attachment_context_keep_turns` | int | `4` | Recent turns whose durable image attachments are resolved into provider requests; `0` sends no historical attachments |
-| `ui_scale` | int | `100` | Sets `QT_SCALE_FACTOR` on next launch (75/100/125/200); CLI ignores |
-| `theme_mode` | string | `"system"` | Desktop theme: `"system"`, `"light"`, or `"dark"` |
+| `ui_scale` | int | `100` | Sets `QT_SCALE_FACTOR` on next launch (75/100/110/125/135/150/175/200); CLI ignores it |
+| `theme_mode` | string | `"system"` | Theme for the desktop app and the web UI: `"system"`, `"light"`, or `"dark"` |
 | `theme_accent` | string | `"default"` | Desktop accent color (`default`/`blue`/`teal`/`green`/`orange`/`red`/`pink`/`purple`) |
 | `user_agent` | string | `PengyAgent/1.0` | User-Agent header for HTTP requests |
 | `llm_timeout` | int | `300` | HTTP timeout in seconds for each LLM API request |
@@ -536,6 +582,8 @@ Shared with Python Pengy and PengyCPP at `~/.config/pengy/`.
 | `image_max_dimension` | int | `4096` | Attached images are downscaled so neither side exceeds this (px) |
 | `image_max_mb` | float | `4.5` | Attached images are re-encoded until under this size (MB) |
 | `image_quality` | int | `85` | JPEG quality (0–100) used when re-encoding attached images |
+
+Also persisted, with the same names and meanings as in `Pengy/spec.md` ("Settings File"): `auto_context_recovery`, `recovery_keep_turns`, `output_token_limit`, `output_token_parameter`, `context_window`, `context_windows`, `context_window_modes`, `context_window_auto`, `compact_at_percent`, `empty_reply_thinking_off`, `empty_reply_thinking_off_models`, `skills_dir`.
 
 ### System Message Templating
 
@@ -557,7 +605,9 @@ cache. Legacy `~/.config/pengy/chats.json` is imported as a compatibility seed o
 must also remove its old entry so it cannot resurrect. Chat messages retain `user`, `assistant`
 (including `tool_calls`), and `tool` roles; optional `chat.usage` is cumulative token usage.
 Optional `chat.reasoning_effort` and `chat.last_response_tokens_per_second` follow the per-chat
-control contract above and are preserved by chat storage and usage accumulation.
+control contract above and are preserved by chat storage and usage accumulation. Optional `chat.model` (per-tab
+override) and `chat.title_source` (`"model"`, `"user"`, or absent — see `Pengy/spec.md`) round-trip
+the same way (`Chat.title_source`, `ChatSummary.title_source`, always written to the index).
 
 Image attachments are durable content-addressed references in `message.attachments`, with source
 objects and display/thumbnail derivatives under `~/.config/pengy/attachments/`. Never persist
@@ -573,7 +623,7 @@ All 16 tools from Python Pengy are implemented in Rust (`src/tools.rs`):
 
 | Tool | Read-only | Description |
 |------|:---:|-------------|
-| `read_file` | ✅ | Read a local file. Expands `~`. |
+| `read_file` | ✅ | Read a local text file. Expands `~`; `offset`/`limit` page through long files. |
 | `read_image` | ✅ | Look at an image file (screenshot, photo, diagram, chart) — added to the conversation for the model to see directly. PNG, JPEG, GIF, WebP, BMP, TIFF; large images are downscaled automatically. |
 | `read_multiple_files` | ✅ | Read up to 20 files at once; per-file budget follows `tool_output_max_chars`, with a 5× total batch budget. |
 | `write_file` | ❌ | Write content to a file (creates parent dirs). |
@@ -666,7 +716,7 @@ build_windows.bat
 
 ## Design Decisions
 
-**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — 25 functions with simple types.
+**Rust core + C FFI instead of pure Rust GUI:** The Rust GUI ecosystem (egui, iced, slint) lacks the maturity of Qt for complex desktop applications. Qt6 via C++ provides a proven widget toolkit with native look-and-feel on all platforms. The C FFI boundary is thin — C strings (JSON), bools and two small shared structs; `gui/pengy_ffi.h` is the authoritative list.
 
 **Static linking of Rust core:** The Rust library is compiled as a static archive (`.a` / `.lib`) and linked into the Qt6 binary. This eliminates runtime Rust dependencies in the final binary. The trade-off is a larger binary (~13 MB) but simpler deployment.
 
@@ -674,13 +724,13 @@ build_windows.bat
 
 **Qt native markdown instead of a markdown library:** Qt's `QTextBrowser` supports a subset of Markdown natively (bold, italic, links, code). Custom regex transforms add fenced code blocks, tables, and paragraph breaks. This avoids pulling in a Rust or C++ markdown library that would need to match Python's `markdown` + `pygments` output.
 
-**Context-overflow recovery:** `llm_client::chat` retries only explicit provider context-limit errors by compacting a private provider-request copy of tool results (up to four reductions, first head/tail previews and then stubs). Original tool events, persisted chat, matching tool IDs, and assistant tool calls stay intact; tools are not rerun. CLI, GUI, and web show `context_compacted` progress. This is separate from the configured per-tool cap and `context_keep_turns` elision, and does not proactively budget total tokens. See `Pengy/spec.md` for the shared policy.
+**Context management:** ported from Python Pengy, whose spec owns the policy ("Context-overflow recovery", and the `auto_context_recovery` / `compact_at_percent` / `context_window*` settings). `context_recovery.rs` recovers from a provider context-limit error by summarising older turns into a checkpoint in the provider-request copy — the persisted chat and its tool IDs stay intact and tools are not rerun; `context_pressure.rs` and `context_windows.rs` add proactive compaction once a request reaches `compact_at_percent` of the selected model's window (explicit, or discovered when the mode is `auto`). CLI, GUI and web show `context_compacted` progress. This is separate from the per-tool output cap and `context_keep_turns` elision.
 
 **Message schema compatibility:** Chat messages use the same JSON schema as Python Pengy — `{"role": "user", "content": "..."}`, `{"role": "assistant", "content": "...", "tool_calls": [...]}`, `{"role": "tool", "tool_call_id": "...", "content": "..."}`. The internal ChatView representation uses unified `tool_block` messages (combining request + result) for rendering, but the persisted format matches the Python version exactly.
 
 **Non-streaming API calls:** The LLM client uses non-streaming completions (no `stream: true`). Full responses render at once. This simplifies the architecture and is acceptable because tool call round-trips dominate latency for agentic workflows.
 
-**Sudo via `SUDO_ASKPASS`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, then rewrite every `sudo` to `sudo -A` and supply the password through a temp `SUDO_ASKPASS` script that echoes an environment variable. Password cached in memory for the duration of the LLM run. No PTY complexity. See Python Pengy's spec for why this replaced piping the password to stdin with a single `sudo -S` rewrite: that broke on pipelines, redirects, earlier stdin readers, and any second `sudo`.
+**Sudo via `SUDO_ASKPASS`:** Same approach as Python Pengy — detect `sudo` in bash commands, prompt for password, then rewrite every `sudo` to `sudo -A` and point `SUDO_ASKPASS` at a 0700 script in a private temp directory that `cat`s a 0600 password file beside it (never an environment variable, which every child of the command could print). The directory is removed when the command ends, or by the CLI's signal path (`cleanup_askpass_helpers`). Password cached in memory for the duration of the LLM run. No PTY complexity. See Python Pengy's spec for why this replaced piping the password to stdin with a single `sudo -S` rewrite: that broke on pipelines, redirects, earlier stdin readers, and any second `sudo`.
 
 **Windows tool surface (`run_powershell`):** Ported from Python Pengy (see its spec for the full rationale). `tool_definitions()` is `platform_tools(base_tool_definitions(), cfg!(windows), …)`: POSIX gets the base list unchanged; Windows gets `run_powershell` inserted before a remote-only `run_bash` (`host` required, and a local call is rejected by `windows_local_run_bash_error`); no other description names a shell, so nothing else changes. PowerShell is resolved once (`POWERSHELL`): `pwsh` on PATH, else `powershell`, else `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`; never `cmd.exe`. The description states the version (5.1 gets a list of syntax differences) and the elevation state (`IsUserAnAdmin` from shell32); there is no Windows elevation flow. The script is written to a `pengy-<pid>-<nanos>.ps1` temp file and run as `<ps> -NoLogo -NoProfile -NonInteractive -Command <POWERSHELL_PRELUDE>`; the prelude (byte-identical with the other editions, no double quotes) reads the file as UTF-8, compiles it with `[ScriptBlock]::Create`, turns off progress output and pwsh's ANSI rendering, sets UTF-8 output, exits 1 on a parse error, and otherwise exits with `$LASTEXITCODE` (1 if the script throws). Tool subprocesses on Windows get `CREATE_NO_WINDOW` (`hide_console`), and `terminate_process_group` runs `taskkill /T /F` by absolute path. `powershell_tests` covers the surface and, when `pwsh` is on PATH (it runs on Linux too), the live prelude.
 
@@ -703,7 +753,7 @@ build_windows.bat
 | OpenAI-compatible LLM API | ✅ | Same API format and tool calling |
 | 16 tools | ✅ | All tools ported |
 | Qt6 desktop GUI | ✅ | Three-pane layout, markdown, tool blocks |
-| CLI (interactive REPL + single-shot) | ✅ | 29 slash commands, @path attachments |
+| CLI (interactive REPL + single-shot) | ✅ | Same slash-command set as Python, @path attachments |
 | Web UI (SSE streaming) | ✅ | Axum + Bootstrap 5, mirrors Python Flask UI |
 | File attachments (GUI) | ✅ | Image + text file support |
 | Image paste from clipboard | ✅ | |
@@ -714,10 +764,12 @@ build_windows.bat
 | Binary output guard | ✅ | `looks_binary()` blocks binary blobs before they reach context (`run_bash`/`run_python`/`directory_tree`/`search_content`/`glob`) |
 | Redact last message | ✅ | `redact_last_message()`; all three frontends, repeatable to an empty chat |
 | Cumulative token usage | ✅ | `add_usage()`; persisted `chat.usage`, shown by all three frontends |
-| Chat export to Markdown | ✅ | GUI sidebar export button |
+| Chat export to Markdown | ✅ | Edit Chat dialog (GUI), Edit Chat modal / navbar (Web), `/export` (CLI) |
+| Edit Chat + Bulk Rename (`title_source`) | ✅ | All three frontends; `chat_title.rs` + FFI |
+| Chat search + jump to message | ✅ | All three frontends; `chat_search.rs` + `pengy_search_chats` |
 | Settings dialog + Fetch Models | ✅ | GUI dialog + Web settings page + CLI `/config` |
 | Tasks (prompt templates) | ✅ | All three frontends — GUI Tasks dialog, CLI `/tasks` + `/task <#>`, Web Tasks modal — stored in shared `tasks.json` |
-| Theme system (mode + accent) | ✅ | Desktop GUI; `theme_mode`/`theme_accent` in settings.json |
+| Theme system (mode + accent) | ✅ | Desktop GUI (mode + accent) and Web UI (mode); `theme_mode`/`theme_accent` in settings.json |
 | Reasoning effort / preservation | ✅ | `reasoning_effort`/`preserve_reasoning` settings |
 | Skills system | ✅ | Skills are markdown docs loaded via system message (skill files ship in the Python repo) |
 
@@ -742,12 +794,16 @@ build_windows.bat
 | `once_cell` | Lazy statics |
 | `futures-util` | Stream utilities for tokio channels |
 | `url` | URL parsing |
+| `image` | Image attachments and preprocessing |
+| `sha2` / `base64` | Attachment content addressing and data URLs |
 
 ### CLI (cli/Cargo.toml)
 
 | Crate | Purpose |
 |-------|---------|
 | `rpassword` | Secure sudo password input (no echo) |
+| `rustyline` | Line editing, history and slash-command completion |
+| `libc` | Signal handling (`sigwatch.rs`) |
 | `reqwest` | `/models` endpoint fetch |
 | `regex` | @path file attachment resolution |
 
@@ -758,6 +814,7 @@ build_windows.bat
 | `axum` | HTTP framework (routing, SSE, forms) |
 | `futures-util` | Stream construction for SSE |
 | `regex` | Markdown-to-HTML conversion |
+| `zip` | Chat export bundles |
 
 ### C++ GUI (CMakeLists.txt)
 
@@ -766,6 +823,7 @@ build_windows.bat
 | Qt6::Core | Foundation classes |
 | Qt6::Widgets | GUI toolkit |
 | Qt6::Network | Network information plugin |
+| Qt6::Svg | Themed SVG icons |
 | OpenSSL | SSL/TLS for Qt networking |
 
 ### Build Tools

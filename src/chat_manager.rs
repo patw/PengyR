@@ -564,6 +564,12 @@ pub fn get_chat(chat_id: &str) -> Option<Chat> {
     read_json::<Chat>(&chat_file(chat_id))
 }
 
+/// A stored chat's file as raw bytes, for chat search's pre-check (which
+/// skips most files without a JSON parse).  Ids come from the index.
+pub fn read_chat_bytes(chat_id: &str) -> io::Result<Vec<u8>> {
+    fs::read(chat_file(chat_id))
+}
+
 /// Clean dangling tool calls so the message list is valid for the API.
 ///
 /// Handles two corruption cases:

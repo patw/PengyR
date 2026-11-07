@@ -1,12 +1,13 @@
 use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage, ChatSummary};
+use pengy_core::chat_search::SearchEvent;
 use pengy_core::chat_title;
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::task_manager;
 use pengy_core::tools;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect};
@@ -141,6 +142,7 @@ async fn main() {
         .route("/chat/:chat_id/title/generate", post(chat_generate_title))
         .route("/chat/:chat_id/redact", post(chat_redact))
         .route("/chat/:chat_id/command", post(chat_command))
+        .route("/search", get(search_api))
         .route("/tasks", get(list_tasks))
         .route("/tasks/render", post(render_task))
         .route("/settings", get(settings_get).post(settings_post))
@@ -1941,6 +1943,37 @@ async fn chat_redact(
 // client fills placeholders, renders here, then feeds the result through the
 // normal /send path.
 
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Sidebar chat search (Enter in the search box): every result at once, as
+/// `{"results": [...], "truncated": bool}` -- same shape as the Python edition.
+async fn search_api(Query(params): Query<SearchQuery>) -> impl IntoResponse {
+    let found = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::new();
+        let mut truncated = false;
+        pengy_core::chat_search::search_chats(
+            &params.q,
+            pengy_core::chat_search::MAX_RESULTS,
+            &|| false,
+            &mut |event| match event {
+                SearchEvent::Result { .. } => results.push(event),
+                SearchEvent::Done { truncated: t, .. } => truncated = t,
+                SearchEvent::Progress { .. } => {}
+            },
+        );
+        (results, truncated)
+    })
+    .await;
+    match found {
+        Ok((results, truncated)) => Json(serde_json::json!({"results": results, "truncated": truncated})).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "search failed").into_response(),
+    }
+}
+
 async fn list_tasks() -> impl IntoResponse {
     let tasks: Vec<serde_json::Value> = task_manager::load_tasks()
         .into_iter()
@@ -2282,6 +2315,7 @@ struct SettingsForm {
     compaction_mode: Option<String>,
     compaction_window: Option<String>,
     compact_at_percent: Option<String>,
+    theme_mode: Option<String>,
 }
 
 async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
@@ -2289,6 +2323,13 @@ async fn settings_post(Form(form): Form<SettingsForm>) -> impl IntoResponse {
 
     if let Some(v) = form.base_url {
         config.base_url = v.trim().to_string();
+    }
+    // Shared with the desktop app; anything but the three modes is ignored
+    // rather than saved.
+    if let Some(v) = &form.theme_mode {
+        if matches!(v.as_str(), "system" | "light" | "dark") {
+            config.theme_mode = v.clone();
+        }
     }
     if let Some(v) = form.model {
         config.model = v.trim().to_string();
@@ -2389,8 +2430,10 @@ struct Turn {
 }
 
 enum TurnType {
-    User { content: String, attachments: Vec<pengy_core::attachments::AttachmentRef> },
-    Assistant { html: String },
+    // `index` is the message's position in the chat's stored messages, which
+    // search hits point at (rendered as id="msg-<index>").
+    User { content: String, attachments: Vec<pengy_core::attachments::AttachmentRef>, index: usize },
+    Assistant { html: String, index: usize },
     ToolUse { events: Vec<ToolEvent> },
 }
 
@@ -2406,11 +2449,19 @@ struct ToolEvent {
 
 fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
     let messages = chat_manager::clean_dangling_tool_calls(raw_messages);
+    // The repair only drops and inserts tool messages, so the n-th non-tool
+    // message here is the n-th non-tool message of the stored chat.
+    let mut positions = raw_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role != "tool")
+        .map(|(n, _)| n);
     let mut turns = Vec::new();
     let mut i = 0;
 
     while i < messages.len() {
         let msg = &messages[i];
+        let index = if msg.role == "tool" { 0 } else { positions.next().unwrap_or(0) };
 
         if msg.role == "user" {
             let content = msg
@@ -2420,7 +2471,7 @@ fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
                 .unwrap_or("")
                 .to_string();
             turns.push(Turn {
-                turn_type: TurnType::User { content, attachments: msg.attachments.clone() },
+                turn_type: TurnType::User { content, attachments: msg.attachments.clone(), index },
             });
             i += 1;
         } else if msg.role == "assistant" {
@@ -2436,6 +2487,7 @@ fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
                     turns.push(Turn {
                         turn_type: TurnType::Assistant {
                             html: render_markdown(&content),
+                            index,
                         },
                     });
                 }
@@ -2489,6 +2541,7 @@ fn group_messages(raw_messages: &[ChatMessage]) -> Vec<Turn> {
                     turns.push(Turn {
                         turn_type: TurnType::Assistant {
                             html: render_markdown(&content),
+                            index,
                         },
                     });
                 }
@@ -2780,7 +2833,8 @@ fn render_table(lines: &[String]) -> String {
 // and table cell, so building these per call recompiled five regexes thousands
 // of times when rendering a long chat.
 static IMG_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").unwrap());
+    // URLs may hold one level of balanced parentheses (Wikipedia's Foo_(bar)).
+    std::sync::LazyLock::new(|| regex::Regex::new(r"!\[([^\]]*)\]\(((?:[^()\s]|\([^()\s]*\))+)\)").unwrap());
 static CODE_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"`([^`]+)`").unwrap());
 static BOLD_RE: std::sync::LazyLock<regex::Regex> =
@@ -2788,18 +2842,61 @@ static BOLD_RE: std::sync::LazyLock<regex::Regex> =
 static ITALIC_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\*([^*]+)\*").unwrap());
 static LINK_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)").unwrap());
+
+/// Whether a link or image URL (already HTML-escaped) may keep its URL.
+/// Model output is untrusted -- it can echo a fetched page -- and a
+/// `javascript:` link would run in this origin, which can drive the whole
+/// API.  Scheme-less URLs (relative and local file paths, #anchors) are fine.
+/// Same rule as the Python and C++ editions.
+fn safe_url(escaped_url: &str) -> bool {
+    // Browsers ignore whitespace and control characters inside a scheme.
+    let plain: String = escaped_url
+        .replace("&amp;", "&")
+        .chars()
+        .filter(|c| *c > ' ')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match plain.split_once(':') {
+        Some((scheme, _))
+            if !scheme.is_empty()
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c)) =>
+        {
+            matches!(scheme, "http" | "https" | "mailto" | "file")
+        }
+        _ => true,
+    }
+}
 
 fn inline_markdown(text: &str) -> String {
     let escaped = escape_html(text);
-    let mut result = escaped;
+    // Inline code is copied through untouched; the other rules only see the
+    // text between code spans, so `*args*` in code stays as written.
+    let mut result = String::with_capacity(escaped.len());
+    let mut pos = 0;
+    for m in CODE_RE.captures_iter(&escaped) {
+        let whole = m.get(0).unwrap();
+        result.push_str(&inline_text(&escaped[pos..whole.start()]));
+        result.push_str(&format!("<code>{}</code>", &m[1]));
+        pos = whole.end();
+    }
+    result.push_str(&inline_text(&escaped[pos..]));
+    result
+}
 
+/// Images, emphasis and links in already-escaped text outside code spans.
+fn inline_text(escaped: &str) -> String {
     // Images — must come before link regex so ![alt](url) isn't partially matched
-    result = IMG_RE
-        .replace_all(&result, r#"<img src="$2" alt="$1">"#)
+    let mut result = IMG_RE
+        .replace_all(escaped, |c: &regex::Captures| {
+            if safe_url(&c[2]) {
+                format!(r#"<img src="{}" alt="{}">"#, &c[2], &c[1])
+            } else {
+                format!(r#"<img alt="{}">"#, &c[1])
+            }
+        })
         .to_string();
-
-    result = CODE_RE.replace_all(&result, "<code>$1</code>").to_string();
 
     result = BOLD_RE
         .replace_all(&result, "<strong>$1</strong>")
@@ -2807,11 +2904,15 @@ fn inline_markdown(text: &str) -> String {
 
     result = ITALIC_RE.replace_all(&result, "<em>$1</em>").to_string();
 
-    result = LINK_RE
-        .replace_all(&result, r#"<a href="$2">$1</a>"#)
-        .to_string();
-
-    result
+    LINK_RE
+        .replace_all(&result, |c: &regex::Captures| {
+            if safe_url(&c[2]) {
+                format!(r#"<a href="{}">{}</a>"#, &c[2], &c[1])
+            } else {
+                format!("<a>{}</a>", &c[1])
+            }
+        })
+        .to_string()
 }
 
 /// Percent-encode a file path for use in a query string.
@@ -2900,6 +3001,15 @@ fn build_messages(chat: &Chat, config: &Config) -> Vec<ChatMessage> {
 mod templates {
     use super::*;
 
+    /// The configured theme mode, validated; "system" is resolved client-side.
+    pub fn theme_mode(config: &Config) -> &'static str {
+        match config.theme_mode.as_str() {
+            "light" => "light",
+            "dark" => "dark",
+            _ => "system",
+        }
+    }
+
     fn base(
         title: &str,
         sidebar_chats: &str,
@@ -2908,13 +3018,20 @@ mod templates {
         extra_style: &str,
         scripts: &str,
     ) -> String {
+        // Sidebar chat search, shared verbatim with the Python and C++ editions.
+        let search_js = include_str!("../templates/chat-search.js");
+        // Theme: the shared resolver script + colour tokens (see the file).
+        let theme_head = include_str!("../templates/theme-head.html");
+        let theme_mode = theme_mode(&config::load_config());
+        let bs_theme = if theme_mode == "dark" { "dark" } else { "light" };
         format!(
             r##"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-bs-theme="{bs_theme}" data-theme-mode="{theme_mode}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>{title}</title>
+{theme_head}
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
   <style>
@@ -2964,7 +3081,7 @@ mod templates {
     .tool-card.done {{ border-left-color: var(--bs-success); }}
     .tool-header {{ cursor: pointer; user-select: none; display: flex; align-items: center; gap: 0.4rem; }}
     .tool-summary {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 0.78rem; }}
-    .tool-args, .tool-output {{ background: #f6f8fa; border-radius: 4px; padding: 0.5rem 0.6rem; margin-top: 0.4rem; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.78rem; color: #24292e; }}
+    .tool-args, .tool-output {{ background: var(--pengy-code-bg); border-radius: 4px; padding: 0.5rem 0.6rem; margin-top: 0.4rem; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; font-size: 0.78rem; color: var(--pengy-code-fg); }}
     .msg-thinking {{ display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.85rem; color: var(--bs-secondary-color); font-size: 0.85rem; }}
     /* ── Jump to bottom ──────────────────────────────────────── */
     #jumpBottomBtn {{
@@ -2990,14 +3107,26 @@ mod templates {
     .markdown-body p {{ margin-bottom: 0.5rem; }}
     .markdown-body p:last-child {{ margin-bottom: 0; }}
     .markdown-body h1,.markdown-body h2,.markdown-body h3 {{ margin-top:0.75rem; margin-bottom:0.4rem; }}
-    .markdown-body pre {{ background: #f6f8fa; border-radius: 4px; padding: 0.75rem; overflow-x: auto; }}
+    .markdown-body pre {{ background: var(--pengy-code-bg); color: var(--pengy-code-fg); border-radius: 4px; padding: 0.75rem; overflow-x: auto; }}
     .markdown-body code {{ font-size: 0.84em; }}
-    .markdown-body :not(pre)>code {{ background: #f6f8fa; color: #d63384; padding: 0.1em 0.3em; border-radius: 3px; }}
+    .markdown-body :not(pre)>code {{ background: var(--pengy-code-bg); color: var(--pengy-inline-code-fg); padding: 0.1em 0.3em; border-radius: 3px; }}
     .markdown-body table {{ width:100%; border-collapse:collapse; margin-bottom:0.5rem; }}
     .markdown-body th,.markdown-body td {{ border:1px solid var(--bs-border-color); padding:0.25rem 0.5rem; }}
     .markdown-body ul,.markdown-body ol {{ padding-left:1.5rem; margin-bottom:0.5rem; }}
     .markdown-body blockquote {{ border-left: 3px solid var(--bs-border-color); margin: 0.5rem 0; padding-left: 0.75rem; color: var(--bs-secondary-color); }}
     .usage-line {{ font-size: 0.75rem; color: var(--bs-secondary-color); margin-top: 0.4rem; }}
+    .attachment-grid {{ display:flex; flex-wrap:wrap; gap:.4rem; margin-bottom:.45rem; }}
+    .attachment-grid:empty {{ display:none; }}
+    .attachment-thumb {{ width:96px; height:96px; object-fit:cover; border-radius:6px; }}
+    .attachment-unavailable {{ font-size:.78rem; color:var(--bs-secondary-color); }}
+    /* Chat search results: a title line plus up to three snippet lines. */
+    .search-result {{ display: block; padding: 0.4rem 0.75rem; border-radius: 6px; text-decoration: none; color: var(--bs-body-color); font-size: 0.85rem; }}
+    .search-result:hover {{ background: var(--bs-secondary-bg); color: var(--bs-body-color); }}
+    .search-result .result-title {{ font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .search-result .result-hit {{ color: var(--bs-secondary-color); font-size: 0.8rem; overflow-wrap: anywhere; }}
+    .search-result .result-hit b {{ color: var(--bs-body-color); }}
+    mark.search-hit {{ padding: 0 1px; border-radius: 2px; }}
+    .msg-user[id], .msg-assistant[id] {{ scroll-margin-top: 0.75rem; }}
     {extra_style}
   </style>
 </head>
@@ -3015,7 +3144,19 @@ mod templates {
           </button>
         </form>
       </div>
-      <div class="chat-list px-2 pb-2">
+      <div class="px-2 pb-2">
+        <div class="input-group input-group-sm">
+          <span class="input-group-text"><i class="bi bi-search"></i></span>
+          <input type="search" id="chatSearch" class="form-control" autocomplete="off"
+                 placeholder="Search chats (Ctrl+K)" aria-label="Search chats"
+                 title="Type to filter by title. Press Enter to search message text too. Words can be in any order; &quot;quote&quot; an exact phrase.">
+        </div>
+      </div>
+      <div id="searchResults" class="px-2 pb-2" hidden>
+        <div class="small text-muted px-1 pb-1" id="searchStatus"></div>
+        <div id="searchResultList"></div>
+      </div>
+      <div class="chat-list px-2 pb-2" id="chatList">
         {sidebar_chats}
       </div>
       <div class="mt-auto border-top p-2 d-md-none">
@@ -3075,6 +3216,9 @@ mod templates {
       const bsOffcanvas = bootstrap.Offcanvas.getInstance(offcanvas);
       if (bsOffcanvas && offcanvas.classList.contains('show')) {{ bsOffcanvas.hide(); }}
     }});
+  </script>
+  <script>
+{search_js}
   </script>
   {scripts}
 </body>
@@ -3172,17 +3316,17 @@ mod templates {
 
         for turn in turns {
             match &turn.turn_type {
-                TurnType::User { content, attachments } => {
+                TurnType::User { content, attachments, index } => {
                     let cards: String = attachments.iter().map(|a| if a.kind == "image" && a.id.starts_with("sha256:") { let d = &a.id[7..]; format!(r#"<img class="attachment-thumb" src="/attachments/{}/thumbnail" alt="{}" loading="lazy">"#, d, escape_html(&a.name)) } else { format!("<span class=\"attachment-unavailable\">Attachment unavailable: {}</span>", escape_html(&a.name)) }).collect();
                     messages_html.push_str(&format!(
-                        r#"<div class="msg-user"><div class="bubble-user"><div class="attachment-grid">{}</div>{}</div></div>"#,
-                        cards, escape_html(content)
+                        r#"<div class="msg-user" id="msg-{}"><div class="bubble-user"><div class="attachment-grid">{}</div>{}</div></div>"#,
+                        index, cards, escape_html(content)
                     ));
                 }
-                TurnType::Assistant { html } => {
+                TurnType::Assistant { html, index } => {
                     messages_html.push_str(&format!(
-                        r#"<div class="msg-assistant"><div class="bubble-assistant"><div class="markdown-body">{}</div></div></div>"#,
-                        html
+                        r#"<div class="msg-assistant" id="msg-{}"><div class="bubble-assistant"><div class="markdown-body">{}</div></div></div>"#,
+                        index, html
                     ));
                 }
                 TurnType::ToolUse { events } => {
@@ -3410,6 +3554,8 @@ mod templates {
 </div>"##
         );
 
+        // Marks and scrolls to search hits (#hits=…), shared with the other editions.
+        let search_hits_js = include_str!("../templates/search-hits.js");
         let scripts = format!(
             r##"<script>
 const CHAT_ID = {chat_id_json};
@@ -3429,7 +3575,8 @@ let pendingFiles = [];
 let wakeLock = null;
 
 document.addEventListener('DOMContentLoaded', () => {{
-  scrollToBottom();
+  if (!revealSearchHits()) scrollToBottom();
+  window.addEventListener('hashchange', revealSearchHits);
   confirmModal = new bootstrap.Modal(document.getElementById('confirmModal'));
   sudoModal    = new bootstrap.Modal(document.getElementById('sudoModal'));
   renameModal  = new bootstrap.Modal(document.getElementById('renameModal'));
@@ -3481,6 +3628,7 @@ document.addEventListener('DOMContentLoaded', () => {{
   }}
 }});
 
+{search_hits_js}
 function scrollToBottom() {{
   const area = document.getElementById('messagesArea');
   area.scrollTop = area.scrollHeight;
@@ -4437,6 +4585,13 @@ function submitQuestion(override) {{
             ""
         };
 
+        let theme_options: String = [("system", "Follow system"), ("light", "Light"), ("dark", "Dark")]
+            .iter()
+            .map(|(value, label)| {
+                let sel = if theme_mode(config) == *value { " selected" } else { "" };
+                format!(r#"<option value="{value}"{sel}>{label}</option>"#)
+            })
+            .collect();
         let tc_none_sel = if config.tool_confirmation == "none" {
             " selected"
         } else {
@@ -4532,6 +4687,11 @@ function submitQuestion(override) {{
           <option value="safe"{tc_safe_sel}>Auto-approve read-only tools (Safe)</option>
           <option value="all"{tc_all_sel}>YOLO — approve everything automatically</option>
         </select>
+      </div>
+      <div class="mb-3">
+        <label class="form-label fw-semibold">Theme</label>
+        <select name="theme_mode" class="form-select">{theme_options}</select>
+        <div class="form-text">Shared with the desktop app via <code>theme_mode</code></div>
       </div>
       <div class="mb-3">
         <label class="form-label fw-semibold">Reasoning Effort</label>
@@ -5058,6 +5218,85 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "assistant_message");
         assert_eq!(v["html"], "<p>checking</p>");
+    }
+
+    #[test]
+    fn theme_mode_is_validated() {
+        let mut config = Config::default();
+        for (set, want) in [("dark", "dark"), ("light", "light"), ("system", "system"), ("DARK", "system"), ("", "system")] {
+            config.theme_mode = set.into();
+            assert_eq!(templates::theme_mode(&config), want);
+        }
+    }
+
+    #[test]
+    fn pages_are_themed_with_tokens_not_hardcoded_colours() {
+        let page = templates::about_page(&[]);
+        let tag = &page[page.find("<html").unwrap()..];
+        let tag = &tag[..tag.find('>').unwrap()];
+        assert!(tag.contains("data-bs-theme=") && tag.contains("data-theme-mode="), "{tag}");
+        // The resolver runs before the stylesheet, so a dark page never flashes light.
+        let resolver = page.find("prefers-color-scheme").unwrap();
+        assert!(resolver < page.find("bootstrap.min.css").unwrap());
+        for token in ["--pengy-code-bg", "--pengy-code-fg", "--pengy-inline-code-fg"] {
+            assert!(page.matches(token).count() >= 3, "{token} not defined for both themes and used");
+        }
+        // Colours belong in the token block; the tool-card accent is a
+        // deliberate theme-agnostic highlight.
+        let after_tokens = &page[page.find("[data-bs-theme=\"dark\"]").unwrap()..];
+        let after_tokens = &after_tokens[after_tokens.find("</style>").unwrap()..];
+        let hex = regex::Regex::new(r"#[0-9a-fA-F]{6}\b").unwrap();
+        let strays: Vec<&str> = hex
+            .find_iter(after_tokens)
+            .map(|m| m.as_str())
+            .filter(|h| !h.eq_ignore_ascii_case("#f9e2af"))
+            .collect();
+        assert!(strays.is_empty(), "hardcoded colours outside the token block: {strays:?}");
+    }
+
+    #[test]
+    fn rendered_links_keep_only_safe_schemes_and_code_stays_literal() {
+        let html = render_markdown(
+            "[bad](javascript:alert(1)) [bad2](JaVa\tScript:x) [ok](https://x.org) [w](https://en.wikipedia.org/wiki/Foo_(bar)) [rel](/tmp/a.txt) ![i](data:text/html,x)",
+        );
+        assert!(!html.to_lowercase().contains("javascript") && !html.contains("data:"), "{html}");
+        assert!(html.contains(r#"<a>bad</a>"#), "{html}");
+        assert!(html.contains(r#"href="https://x.org""#), "{html}");
+        assert!(html.contains(r#"href="https://en.wikipedia.org/wiki/Foo_(bar)""#), "{html}");
+        assert!(html.contains("/tmp/a.txt"), "{html}");
+        assert!(html.contains(r#"<img alt="i">"#), "{html}");
+        let html = render_markdown("call `f(*args*, **kw**)` then *done*");
+        assert!(html.contains("<code>f(*args*, **kw**)</code>") && html.contains("<em>done</em>"), "{html}");
+        // Raw HTML from the model is shown, never parsed.
+        assert!(render_markdown("<img src=x onerror=alert(1)>").contains("&lt;img"));
+    }
+
+    #[test]
+    fn messages_carry_their_stored_index_for_search_jumps() {
+        let msg: fn(&str, &str) -> ChatMessage = |role, text| ChatMessage::new(role, Some(serde_json::json!(text)));
+        let mut asks = msg("assistant", "Reading.");
+        asks.tool_calls = vec![chat_manager::ToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: chat_manager::FunctionCall { name: "glob".into(), arguments: "{}".into() },
+        }];
+        let mut orphan = msg("tool", "stray");
+        orphan.tool_call_id = Some("nobody".into());
+        // No result for c1 (the repair inserts a placeholder) and an orphan
+        // tool message (the repair drops it): both shift raw positions.
+        let raw = vec![msg("user", "read it"), asks, orphan, msg("assistant", "the nginx answer")];
+        let mut chat = Chat::new("t");
+        chat.messages = raw.clone();
+        let turns = group_messages(&raw);
+        let html = templates::chat_page(&chat, &[], &Config::default(), &turns, false);
+        for (id, text) in [("msg-0", "read it"), ("msg-1", "Reading."), ("msg-3", "the nginx answer")] {
+            let at = html.find(&format!("id=\"{id}\"")).unwrap_or_else(|| panic!("{id} missing"));
+            assert!(html[at..].find(text).unwrap() < 200, "{id} should hold {text:?}");
+        }
+        assert!(!html.contains("id=\"msg-2\""));
+        // Sidebar search box and the hit-revealing script are on the page.
+        assert!(html.contains("id=\"chatSearch\"") && html.contains("id=\"chatList\""));
+        assert!(html.contains("function revealSearchHits()") && html.contains("function runSearch()"));
     }
 
     #[test]

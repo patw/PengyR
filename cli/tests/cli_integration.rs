@@ -426,6 +426,26 @@ fn title_generates_marks_and_saves() {
 }
 
 #[test]
+fn search_numbers_messages_and_load_prints_one() {
+    let h = Harness::new();
+    h.seed_chat(
+        "t",
+        vec![user_msg("hello"), assistant_msg("hi"), user_msg("how do I set up nginx"),
+             assistant_msg("Install **nginx** and edit the config.")],
+    );
+    let out = h.run(&["/search NGINX", "/load 1 #4", "/load 1 9", "/search zzz", "/search"]);
+    assert!(out.contains("#3    You:") && out.contains("#4    AI:"), "{out}");
+    assert!(out.contains("1 chat found. /load <#> to open one"), "{out}");
+    assert!(out.contains("── #4 Assistant"), "{out}");
+    // The whole message, the last search's words marked.
+    assert!(out.contains("Install **\x1b[1m\x1b[33mnginx\x1b[0m** and edit the config."), "{out}");
+    assert!(out.contains("/show 1 to read on from here"), "{out}");
+    assert!(out.contains("No message #9; this chat has 4."), "{out}");
+    assert!(out.contains("No chats match."), "{out}");
+    assert!(out.contains("Usage: /search <words>"), "{out}");
+}
+
+#[test]
 fn title_failure_keeps_the_title() {
     let h = Harness::new();
     let chat = h.seed_chat("Old Title", vec![]);

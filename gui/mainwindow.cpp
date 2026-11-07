@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include <QShortcut>
 #include "toolconfirmdialog.h"
 #include "chathistory.h"
 #include "chatview.h"
@@ -100,6 +101,11 @@ void MainWindow::setupUi() {
     connect(m_chatHistory, &ChatHistoryWidget::tasksRequested, this, &MainWindow::openTasks);
     connect(m_chatHistory, &ChatHistoryWidget::deleteRequested, this, &MainWindow::deleteChat);
     connect(m_chatHistory, &ChatHistoryWidget::editRequested, this, &MainWindow::editChat);
+    connect(m_chatHistory, &ChatHistoryWidget::searchHitSelected, this, &MainWindow::onSearchHitSelected);
+    for (const QKeySequence& keys : {QKeySequence("Ctrl+K"), QKeySequence("Ctrl+Shift+F")}) {
+        auto* shortcut = new QShortcut(keys, this);
+        connect(shortcut, &QShortcut::activated, m_chatHistory, &ChatHistoryWidget::focusSearch);
+    }
     connect(m_chatHistory, &ChatHistoryWidget::modelChanged, this, &MainWindow::onModelChanged);
     connect(m_chatHistory, &ChatHistoryWidget::effortChanged, this, &MainWindow::onEffortChanged);
     leftSplitter->addWidget(m_chatHistory);
@@ -304,8 +310,8 @@ TabSession* MainWindow::addTab(const QJsonObject& chat, bool switchTo) {
 
     // Render existing messages
     QJsonArray messages = chat["messages"].toArray();
-    for (const QJsonValue& v : messages)
-        renderMessage(chatView, v.toObject());
+    for (int i = 0; i < messages.size(); ++i)
+        renderMessage(chatView, messages[i].toObject(), i);
     chatView->renderNow();
 
     QString chatId = chat["id"].toString();
@@ -474,21 +480,21 @@ QJsonObject MainWindow::assistantDisplayMessage(const QJsonObject& msg) {
     return display;
 }
 
-void MainWindow::renderMessage(ChatView* view, const QJsonObject& msg) {
+void MainWindow::renderMessage(ChatView* view, const QJsonObject& msg, int index) {
     QString role = msg["role"].toString();
 
     if (role == "user") {
         QJsonObject display;
         display["content"] = msg["content"];
         display["attachments"] = msg["attachments"];
-        view->appendMessage("user", display, false);
+        view->appendMessage("user", display, false, index);
 
     } else if (role == "assistant") {
         // Text first, tool cards after: the model wrote its narration *before*
         // deciding on the tool calls in the same message, and that is the order
         // the live run renders it in.
         if (!msg["content"].toString().isEmpty())
-            view->appendMessage("assistant", assistantDisplayMessage(msg), false);
+            view->appendMessage("assistant", assistantDisplayMessage(msg), false, index);
 
         for (const QJsonValue& tc : msg["tool_calls"].toArray()) {
             QJsonObject tcObj = tc.toObject();
@@ -581,6 +587,14 @@ void MainWindow::deleteChat(const QString& chatId) {
         createNewChat();
 
     saveOpenTabs();
+}
+
+void MainWindow::onSearchHitSelected(const QString& chatId, const QList<int>& sources,
+                                     const QStringList& terms) {
+    // A search result was clicked: open its chat and show the hits.
+    loadChat(chatId);
+    TabSession* session = tabForChat(chatId);
+    if (session && !sources.isEmpty()) session->chatView->revealHits(sources, terms);
 }
 
 void MainWindow::loadChat(const QString& chatId) {
@@ -736,7 +750,7 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     QJsonObject display;
     display["content"] = text;
     display["attachments"] = attachmentRefs;
-    session->chatView->appendMessage("user", display);
+    session->chatView->appendMessage("user", display, true, messages.size() - 1);
 
     // Update title from first message
     if (session->chat["title"].toString() == "New Chat") {
@@ -968,7 +982,8 @@ void MainWindow::onWorkerEvent(const QString& eventJson) {
         // and shows on reload, so it has to render live too -- before the tool
         // cards, which is the order it was written in.
         if (!msg["content"].toString().trimmed().isEmpty())
-            session->chatView->appendMessage("assistant", assistantDisplayMessage(msg));
+            session->chatView->appendMessage("assistant", assistantDisplayMessage(msg), true,
+                                             session->chat["messages"].toArray().size());
         QJsonArray messages = session->chat["messages"].toArray();
         messages.append(msg);
         session->chat["messages"] = messages;
@@ -1033,7 +1048,7 @@ void MainWindow::handleFinalResponse(TabSession* session, const QJsonObject& res
             display["reasoning_content"] = asstMsg["reasoning_content"];
         else if (asstMsg.contains("reasoning"))
             display["reasoning_content"] = asstMsg["reasoning"];
-        session->chatView->appendMessage("assistant", display);
+        session->chatView->appendMessage("assistant", display, true, messages.size() - 1);
     }
     // Persist metrics even if the final response has no visible content.
     QByteArray chatJson = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
@@ -1262,8 +1277,9 @@ void MainWindow::redactLast() {
     pengy_chat_save(chatJson.constData());
 
     session->chatView->clear();
-    for (const QJsonValue& v : session->chat["messages"].toArray())
-        renderMessage(session->chatView, v.toObject());
+    const QJsonArray remaining = session->chat["messages"].toArray();
+    for (int i = 0; i < remaining.size(); ++i)
+        renderMessage(session->chatView, remaining[i].toObject(), i);
     session->chatView->renderNow();
 }
 
