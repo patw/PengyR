@@ -595,7 +595,7 @@ pub fn unreachable_help(base_url: &str, detail: &str) -> String {
 }
 
 /// A short description of a transport failure, for [`unreachable_help`].
-fn transport_detail(error: &reqwest::Error) -> String {
+pub(crate) fn transport_detail(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "timed out".into()
     } else if error.is_connect() {

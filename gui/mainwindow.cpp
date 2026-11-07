@@ -6,6 +6,9 @@
 #include "chatworker.h"
 #include "settingsdialog.h"
 #include "tasksdialog.h"
+#include "editchatdialog.h"
+#include "bulkrename.h"
+#include "chattitle.h"
 #include "themehelper.h"
 #include "iconhelper.h"
 #include <QTabBar>
@@ -96,6 +99,7 @@ void MainWindow::setupUi() {
     connect(m_chatHistory, &ChatHistoryWidget::settingsRequested, this, &MainWindow::openSettings);
     connect(m_chatHistory, &ChatHistoryWidget::tasksRequested, this, &MainWindow::openTasks);
     connect(m_chatHistory, &ChatHistoryWidget::deleteRequested, this, &MainWindow::deleteChat);
+    connect(m_chatHistory, &ChatHistoryWidget::editRequested, this, &MainWindow::editChat);
     connect(m_chatHistory, &ChatHistoryWidget::modelChanged, this, &MainWindow::onModelChanged);
     connect(m_chatHistory, &ChatHistoryWidget::effortChanged, this, &MainWindow::onEffortChanged);
     leftSplitter->addWidget(m_chatHistory);
@@ -595,6 +599,7 @@ void MainWindow::loadChat(const QString& chatId) {
 
 void MainWindow::openSettings() {
     SettingsDialog dlg(m_config, this);
+    connect(&dlg, &SettingsDialog::bulkRenameRequested, this, [this, &dlg]() { bulkRenameChats(&dlg); });
     if (dlg.exec() == QDialog::Accepted) {
         m_config = dlg.config();
         QByteArray json = QJsonDocument(m_config).toJson(QJsonDocument::Compact);
@@ -609,6 +614,66 @@ void MainWindow::openSettings() {
         if (session)
             updateQuickSettingsFor(session);
     }
+}
+
+void MainWindow::editChat(const QString& chatId) {
+    // An open tab's chat is the live copy (it may hold messages the disk
+    // hasn't caught up with, and its next save would clobber a title written
+    // only to disk), so edit that one when there is one.
+    TabSession* session = tabForChat(chatId);
+    QJsonObject chat;
+    if (session) {
+        chat = session->chat;
+    } else {
+        char* raw = pengy_chat_get(chatId.toUtf8().constData());
+        if (!raw) return;
+        chat = QJsonDocument::fromJson(QByteArray(raw)).object();
+        pengy_free(raw);
+    }
+    if (chat.isEmpty()) return;
+
+    Theme theme = makeTheme(m_config["theme_mode"].toString("system"),
+                            m_config["theme_accent"].toString("default"));
+    EditChatDialog dlg(chat, m_config["model"].toString(), theme, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString title = dlg.title();
+    const QString source = dlg.titleSource();
+    if (title == chat["title"].toString() && source == chat["title_source"].toString()) return;
+
+    QJsonObject& target = session ? session->chat : chat;
+    target["title"] = title;
+    if (source.isEmpty()) target.remove("title_source");
+    else target["title_source"] = source;
+    QByteArray json = QJsonDocument(target).toJson(QJsonDocument::Compact);
+    pengy_chat_save(json.constData());
+    m_chatHistory->updateChatTitle(chatId, title);
+    if (session) updateTabTitle(session);
+}
+
+void MainWindow::bulkRenameChats(QWidget* parent) {
+    // Settings → UI → Bulk Rename Chats, with the saved default model.
+    std::optional<bool> redo = confirmBulkRename(parent, m_config["model"].toString(),
+                                                 m_config["base_url"].toString());
+    if (!redo) return;
+    BulkRenameDialog dlg(ChatTitle::bulkTargets(*redo), *redo,
+                         [this](const QString& id, const QString& title) { applyBulkTitle(id, title); },
+                         parent);
+    dlg.start();
+    dlg.exec();
+}
+
+void MainWindow::applyBulkTitle(const QString& chatId, const QString& title) {
+    // The title is already on disk. An open tab saves its own copy, and one of
+    // those saves may have landed between the core's write and this call, so
+    // put the title in the copy and write it again.
+    if (TabSession* session = tabForChat(chatId)) {
+        session->chat["title"] = title;
+        session->chat["title_source"] = ChatTitle::kSourceModel;
+        QByteArray json = QJsonDocument(session->chat).toJson(QJsonDocument::Compact);
+        pengy_chat_save(json.constData());
+        updateTabTitle(session);
+    }
+    m_chatHistory->updateChatTitle(chatId, title);
 }
 
 void MainWindow::openTasks() {

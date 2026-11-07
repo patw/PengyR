@@ -90,6 +90,7 @@ message(STATUS "Pengy core: ${PENGY_CORE_LIB} (static=${PENGY_RUST_STATIC})")
 add_executable(pengy WIN32
   main.cpp mainwindow.cpp toolconfirmdialog.cpp chathistory.cpp chatview.cpp
   chatinput.cpp chatworker.cpp settingsdialog.cpp tasksdialog.cpp
+  editchatdialog.cpp bulkrename.cpp chattitle_ffi.cpp
   resources.qrc
 )
 
@@ -202,6 +203,15 @@ if(PENGY_BUILD_TESTS)
   target_include_directories(pengy_toolconfirm_test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(pengy_toolconfirm_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
   add_test(NAME pengy_toolconfirm_test COMMAND pengy_toolconfirm_test)
+
+  # Edit Chat + Bulk Rename dialogs against a canned ChatTitle (no core, no
+  # endpoint). Same test file as PengyCPP's.
+  add_executable(pengy_editchat_test
+    tests/test_editchat.cpp tests/stub_chattitle.cpp editchatdialog.cpp bulkrename.cpp resources.qrc)
+  target_compile_definitions(pengy_editchat_test PRIVATE PENGY_UNIT_TEST)
+  target_include_directories(pengy_editchat_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_editchat_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
+  add_test(NAME pengy_editchat_test COMMAND pengy_editchat_test)
 
   # chathistory.cpp calls into the Rust core (pengy_ffi.h), so this test
   # target needs the same platform-specific link set as the main `pengy`

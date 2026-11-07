@@ -302,5 +302,23 @@ fn split_store_behaves() {
     );
     assert_eq!(saved.messages.len(), 2, "worker's newer messages must land");
 
+    // title_source ("model"/"user", written by Bulk Rename / Edit Chat) must
+    // survive a save here, or the next Bulk Rename retitles the chat; a
+    // mid-run rename's source is adopted just like its title.
+    reset(&dir);
+    let mut worker_copy = mk("Original", vec![user_msg("hi")]);
+    let mut renamer_copy = get_chat(&worker_copy.id).unwrap();
+    renamer_copy.title = "Mine".into();
+    renamer_copy.title_source = Some("user".into());
+    save_chat(&renamer_copy).unwrap();
+    worker_copy.messages.push(user_msg("more"));
+    save_chat_progress(&mut worker_copy).unwrap();
+    let saved = get_chat(&worker_copy.id).unwrap();
+    assert_eq!(saved.title_source.as_deref(), Some("user"));
+    let entry = load_index().into_iter().find(|e| e.id == saved.id).unwrap();
+    assert_eq!(entry.title_source.as_deref(), Some("user"));
+    let raw = std::fs::read_to_string(dir.join("chats").join(format!("{}.json", saved.id))).unwrap();
+    assert!(raw.contains("\"title_source\""), "key must be written to the chat file");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

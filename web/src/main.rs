@@ -1,5 +1,6 @@
 use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage, ChatSummary};
+use pengy_core::chat_title;
 use pengy_core::config::{self, Config};
 use pengy_core::llm_client::{self, Confirmation, LlmEvent, ToolConfirmation};
 use pengy_core::task_manager;
@@ -137,6 +138,7 @@ async fn main() {
         .route("/chat/:chat_id/export", get(chat_export))
         .route("/chat/:chat_id/export/:format", get(chat_export_bundle))
         .route("/chat/:chat_id/rename", post(chat_rename))
+        .route("/chat/:chat_id/title/generate", post(chat_generate_title))
         .route("/chat/:chat_id/redact", post(chat_redact))
         .route("/chat/:chat_id/command", post(chat_command))
         .route("/tasks", get(list_tasks))
@@ -1803,6 +1805,9 @@ async fn chat_export(Path(chat_id): Path<String>) -> impl IntoResponse {
 #[derive(Deserialize)]
 struct RenameRequest {
     title: Option<String>,
+    /// "model" when the client saves an unedited generated title; anything a
+    /// person typed is "user", which Bulk Rename never overwrites.
+    source: Option<String>,
 }
 
 async fn chat_rename(
@@ -1829,9 +1834,31 @@ async fn chat_rename(
         }
     };
 
+    let source = match data.source.as_deref() {
+        Some(chat_manager::TITLE_SOURCE_MODEL) => chat_manager::TITLE_SOURCE_MODEL,
+        _ => chat_manager::TITLE_SOURCE_USER,
+    };
     chat.title = new_title.clone();
+    chat.title_source = Some(source.into());
     chat_manager::save_chat(&chat).ok();
     Json(serde_json::json!({"status": "ok", "title": new_title})).into_response()
+}
+
+/// Suggest a title with the configured model. Does not save it.
+async fn chat_generate_title(Path(chat_id): Path<String>) -> impl IntoResponse {
+    let Some(chat) = chat_manager::get_chat(&chat_id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Chat not found"}))).into_response();
+    };
+    let config = config::load_config();
+    match chat_title::generate_title(&config, &chat).await {
+        Ok(title) => Json(serde_json::json!({"title": title})).into_response(),
+        Err(chat_title::TitleError::Unusable(m)) => {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": m}))).into_response()
+        }
+        Err(chat_title::TitleError::Failed(m)) => {
+            (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": m}))).into_response()
+        }
+    }
 }
 
 // ── Redact ─────────────────────────────────────────────────────
@@ -2065,6 +2092,7 @@ async fn chat_command(
         let new_title = args.join(" ");
         if let Some(mut chat) = chat_manager::get_chat(&chat_id) {
             chat.title = new_title.clone();
+            chat.title_source = Some(chat_manager::TITLE_SOURCE_USER.into());
             chat_manager::save_chat(&chat).ok();
             return Json(serde_json::json!({
                 "type": "rename",
@@ -2074,10 +2102,29 @@ async fn chat_command(
         }
     }
 
+    if cmd == "/title" {
+        if let Some(mut chat) = chat_manager::get_chat(&chat_id) {
+            let new_title = match chat_title::generate_title(&config, &chat).await {
+                Ok(t) => t,
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "type": "message",
+                        "message": format!("Couldn't generate a title: {e}"),
+                    }))
+                    .into_response();
+                }
+            };
+            chat.title = new_title.clone();
+            chat.title_source = Some(chat_manager::TITLE_SOURCE_MODEL.into());
+            chat_manager::save_chat(&chat).ok();
+            return Json(serde_json::json!({"type": "rename", "title": new_title})).into_response();
+        }
+    }
+
     if cmd == "/help" {
         return Json(serde_json::json!({
             "type": "message",
-            "message": "Slash commands: /new /yolo [none|safe|all] /model <name> /rename <title> /export /help",
+            "message": "Slash commands: /new /yolo [none|safe|all] /model <name> /rename <title> /title /export /help",
         }))
         .into_response();
     }
@@ -2898,6 +2945,12 @@ mod templates {
     .chat-list-item .delete-btn {{ opacity: 0; border: none; background: none; color: var(--bs-secondary-color); padding: 0.25rem 0.35rem; font-size: 0.8rem; flex-shrink: 0; min-width: 28px; min-height: 28px; }}
     @media (hover: none) and (pointer: coarse) {{ .chat-list-item .delete-btn {{ opacity: 0.5; }} }}
     .chat-list-item:hover .delete-btn {{ opacity: 1; }}
+    /* The chat bubble doubles as the Edit Chat button: it turns into a pencil on hover. */
+    .chat-list-item .edit-btn {{ border: none; background: none; color: var(--bs-secondary-color); padding: 0; margin: -0.25rem 0 -0.25rem -0.35rem; font-size: 0.8rem; flex-shrink: 0; min-width: 28px; min-height: 28px; border-radius: 4px; }}
+    .chat-list-item .edit-btn .bi-pencil {{ display: none; }}
+    .chat-list-item .edit-btn:hover, .chat-list-item .edit-btn:focus-visible {{ color: var(--bs-primary); background: var(--bs-tertiary-bg); }}
+    .chat-list-item .edit-btn:hover .bi-pencil, .chat-list-item .edit-btn:focus-visible .bi-pencil {{ display: inline; }}
+    .chat-list-item .edit-btn:hover .bi-chat-left-text, .chat-list-item .edit-btn:focus-visible .bi-chat-left-text {{ display: none; }}
     .chat-list-item .delete-btn:hover {{ color: var(--bs-danger); }}
     .messages-area {{ flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 1rem 0.75rem; }}
     @media (min-width: 576px) {{ .messages-area {{ padding: 1.25rem 1rem; }} }}
@@ -3035,7 +3088,9 @@ mod templates {
             let active_class = if c.id == active_id { " active" } else { "" };
             html.push_str(&format!(
                 r##"<a href="/chat/{id}" class="chat-list-item{active_class}" data-chat-id="{id}">
-  <i class="bi bi-chat-left-text small text-muted flex-shrink-0"></i>
+  <button type="button" class="edit-btn" title="Edit chat (rename, generate title, export)" aria-label="Edit chat" onclick="event.preventDefault(); event.stopPropagation(); openEditChat('{id}')">
+    <i class="bi bi-chat-left-text"></i><i class="bi bi-pencil"></i>
+  </button>
   <span class="chat-title">{title}</span>
   <form action="/chat/{id}/delete" method="post" style="display:inline" onclick="event.stopPropagation()">
     <button type="submit" class="delete-btn" title="Delete chat" onclick="return confirm('Delete this chat?')">
@@ -3276,18 +3331,30 @@ mod templates {
     </div>
   </div>
 </div>
+<!-- Edit Chat Modal: rename, generate a title with the model, export -->
 <div class="modal fade" id="renameModal" tabindex="-1">
-  <div class="modal-dialog modal-sm">
+  <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h6 class="modal-title">Rename Chat</h6>
+        <h6 class="modal-title">Edit Chat</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-        <input type="text" id="renameInput" class="form-control" value="" placeholder="Chat title...">
+        <label for="renameInput" class="form-label small text-muted">Title</label>
+        <div class="input-group">
+          <input type="text" id="renameInput" class="form-control" value="" placeholder="Chat title...">
+          <button class="btn btn-outline-secondary" type="button" id="generateTitleBtn" onclick="generateTitle()" title="Generate a title with the configured model">
+            <i class="bi bi-stars"></i> Generate
+          </button>
+        </div>
+        <div class="small text-danger mt-2" id="editChatError" hidden></div>
       </div>
       <div class="modal-footer">
+        <a class="btn btn-sm btn-outline-secondary me-auto" id="editChatExport" href="#" target="_blank">
+          <i class="bi bi-download"></i> Export as Markdown
+        </a>
         <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-        <button class="btn btn-sm btn-primary" onclick="doRename()">Rename</button>
+        <button class="btn btn-sm btn-primary" onclick="doRename()">Save</button>
       </div>
     </div>
   </div>
@@ -3626,27 +3693,95 @@ function exportChat() {{
   window.open(`/chat/${{CHAT_ID}}/export`, '_blank');
 }}
 
+// ── Edit Chat (rename / generate title / export) ─────────────
+// Opened from any sidebar row's chat bubble, or by double-clicking the
+// navbar title for the current chat. Generate only fills the field;
+// nothing is written until Save.
+
+let editChatId = CHAT_ID;
+let editChatOriginal = '';
+let generatedTitle = '';
+let titleRequest = 0;
+
 function showRename() {{
-  document.getElementById('renameInput').value = document.title.replace(' — Pengy', '');
+  openEditChat(CHAT_ID);
+}}
+
+function openEditChat(chatId) {{
+  editChatId = chatId;
+  titleRequest++;  // a reply for a previously opened chat must not land here
+  const row = document.querySelector(`[data-chat-id="${{chatId}}"] .chat-title`);
+  const current = chatId === CHAT_ID
+    ? document.title.replace(' — Pengy', '')
+    : (row ? row.textContent.trim() : '');
+  editChatOriginal = current;
+  generatedTitle = '';
+  document.getElementById('renameInput').value = current;
+  document.getElementById('editChatExport').href = `/chat/${{chatId}}/export`;
+  setEditChatError('');
+  resetGenerateBtn();
   renameModal.show();
-  setTimeout(() => document.getElementById('renameInput').focus(), 300);
+  setTimeout(() => document.getElementById('renameInput').select(), 300);
+}}
+
+function setEditChatError(text) {{
+  const el = document.getElementById('editChatError');
+  el.textContent = text;
+  el.hidden = !text;
+}}
+
+function resetGenerateBtn() {{
+  const btn = document.getElementById('generateTitleBtn');
+  btn.disabled = false;
+  btn.innerHTML = '<i class="bi bi-stars"></i> Generate';
+}}
+
+function generateTitle() {{
+  const btn = document.getElementById('generateTitleBtn');
+  const request = ++titleRequest;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status"></span> Generating…';
+  setEditChatError('');
+  fetch(`/chat/${{editChatId}}/title/generate`, {{method: 'POST'}})
+    .then(r => r.json().then(data => ({{ok: r.ok, data}})))
+    .then(({{ok, data}}) => {{
+      if (request !== titleRequest) return;
+      if (!ok || !data.title) {{
+        setEditChatError("Couldn't generate a title: " + (data.error || 'unknown error'));
+        return;
+      }}
+      const input = document.getElementById('renameInput');
+      generatedTitle = data.title;
+      input.value = data.title;
+      input.focus();
+    }})
+    .catch(err => {{
+      if (request === titleRequest) setEditChatError("Couldn't generate a title: " + err);
+    }})
+    .finally(() => {{ if (request === titleRequest) resetGenerateBtn(); }});
 }}
 
 function doRename() {{
   const newTitle = document.getElementById('renameInput').value.trim();
   if (!newTitle) return;
+  const chatId = editChatId;
+  titleRequest++;
   renameModal.hide();
-  fetch(`/chat/${{CHAT_ID}}/rename`, {{
+  // Saving an untouched title is a no-op, so it can't mark an automatic title
+  // as hand-picked (which would hide it from Bulk Rename).
+  if (newTitle === editChatOriginal && !generatedTitle) return;
+  const source = newTitle === generatedTitle ? 'model' : 'user';
+  fetch(`/chat/${{chatId}}/rename`, {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{title: newTitle}}),
+    body: JSON.stringify({{title: newTitle, source}}),
   }})
   .then(r => r.json())
   .then(data => {{
     if (data.title) {{
-      const el = document.querySelector(`[data-chat-id="${{CHAT_ID}}"] .chat-title`);
+      const el = document.querySelector(`[data-chat-id="${{chatId}}"] .chat-title`);
       if (el) el.textContent = data.title;
-      document.title = data.title + ' — Pengy';
+      if (chatId === CHAT_ID) document.title = data.title + ' — Pengy';
     }}
   }});
 }}

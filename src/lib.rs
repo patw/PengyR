@@ -7,6 +7,7 @@
 pub mod about;
 pub mod attachments;
 pub mod chat_manager;
+pub mod chat_title;
 pub mod config;
 pub mod context_recovery;
 pub mod context_pressure;
@@ -183,6 +184,72 @@ pub extern "C" fn pengy_chat_add_usage(
     };
     chat_manager::add_usage(&mut chat, &usage);
     to_c(&serde_json::to_string(&chat).unwrap_or_default())
+}
+
+// ── Chat titles (Edit Chat / Bulk Rename) ─────────────────────────
+
+fn title_result(result: Result<String, chat_title::TitleError>) -> *mut c_char {
+    let json = match result {
+        Ok(title) => serde_json::json!({"title": title}),
+        Err(chat_title::TitleError::Unusable(m)) => serde_json::json!({"error": m, "unusable": true}),
+        Err(chat_title::TitleError::Failed(m)) => serde_json::json!({"error": m, "unusable": false}),
+    };
+    to_c(&json.to_string())
+}
+
+/// Generate a title for `chat_json` (the caller's live copy, e.g. an open tab)
+/// with the saved default model.  Blocks for the request: call it off the UI
+/// thread.  Returns `{"title": ...}` or `{"error": ..., "unusable": bool}`;
+/// `unusable` means nothing to name the chat from / an empty reply, not an
+/// endpoint failure.
+#[no_mangle]
+pub extern "C" fn pengy_title_generate(chat_json: *const c_char) -> *mut c_char {
+    let chat: chat_manager::Chat = match serde_json::from_str(&unsafe { cstr(chat_json) }) {
+        Ok(c) => c,
+        Err(e) => return title_result(Err(chat_title::TitleError::Unusable(e.to_string()))),
+    };
+    let config = config::load_config();
+    title_result(rt().block_on(chat_title::generate_title(&config, &chat)))
+}
+
+/// Bulk Rename's per-chat step, done entirely on the Rust side so a huge chat
+/// never crosses the FFI boundary: load `chat_id`, skip it unless its
+/// `title_source` wants renaming (`redo` as in `bulk_rename_targets`), generate
+/// a title and write it with `set_chat_title(.., "model")`.  Blocks; call off
+/// the UI thread.  Returns `{"status": "renamed"|"unchanged"|"kept"|"skipped"
+/// |"failed", "title"?, "error"?}`.
+#[no_mangle]
+pub extern "C" fn pengy_title_bulk_step(chat_id: *const c_char, redo: bool) -> *mut c_char {
+    let id = unsafe { cstr(chat_id) };
+    let Some(chat) = chat_manager::get_chat(&id) else {
+        return to_c(&serde_json::json!({"status": "skipped"}).to_string());
+    };
+    if !chat_title::wants_rename(chat.title_source.as_deref(), redo) {
+        return to_c(&serde_json::json!({"status": "kept"}).to_string());
+    }
+    let config = config::load_config();
+    let result = rt().block_on(chat_title::generate_title(&config, &chat));
+    let old_title = chat.title.clone();
+    drop(chat); // some chats are hundreds of MB; don't hold two at once
+    let json = match result {
+        Err(chat_title::TitleError::Unusable(_)) => serde_json::json!({"status": "skipped"}),
+        Err(chat_title::TitleError::Failed(m)) => serde_json::json!({"status": "failed", "error": m}),
+        // Written (and marked) even when unchanged, so the next run skips it.
+        Ok(title) => match chat_manager::set_chat_title(&id, &title, Some(chat_manager::TITLE_SOURCE_MODEL)) {
+            Ok(true) if title == old_title => serde_json::json!({"status": "unchanged", "title": title}),
+            Ok(true) => serde_json::json!({"status": "renamed", "title": title}),
+            Ok(false) => serde_json::json!({"status": "skipped"}),
+            Err(e) => serde_json::json!({"status": "failed", "error": e.to_string()}),
+        },
+    };
+    to_c(&json.to_string())
+}
+
+/// JSON array of chat IDs a Bulk Rename run would visit (see
+/// `chat_title::bulk_rename_targets`).
+#[no_mangle]
+pub extern "C" fn pengy_title_bulk_targets(redo: bool) -> *mut c_char {
+    to_c(&serde_json::to_string(&chat_title::bulk_rename_targets(redo)).unwrap_or_default())
 }
 
 // ── Tasks ─────────────────────────────────────────────────────────

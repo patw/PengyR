@@ -34,6 +34,12 @@ pub struct Chat {
     /// last one). `None` until the first turn reports usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Where the title came from: "model" (generated) or "user" (typed).
+    /// `None` is the automatic first-message title. Bulk Rename only retitles
+    /// `None` chats, so this must round-trip or a chat saved here would be
+    /// retitled again (and a hand-picked title lost) by the next run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_source: Option<String>,
 }
 
 /// A message in a chat (OpenAI-compatible format).
@@ -109,6 +115,7 @@ impl Chat {
             reasoning_effort: None,
             last_response_tokens_per_second: None,
             usage: None,
+            title_source: None,
         }
     }
 }
@@ -148,6 +155,10 @@ pub struct ChatSummary {
     pub created_at: String,
     pub msg_count: usize,
     pub preview: String,
+    /// Always written (null = automatic title), matching the Python edition:
+    /// an index entry *without* the key means "unknown, read the chat file".
+    #[serde(default)]
+    pub title_source: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -254,6 +265,7 @@ fn summarize(chat: &Chat) -> ChatSummary {
         created_at: chat.created_at.clone(),
         msg_count: chat.messages.len(),
         preview: preview_of(chat),
+        title_source: chat.title_source.clone(),
     }
 }
 
@@ -509,8 +521,36 @@ pub fn save_chat_progress(chat: &mut Chat) -> io::Result<()> {
         if !on_disk.title.is_empty() && on_disk.title != chat.title {
             chat.title = on_disk.title;
         }
+        if on_disk.title_source.is_some() && on_disk.title_source != chat.title_source {
+            chat.title_source = on_disk.title_source;
+        }
     }
     save_chat(chat)
+}
+
+/// Where a chat's title came from, stored as `Chat::title_source`.  `None`
+/// is the automatic first-message title (and every chat from before the
+/// field).  Bulk Rename only touches `None` ones, which makes it resumable and
+/// leaves hand-picked titles alone.  Same values as the Python and C++ editions.
+pub const TITLE_SOURCE_MODEL: &str = "model";
+pub const TITLE_SOURCE_USER: &str = "user";
+
+/// Change only the title (and its source) of a stored chat.
+///
+/// Returns `Ok(false)` if the chat no longer exists.  Re-reads the chat
+/// immediately before writing instead of saving a copy the caller loaded
+/// earlier, so a long-running caller (Bulk Rename) cannot write back stale
+/// messages over ones another frontend saved in the meantime.
+pub fn set_chat_title(chat_id: &str, title: &str, source: Option<&str>) -> io::Result<bool> {
+    let Some(mut chat) = get_chat(chat_id) else {
+        return Ok(false);
+    };
+    chat.title = title.to_string();
+    if let Some(source) = source {
+        chat.title_source = Some(source.to_string());
+    }
+    save_chat(&chat)?;
+    Ok(true)
 }
 
 /// Get a chat by ID.

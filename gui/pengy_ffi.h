@@ -22,6 +22,11 @@ extern "C" {
     char* pengy_messages_redact_last(const char* json);
     char* pengy_chat_add_usage(const char* chat_json, const char* usage_json);
 
+    // Chat titles (Edit Chat / Bulk Rename). Blocking: call off the UI thread.
+    char* pengy_title_generate(const char* chat_json);
+    char* pengy_title_bulk_step(const char* chat_id, bool redo);
+    char* pengy_title_bulk_targets(bool redo);
+
     char* pengy_tasks_load();
     bool  pengy_tasks_save(const char* json);
     char* pengy_task_create(const char* title, const char* template_str);

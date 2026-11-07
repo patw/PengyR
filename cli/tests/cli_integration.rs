@@ -406,7 +406,32 @@ fn rename_persists_to_disk() {
     let h = Harness::new();
     let chat = h.seed_chat("Old Title", vec![]);
     h.run(&["/rename Fresh Title"]);
-    assert_eq!(h.read_chat(&chat.id).title, "Fresh Title");
+    let after = h.read_chat(&chat.id);
+    assert_eq!(after.title, "Fresh Title");
+    // A typed title is never overwritten by Bulk Rename.
+    assert_eq!(after.title_source.as_deref(), Some("user"));
+}
+
+#[test]
+fn title_generates_marks_and_saves() {
+    let h = Harness::new();
+    let chat = h.seed_chat("Old Title", vec![user_msg("how do I mount nfs at boot"), assistant_msg("fstab")]);
+    let stub = spawn_stub_llm(vec![llm_completion("\\\"NFS Mount at Boot.\\\"", 5, 5)]);
+    h.point_at(&stub.base_url);
+    let out = h.run(&["/title"]);
+    assert!(out.contains("Renamed"), "{out}");
+    let after = h.read_chat(&chat.id);
+    assert_eq!(after.title, "NFS Mount at Boot");
+    assert_eq!(after.title_source.as_deref(), Some("model"));
+}
+
+#[test]
+fn title_failure_keeps_the_title() {
+    let h = Harness::new();
+    let chat = h.seed_chat("Old Title", vec![]);
+    let out = h.run(&["/title"]);
+    assert!(out.contains("Couldn't generate a title"), "{out}");
+    assert_eq!(h.read_chat(&chat.id).title, "Old Title");
 }
 
 #[test]

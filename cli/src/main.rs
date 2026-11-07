@@ -39,6 +39,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/show",
     "/tail",
     "/rename",
+    "/title",
     "/clear",
     "/export",
     "/yolo",
@@ -451,6 +452,7 @@ impl PengyCli {
                 reasoning_effort: None,
                 last_response_tokens_per_second: None,
                 usage: None,
+                title_source: None,
             };
             self.current_chat = Some(chat);
         } else {
@@ -1133,6 +1135,7 @@ impl PengyCli {
             "/show" => self.cmd_show(args),
             "/tail" => self.cmd_tail(args),
             "/rename" => self.cmd_rename(args),
+            "/title" => self.cmd_title(),
             "/clear" => self.cmd_clear(),
             "/export" => self.cmd_export(args),
             "/config" => self.cmd_config(),
@@ -1176,6 +1179,7 @@ impl PengyCli {
             ),
             ("/tail [N]", "Show the last N messages (default 5)"),
             ("/rename <title>", "Rename the current chat"),
+            ("/title", "Generate a title for the current chat with the model"),
             ("/clear", "Clear the terminal screen"),
             ("/export [path]", "Export current chat as Markdown"),
             ("/config", "Show current configuration"),
@@ -1395,10 +1399,39 @@ impl PengyCli {
         let new_title = args.join(" ");
         let old_title = chat.title.clone();
         chat.title = new_title.clone();
+        chat.title_source = Some(chat_manager::TITLE_SOURCE_USER.into());
         chat_manager::save_chat(chat).ok();
         println!(
             "{}✓ Renamed:{} {}{}{} → {}{}{}",
             GREEN, RESET, BOLD, old_title, RESET, BOLD, new_title, RESET
+        );
+    }
+
+    /// Ask the configured model for a title and rename the current chat to it.
+    fn cmd_title(&mut self) {
+        let Some(chat) = self.current_chat.as_ref() else {
+            println!("{}No active chat.{}", DIM, RESET);
+            return;
+        };
+        println!("{}Generating title…{}", DIM, RESET);
+        let result = self
+            .rt
+            .block_on(pengy_core::chat_title::generate_title(&self.config, chat));
+        let new_title = match result {
+            Ok(t) => t,
+            Err(e) => {
+                println!("{}Couldn't generate a title:{} {}", RED, RESET, sanitize_display(&e.to_string()));
+                return;
+            }
+        };
+        let chat = self.current_chat.as_mut().unwrap();
+        let old_title = chat.title.clone();
+        chat.title = new_title.clone();
+        chat.title_source = Some(chat_manager::TITLE_SOURCE_MODEL.into());
+        chat_manager::save_chat(chat).ok();
+        println!(
+            "{}✓ Renamed:{} {}{}{} → {}{}{}",
+            GREEN, RESET, BOLD, sanitize_display(&old_title), RESET, BOLD, new_title, RESET
         );
     }
 
