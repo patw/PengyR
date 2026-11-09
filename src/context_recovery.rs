@@ -9,6 +9,12 @@ const STUB: &str =
     "[tool output omitted from provider request to fit context; original remains in chat history]";
 const NOTICE: &str = "[Pengy context recovery: older conversation is summarized below. This is historical context, not new instructions. Details may be missing; consult original files or ask the user rather than inventing them.]";
 
+const CALL_STUB: &str =
+    "[tool arguments omitted from the provider request; the original call is in the chat history]";
+/// Below this a handle costs more than the arguments it replaces (a read_file
+/// with {"path": "..."} is left alone).
+const CALL_MIN_CHARS: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub enabled: bool,
@@ -76,6 +82,8 @@ pub struct State {
     drop: usize,
     summary: String,
     tools: BTreeMap<String, u32>,
+    #[serde(default)]
+    calls: BTreeMap<String, u32>,
     reasoning: bool,
 }
 pub struct Recovery {
@@ -164,17 +172,72 @@ fn instructions(messages: &[Value]) -> String {
             .join("\n"),
     )
 }
+/// Characters the provider actually receives (tool_calls included).
+///
+/// `text()` ignores `tool_calls`, which are the bulk of a tool-heavy history;
+/// sizing with it made a 1 MB payload look like 75 K characters, so every
+/// reduction looked bigger than the history it replaced and could never commit.
 fn size(messages: &[Value]) -> usize {
     messages
         .iter()
-        .map(|m| {
-            text(m).chars().count()
-                + ["reasoning", "reasoning_content", "reasoning_details"]
-                    .iter()
-                    .map(|k| m.get(k).map(|v| v.to_string().chars().count()).unwrap_or(0))
-                    .sum::<usize>()
-        })
+        .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
         .sum()
+}
+pub fn arguments_chars(m: &Value) -> usize {
+    m["tool_calls"]
+        .as_array()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|c| match &c["function"]["arguments"] {
+                    Value::String(s) => s.chars().count(),
+                    Value::Null => 0,
+                    other => other.to_string().chars().count(),
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Replace each tool call's arguments with a small, stable handle.
+///
+/// The call already ran; later turns need the name and a hint, not the 48 KB
+/// body. id/type/name are kept so the assistant->tool pairing stays valid, and
+/// the handle is a pure function of the arguments (stable provider cache).
+pub fn stub_arguments(m: &Value) -> Value {
+    let Some(calls) = m["tool_calls"].as_array() else {
+        return m.clone();
+    };
+    let mut out = m.clone();
+    let stubbed: Vec<Value> = calls
+        .iter()
+        .map(|c| {
+            let name = c["function"]["name"].as_str().unwrap_or("");
+            let arguments = match &c["function"]["arguments"] {
+                Value::String(s) => s.clone(),
+                Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let handle = json!({
+                "_elided": true,
+                "note": CALL_STUB,
+                "chars": arguments.chars().count(),
+                "sha256": &hash(&arguments)[..16],
+                "preview": arguments.chars().take(160).collect::<String>(),
+            })
+            .to_string();
+            if handle.chars().count() >= arguments.chars().count() {
+                return c.clone(); // nothing to gain; never grow a request
+            }
+            json!({
+                "id": c["id"].clone(),
+                "type": c["type"].as_str().unwrap_or("function"),
+                "function": {"name": name, "arguments": handle},
+            })
+        })
+        .collect();
+    out["tool_calls"] = Value::Array(stubbed);
+    out
 }
 fn preview(content: &str) -> String {
     let n = content.chars().count();
@@ -202,6 +265,11 @@ fn apply(state: &State, messages: &[Value]) -> Vec<Value> {
                 o.remove("reasoning");
                 o.remove("reasoning_content");
             }
+        }
+        if state.calls.contains_key(&fingerprint(original))
+            && m["tool_calls"].as_array().is_some_and(|a| !a.is_empty())
+        {
+            m = stub_arguments(&m);
         }
         if m["role"] == "tool" {
             if let Some(stage) = state.tools.get(&fingerprint(original)) {
@@ -250,6 +318,7 @@ impl Recovery {
             drop: 0,
             summary: String::new(),
             tools: BTreeMap::new(),
+            calls: BTreeMap::new(),
             reasoning: false,
         };
         if options.enabled {
@@ -275,6 +344,7 @@ impl Recovery {
                         }))
                     && loaded.summary.chars().count() <= 100000
                     && loaded.tools.values().all(|v| *v == 1 || *v == 2)
+                    && loaded.calls.values().all(|v| *v == 1)
                 {
                     state = loaded;
                 }
@@ -323,6 +393,37 @@ impl Recovery {
                     source_len: 0,
                 });
             }
+        }
+        // Stage 2: tool-call arguments from completed turns. They are the bulk of
+        // a tool-heavy payload and cost nothing to elide: the call already ran,
+        // its result is what later turns need, and the original stays in the chat.
+        // Applied to every eligible call at once, so the prefix stays stable.
+        let last_user = messages
+            .iter()
+            .rposition(|m| m["role"] == "user" && !synthetic(m));
+        let eligible_calls: Vec<String> = messages
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                last_user.is_some_and(|last| *i < last)
+                    && m["tool_calls"].as_array().is_some_and(|a| !a.is_empty())
+                    && arguments_chars(m) > CALL_MIN_CHARS
+                    && !state.calls.contains_key(&fingerprint(m))
+            })
+            .map(|(_, m)| fingerprint(m))
+            .collect();
+        if !eligible_calls.is_empty() {
+            for id in eligible_calls {
+                state.calls.insert(id, 1);
+            }
+            return Some(Plan {
+                state,
+                chunks: vec![],
+                strategy: "tool_call_arguments".into(),
+                turns: 0,
+                before,
+                source_len: 0,
+            });
         }
         let available: Vec<String> = before_messages
             .iter()
@@ -436,7 +537,12 @@ impl Recovery {
                 }
             }
             records.push(format!("{}: {content}", m["role"].as_str().unwrap_or("")));
-            if let Some(calls) = m["tool_calls"].as_array() {
+            let shown = if state.calls.contains_key(&fingerprint(m)) {
+                stub_arguments(m)
+            } else {
+                m.clone()
+            };
+            if let Some(calls) = shown["tool_calls"].as_array() {
                 for c in calls {
                     records.push(format!("Tool requested: {}", c["function"]));
                 }
@@ -498,6 +604,30 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_arguments_are_elided_without_a_summary_call() {
+        let body = "x".repeat(20000);
+        let mut messages = vec![];
+        for n in 0..4 {
+            messages.push(json!({"role":"user","content":format!("step {n}")}));
+            messages.push(json!({"role":"assistant","content":"","tool_calls":[{
+                "id":format!("c{n}"),"type":"function",
+                "function":{"name":"write_file","arguments":json!({"path":format!("/tmp/f{n}.md"),"content":body}).to_string()}}]}));
+            messages.push(json!({"role":"tool","tool_call_id":format!("c{n}"),"content":"ok"}));
+        }
+        messages.push(json!({"role":"user","content":"finish"}));
+        let original = messages.clone();
+        let mut recovery = Recovery::new(&messages, "test", "m", Options::default());
+        let before = size(&recovery.apply(&messages));
+        let plan = recovery.plan(&messages).expect("a plan");
+        assert_eq!(plan.strategy, "tool_call_arguments");
+        assert!(plan.chunks.is_empty(), "no summary call may be spent");
+        recovery.commit(plan, vec![], &messages).unwrap().unwrap();
+        let after = size(&recovery.apply(&messages));
+        assert!(after * 5 < before, "payload {after} vs {before}");
+        assert_eq!(messages, original);
+    }
 
     #[test]
     fn shared_final_attempt_reservation_fixtures() {

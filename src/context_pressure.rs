@@ -113,11 +113,25 @@ pub fn input_chars(messages: &Value, tools: &Value) -> Option<usize> {
     }
     Some(count(messages)?.saturating_add(count(tools)?))
 }
+pub const ANSWER_RESERVE_TOKENS: u64 = 2048;
+
+/// Soft threshold and hard input ceiling for one request.
+///
+/// With no configured output limit the hard line used to be the whole window,
+/// so a request could be admitted with 33 tokens left to answer in -- and a
+/// hard-wall engine then answers with those 33 tokens. Reserve the answer.
 pub fn budgets(window: u64, percent: u64, output: u64, input_only: bool) -> (u64, u64) {
+    let reserve = if input_only {
+        0
+    } else if output > 0 {
+        output
+    } else {
+        ANSWER_RESERVE_TOKENS
+    };
     let hard = if input_only {
         window
     } else {
-        window.saturating_sub(output)
+        window.saturating_sub(reserve)
     };
     (
         ((window as u128 * percent as u128 / 100).min(hard as u128)) as u64,

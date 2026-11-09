@@ -10,6 +10,8 @@ use crate::context_recovery::{Recovery, SUMMARY_PROMPT};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use tokio::sync::mpsc;
 
 // ── Graceful image-stripping helpers ────────────────────────────
@@ -156,6 +158,114 @@ pub const TIMEOUT_STATUSES: &[u16] = &[408, 504];
 // often *deterministic* (the request trips a provider bug), so it buys one
 // retry rather than three.
 pub const MAX_TRANSIENT_RETRIES: u32 = 3;
+/// A checkpoint of "at most 500 words" needs ~700-900 answer tokens. At 2048 an
+/// answer-room engine (Basalt) gives the thinking 1536 and the answer 512, so the
+/// summary always ends at the cap and recovery can never commit.
+pub const SUMMARY_MAX_TOKENS: u64 = 8192;
+/// A checkpoint this long was written, even if the allowance cut it off.
+const MIN_SUMMARY_CHARS: usize = 200;
+/// Ceiling for an automatically derived output allowance.
+const MAX_AUTO_OUTPUT_TOKENS: u64 = 32768;
+
+/// Output allowance that still leaves room to answer, or 0 to send none.
+fn answer_room(window_tokens: u64, estimate: Option<u64>) -> u64 {
+    match estimate {
+        Some(e) if window_tokens > 0 => window_tokens.saturating_sub(e).min(MAX_AUTO_OUTPUT_TOKENS),
+        _ => 0,
+    }
+}
+
+/// Routes that refused the *derived* allowance in this process. Process-local on
+/// purpose: the next start costs one rejected request, never a persisted
+/// capability that could go stale. The image-rejection cache persists because it
+/// changes the request body; this only removes a hint Pengy added itself.
+static AUTO_OUTPUT_REJECTED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn auto_output_route(base_url: &str, model: &str) -> String {
+    let mut key = base_url.trim_end_matches('/').to_string();
+    key.push('\u{1}');
+    key.push_str(model);
+    key
+}
+
+fn auto_output_rejected(base_url: &str, model: &str) -> bool {
+    AUTO_OUTPUT_REJECTED
+        .lock()
+        .map(|routes| routes.contains(&auto_output_route(base_url, model)))
+        .unwrap_or(false)
+}
+
+fn remember_auto_output_rejection(base_url: &str, model: &str) {
+    if let Ok(mut routes) = AUTO_OUTPUT_REJECTED.lock() {
+        routes.insert(auto_output_route(base_url, model));
+    }
+}
+
+/// Whether the provider rejected the allowance parameter itself.
+///
+/// Distinct from a context error: the body names the parameter and says it is
+/// unsupported (OpenAI's reasoning models answer 400 to `max_tokens`). Only the
+/// automatically derived allowance is ever dropped; a configured limit keeps its
+/// existing explicit failure.
+fn is_output_parameter_error(code: u16, body: &serde_json::Value, detail: &str, parameter: &str) -> bool {
+    if !matches!(code, 400 | 422) || parameter.is_empty() {
+        return false;
+    }
+    let text = format!(
+        "{} {} {}",
+        detail,
+        body["error"]["code"].as_str().unwrap_or(""),
+        body["error"]["type"].as_str().unwrap_or("")
+    )
+    .to_lowercase();
+    text.contains(&parameter.to_lowercase())
+        && [
+            "unsupported",
+            "not supported",
+            "does not support",
+            "unrecognized",
+            "unknown parameter",
+        ]
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+/// Re-derive the output allowance for the view that is actually being sent.
+///
+/// Called before every attempt: a reduction makes the prompt smaller, so a stale
+/// allowance would clip the answer exactly when room just became available (a
+/// hard-wall engine answers with whatever the cap allows).
+fn apply_auto_output(
+    payload: &mut serde_json::Value,
+    pressure: &crate::context_pressure::Pressure,
+    window: Option<u64>,
+    limit: u64,
+    parameter: &str,
+) {
+    if limit > 0 || parameter.is_empty() {
+        return;
+    }
+    let room = window
+        .map(|tokens| {
+            answer_room(
+                tokens,
+                pressure.estimate(crate::context_pressure::input_chars(
+                    &payload["messages"],
+                    &payload["tools"],
+                )),
+            )
+        })
+        .unwrap_or(0);
+    if let Some(object) = payload.as_object_mut() {
+        if room > 0 {
+            object.insert(parameter.to_string(), serde_json::json!(room));
+        } else {
+            object.remove(parameter);
+        }
+    }
+}
+
 pub const MAX_INTERNAL_RETRIES: u32 = 1;
 const TRANSIENT_STATUSES: &[u16] = &[502, 503];
 /// A connection failure *after* this endpoint has answered is a dropped route
@@ -995,10 +1105,26 @@ pub async fn chat(
             // Shared retry-admission clock across failure categories.
             // An admitted request retains its own per-attempt deadline.
             let mut retry_chain_started: Option<std::time::Instant> = None;
+            // A route that refuses the allowance parameter itself keeps the turn:
+            // drop the derived allowance and remember it (process-local).
+            let mut auto_output_off =
+                recovery.options.output_limit == 0 && auto_output_rejected(base_url, model);
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     // Cancelled during backoff — emit nothing, just return
                     return;
+                }
+                // Re-derive for the view actually being sent: a reduction makes the
+                // prompt smaller, so a stale allowance would clip the answer exactly
+                // when room just became available.
+                if !auto_output_off {
+                    apply_auto_output(
+                        &mut payload,
+                        &pressure,
+                        window.as_ref().filter(|w| !w.input_only).map(|w| w.tokens),
+                        recovery.options.output_limit,
+                        &recovery.options.output_parameter,
+                    );
                 }
                 let request_started = std::time::Instant::now();
                 match client
@@ -1122,6 +1248,24 @@ pub async fn chat(
                             return;
                         }
 
+                        // The route refuses the allowance parameter itself: drop the
+                        // derived allowance and retry instead of failing the turn.
+                        if !auto_output_off
+                            && recovery.options.output_limit == 0
+                            && is_output_parameter_error(
+                                code,
+                                &body,
+                                detail,
+                                &recovery.options.output_parameter,
+                            )
+                        {
+                            auto_output_off = true;
+                            remember_auto_output_rejection(base_url, model);
+                            if let Some(object) = payload.as_object_mut() {
+                                object.remove(&recovery.options.output_parameter);
+                            }
+                            continue;
+                        }
                         if let Some((budget, reason)) = transient_retry(code) {
                             if transient_retries < budget
                                 && retry_chain_open(&mut retry_chain_started, RETRY_CHAIN_GRACE)
@@ -1691,7 +1835,7 @@ async fn recover_with_reason(recovery: &mut Recovery, messages: &[ChatMessage], 
         if cancel.load(Ordering::Relaxed) { return Err("Context recovery cancelled.".into()); }
         recovery.summary_calls += 1;
         let mut payload = serde_json::json!({"model": model, "messages":[{"role":"system","content":SUMMARY_PROMPT},{"role":"user","content":chunk}]});
-        payload[&recovery.options.output_parameter] = serde_json::json!(2048);
+        payload[&recovery.options.output_parameter] = serde_json::json!(SUMMARY_MAX_TOKENS);
         // Bounded summaries need answer tokens, not an exhausted reasoning allowance.
         // Only use the mechanism explicitly configured for this endpoint/model.
         let mechanism = recovery.options.thinking_off_models.get(model).unwrap_or(&recovery.options.thinking_off);
@@ -1769,8 +1913,16 @@ async fn recover_with_reason(recovery: &mut Recovery, messages: &[ChatMessage], 
             // panicked -- it just degraded to the generic "incomplete" message.
             None => return Err("Context summary request returned no choices; original history retained.".into()),
         };
-        let text = choice["message"]["content"].as_str().unwrap_or("");
-        if choice["finish_reason"] != "stop" || text.trim().is_empty() || choice["message"]["tool_calls"].as_array().is_some_and(|a| !a.is_empty()) {
+        let text = choice["message"]["content"].as_str().unwrap_or("").trim();
+        // A checkpoint cut off at the allowance is still usable history: a
+        // truncated summary beats discarding the transcript and paying for the
+        // same prompt again. Only an empty or tool-calling reply is a failure.
+        let usable = choice["finish_reason"] == "stop"
+            || (choice["finish_reason"] == "length" && text.chars().count() >= MIN_SUMMARY_CHARS);
+        if text.is_empty()
+            || !usable
+            || choice["message"]["tool_calls"].as_array().is_some_and(|a| !a.is_empty())
+        {
             return Err("Context summary was incomplete; original history retained.".into());
         }
         summaries.push(text.to_string());
@@ -3848,6 +4000,107 @@ mod loop_tests {
         }
     }
     #[tokio::test(flavor="multi_thread")]
+    async fn truncated_summary_at_the_cap_still_commits() {
+        // A checkpoint cut off at the allowance is still usable history; 2048
+        // tokens of allowance left only 512 for the answer on an answer-room
+        // engine, so every summary ended here and recovery never committed.
+        let mut checkpoint = completion(&"c".repeat(400), serde_json::Value::Null, (20, 5));
+        checkpoint["choices"][0]["finish_reason"] = serde_json::json!("length");
+        let (base,req)=stub_server_sequence(vec![
+            (400,serde_json::json!({"error":{"code":"context_length_exceeded"}})),
+            (200,checkpoint),
+            (200,completion("answer",serde_json::Value::Null,(100,5)))]);
+        let events=drain(start_chat_options(&base,"stub-model",recoverable_history(),ToolConfirmation::All,"",false,crate::context_recovery::Options::default())).await;
+        assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})),"{events:?}");
+        let req=req.lock().unwrap();
+        assert_eq!(req.len(),3,"recovery must retry the turn after committing");
+        assert!(req[1].get("tools").is_none());
+        assert!(req[1]["max_tokens"].as_u64().unwrap_or(0) >= 4096,
+                "summary allowance {} leaves no room for a checkpoint", req[1]["max_tokens"]);
+    }
+
+    /// Big tool-call arguments, small results, more than one completed user turn:
+    /// the shape where eliding arguments is the only free reduction.
+    fn tool_heavy_history() -> Vec<ChatMessage> {
+        let body = "x".repeat(20000);
+        let mut raw = vec![
+            serde_json::json!({"role":"system","content":"policy"}),
+            serde_json::json!({"role":"user","content":"build it"}),
+        ];
+        for n in 0..4 {
+            raw.push(serde_json::json!({"role":"assistant","content":"","tool_calls":[{
+                "id":format!("c{n}"),"type":"function",
+                "function":{"name":"write_file","arguments":serde_json::json!({"path":format!("/tmp/f{n}.md"),"content":body}).to_string()}}]}));
+            raw.push(serde_json::json!({"role":"tool","tool_call_id":format!("c{n}"),"content":"ok"}));
+            raw.push(serde_json::json!({"role":"user","content":format!("continue {n}")}));
+        }
+        raw.push(serde_json::json!({"role":"assistant","content":"working"}));
+        raw.push(serde_json::json!({"role":"user","content":"finish"}));
+        raw.into_iter().map(|m| serde_json::from_value(m).unwrap()).collect()
+    }
+
+    #[tokio::test(flavor="multi_thread")]
+    async fn derived_allowance_is_recomputed_for_the_reduced_view() {
+        // A 65 536-token window seeded at 40 000 tokens leaves 25 536 for the
+        // answer. The context error elides the tool-call arguments, so the retry
+        // must ask for the room that just became free -- a stale allowance would
+        // clip the answer at the old budget, which is the failure this fixes.
+        let messages = tool_heavy_history();
+        let (base, req) = stub_server_sequence(vec![
+            (400, serde_json::json!({"error":{"code":"context_length_exceeded"}})),
+            (200, completion("answer", serde_json::Value::Null, (4000, 5))),
+        ]);
+        let options = crate::context_recovery::Options {
+            context_window: 65536,
+            chat_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint_dir: Some(tempfile::tempdir().unwrap().keep()),
+            ..Default::default()
+        };
+        seed_pressure(&base, "stub-model", &messages, &options, 40000);
+        let events = drain(start_chat_options(&base, "stub-model", messages, ToolConfirmation::All, "", false, options)).await;
+        assert!(matches!(events.last(), Some(LlmEvent::FinalResponse{..})), "{events:?}");
+        let req = req.lock().unwrap();
+        assert_eq!(req.len(), 2, "{req:?}");
+        let first = req[0]["max_tokens"].as_u64().unwrap_or(0);
+        let second = req[1]["max_tokens"].as_u64().unwrap_or(0);
+        assert!(first > 0, "no allowance was derived: {}", req[0]);
+        assert!(second > first, "stale allowance after a reduction: {first} -> {second}");
+    }
+
+    #[tokio::test(flavor="multi_thread")]
+    async fn route_that_rejects_the_allowance_parameter_still_answers() {
+        // An OpenAI reasoning model answers 400 to max_tokens. Dropping the
+        // *derived* allowance must keep the turn, and the route must be
+        // remembered so no later request pays for it again.
+        let messages = vec![user_msg("hello")];
+        let (base, req) = stub_server_sequence(vec![
+            (400, serde_json::json!({"error":{"code":"unsupported_parameter","type":"invalid_request_error","message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}})),
+            (200, completion("ok", serde_json::Value::Null, (10, 5))),
+            (200, completion("again", serde_json::Value::Null, (10, 5))),
+        ]);
+        let options = crate::context_recovery::Options {
+            context_window: 65536,
+            chat_id: uuid::Uuid::new_v4().to_string(),
+            checkpoint_dir: Some(tempfile::tempdir().unwrap().keep()),
+            ..Default::default()
+        };
+        seed_pressure(&base, "stub-model", &messages, &options, 40000);
+        let events = drain(start_chat_options(&base, "stub-model", messages.clone(), ToolConfirmation::All, "", false, options.clone())).await;
+        assert!(matches!(events.last(), Some(LlmEvent::FinalResponse{content,..}) if content=="ok"), "{events:?}");
+        {
+            let req = req.lock().unwrap();
+            assert_eq!(req.len(), 2, "{req:?}");
+            assert!(req[0]["max_tokens"].as_u64().unwrap_or(0) > 0, "{}", req[0]);
+            assert!(req[1].get("max_tokens").is_none(), "{}", req[1]);
+        }
+        let events = drain(start_chat_options(&base, "stub-model", messages, ToolConfirmation::All, "", false, options)).await;
+        assert!(matches!(events.last(), Some(LlmEvent::FinalResponse{content,..}) if content=="again"), "{events:?}");
+        let req = req.lock().unwrap();
+        assert_eq!(req.len(), 3, "{req:?}");
+        assert!(req[2].get("max_tokens").is_none(), "the route's rejection was not remembered: {}", req[2]);
+    }
+
+    #[tokio::test(flavor="multi_thread")]
     async fn summary_uses_only_explicitly_configured_thinking_off() {
         for mechanism in ["", "reasoning_effort", "enable_thinking"] {
             let (base,req)=stub_server_sequence(vec![
@@ -3858,7 +4111,7 @@ mod loop_tests {
             let events=drain(start_chat_options(&base,"stub-model",recoverable_history(),ToolConfirmation::All,"high",false,options)).await;
             assert!(matches!(events.last(),Some(LlmEvent::FinalResponse{..})),"{events:?}");
             let req=req.lock().unwrap();assert_eq!(req.len(),3);
-            assert!(req[1].get("tools").is_none());assert_eq!(req[1]["max_tokens"],2048);
+            assert!(req[1].get("tools").is_none());assert_eq!(req[1]["max_tokens"],SUMMARY_MAX_TOKENS);
             match mechanism {
                 "reasoning_effort"=>assert_eq!(req[1]["reasoning_effort"],"none"),
                 "enable_thinking"=>assert_eq!(req[1]["chat_template_kwargs"]["enable_thinking"],false),
