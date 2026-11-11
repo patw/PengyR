@@ -2578,8 +2578,12 @@ async fn run_powershell_with(
     let result = tokio::task::spawn_blocking(move || {
         let wait_result = wait_child(&mut child, pid, timeout);
         ctx_blocking.unregister_process(pid);
-        let out = read_and_remove(&stdout_path);
-        let err = read_and_remove(&stderr_path);
+        // pwsh colours error records even into a pipe, and `OutputRendering =
+        // PlainText` only suppresses that from 7.5 on (7.4.6 still writes
+        // ESC[31;1m, measured 2026-11-11). Strip at the boundary so the model
+        // never sees escape codes, whatever version is installed.
+        let out = strip_ansi(&read_and_remove(&stdout_path));
+        let err = strip_ansi(&read_and_remove(&stderr_path));
         wait_result.map(|status| match status {
             Some(status) => finish_command_output(join_command_output(out, &err, status)),
             None => timed_out_output(format!("Error: Command timed out after {timeout} seconds"), out, &err),
@@ -2709,6 +2713,57 @@ fn create_output_files(
     let stdout_file = std::fs::File::create(&stdout_path)?;
     let stderr_file = std::fs::File::create(&stderr_path)?;
     Ok((stdout_path, stderr_path, stdout_file, stderr_file))
+}
+
+/// Remove ANSI escape sequences (CSI colours, OSC hyperlinks) from captured
+/// output.
+///
+/// PowerShell colourises error records even when stdout and stderr are pipes,
+/// and the prelude's `$PSStyle.OutputRendering = 'PlainText'` only suppresses
+/// that from 7.5 onwards: on pwsh 7.4.6 `Write-Error 'bad'` still arrives as
+/// `ESC[31;1mWrite-Error: ESC[31;1mbadESC[0m` (measured 2026-11-11, with `TERM`
+/// unset and inherited alike). The escape codes are pure noise to a model, so
+/// they are stripped where the output is captured rather than trusting the
+/// installed version to behave.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            // CSI: ESC [ parameter/intermediate bytes, then one final byte.
+            Some('[') => {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            // OSC: ESC ] ... terminated by BEL or ESC \ (hyperlinks, titles).
+            Some(']') => {
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\u{7}' {
+                        break;
+                    }
+                    if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // Any other two-character escape (ESC c reset, ESC = keypad, ...).
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 fn read_and_remove(path: &Path) -> String {
@@ -7037,6 +7092,41 @@ mod powershell_tests {
         *TOOL_TIMEOUT.lock().unwrap() = old;
         assert!(out.contains("timed out"), "{out}");
         assert!(scripts().is_subset(&before));
+    }
+
+    #[test]
+    fn ansi_sequences_are_stripped() {
+        assert_eq!(
+            strip_ansi("\u{1b}[31;1mWrite-Error: \u{1b}[31;1mbad\u{1b}[0m"),
+            "Write-Error: bad"
+        );
+        assert_eq!(strip_ansi("plain text, tab\tkept"), "plain text, tab\tkept");
+        assert_eq!(strip_ansi("a\u{1b}[Kb"), "ab");
+        // OSC 8 hyperlink: ESC ] 8 ; ; url BEL text ESC ] 8 ; ; BEL
+        assert_eq!(
+            strip_ansi("x\u{1b}]8;;http://example.com\u{7}link\u{1b}]8;;\u{7}y"),
+            "xlinky"
+        );
+        assert_eq!(strip_ansi("trailing\u{1b}"), "trailing");
+    }
+
+    #[tokio::test]
+    async fn live_deliberate_escape_codes_are_stripped() {
+        // Independent of the installed pwsh: this script writes to the raw console
+        // stream, which `$PSStyle.OutputRendering` does not touch, so the ESC
+        // arrives on 7.4.6 and 7.7.0 alike unless the capture path strips it.
+        if pwsh().is_none() {
+            return;
+        }
+        let _guard = test_tool_timeout_guard();
+        let out = run(
+            "$e = [char]27; [Console]::Out.Write(\"$e[31mred$e[0m done`n\")",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(out.contains("red done"), "{out:?}");
     }
 }
 
