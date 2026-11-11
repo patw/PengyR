@@ -6980,6 +6980,13 @@ mod powershell_tests {
 
     #[tokio::test]
     async fn live_unicode_multiline_and_cwd() {
+        if pwsh().is_none() {
+            return;
+        }
+        // These tests share the process-global TOOL_TIMEOUT that
+        // live_timeout_kills_and_cleans_up sets to 2 seconds, and the temp
+        // `.ps1` files it counts. Run one at a time or they sabotage each other.
+        let _guard = test_tool_timeout_guard();
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("dir with späce");
         std::fs::create_dir(&d).unwrap();
@@ -6993,6 +7000,10 @@ mod powershell_tests {
 
     #[tokio::test]
     async fn live_no_ansi_and_exit_codes() {
+        if pwsh().is_none() {
+            return;
+        }
+        let _guard = test_tool_timeout_guard();
         let Some(out) = run("Write-Error 'bad'", None).await else { return };
         assert!(!out.contains("\x1b[") && out.contains("bad"), "{out:?}");
         let out = run("throw \"boom\"", None).await.unwrap();

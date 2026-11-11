@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **The live PowerShell tests no longer sabotage each other.** All three share one process: `live_timeout_kills_and_cleans_up` sets the global `TOOL_TIMEOUT` to 2 seconds and then counts the temp `.ps1` files in the shared temp directory, while the other two run their own commands under that same global. When they overlap, a cold `pwsh` start exceeds 2 seconds and an unrelated test fails with `Command timed out after 2 seconds` — the v1.15.2 CI failure on GitHub's runner, where they had passed by timing luck on the two previous tags. All three now serialize on the same guard the timeout test already used, so the global is only ever mutated while nothing else is running. Found because the dev guest has no `pwsh`, so `check_release.sh` skips these tests locally and only CI exercises them; the guest now has 7.7.0 installed.
+
 ## v1.15.2 — 2026-11-10
 
 - **A route that refuses image input by wording is now recognized.** Fireworks' GLM router answers *any* image part — a 1×1 PNG included — with `400 Invalid image or video input`, while text-only requests on the same route succeed, so the phrase means "no vision here", not "this image is corrupt". It is now treated like the other unsupported-input signals: the turn continues with images suppressed and the model told only file metadata is available. Corpus-image errors ("Invalid image URL", "Unsupported image format") still fail loudly, and a corrupt image still surfaces its real error.
