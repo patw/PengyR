@@ -18,9 +18,16 @@ Usage:
   no FILE   -> every ~/.config/pengy/chats/*.json
   default   -> dry run: report only, write nothing
   --apply   -> back up each file (already-applied files are skipped) and rewrite
+  --force   -> repair even though a Pengy process is running
 
-Exit codes: 0 clean/ok, 1 nothing to do AND --apply given? no: 0 always unless a
-file could not be read or an applied file still fails verification (2).
+A running Pengy holds its chats in memory and writes them back on save and on
+exit, so a repair applied under it is silently undone -- measured 2026-11-10:
+repaired at 19:31, the app exited at 19:43 and restored the byte-identical
+poisoned string, and the next turn 400'd again. `--apply` therefore refuses
+while the GUI is running; quit Pengy, repair, then start it again.
+
+Exit codes: 0 clean/ok; 2 a file could not be read or still fails verification
+after repair; 3 refused because Pengy is running.
 """
 from __future__ import annotations
 
@@ -93,11 +100,52 @@ def repair(doc, hits: list[dict]) -> None:
         call["function"]["arguments"] = handle_for(call["function"]["arguments"])
 
 
+GUI_NAMES = {"pengy"}
+SERVER_NAMES = {"pengy-web", "pengy-cli", "pengy-cli-rust"}
+
+
+def running_pengy() -> tuple[list[str], list[str]]:
+    """(GUI instances, other chat-writing instances) currently alive.
+
+    The GUI is the one that rewrites a chat file from its in-memory copy; the
+    web/CLI processes are only a risk if a session is actually using them.
+    """
+    gui, other = [], []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            name = os.readlink(f"/proc/{entry}/exe").rsplit("/", 1)[-1]
+        except OSError:
+            continue
+        if name in GUI_NAMES:
+            gui.append(f"{name} (pid {entry})")
+        elif name in SERVER_NAMES:
+            other.append(f"{name} (pid {entry})")
+    return gui, other
+
+
 def main(argv: list[str]) -> int:
     apply = "--apply" in argv
     as_json = "--json" in argv
     backup = "--no-backup" not in argv
     paths = chat_paths(argv)
+
+    gui, other = running_pengy()
+    if apply and gui and "--force" not in argv:
+        print(
+            "Refusing to repair while Pengy is running: it holds these chats in\n"
+            f"memory and will write them back over the repair. Running: {', '.join(gui)}.\n"
+            "Quit Pengy, run this again, then start it. (--force to override.)",
+            file=sys.stderr,
+        )
+        return 3
+    if other:
+        print(
+            f"note: also running: {', '.join(other)} -- if a session there is using a\n"
+            "      chat, it can restore its own copy. The desktop GUI is the usual culprit.",
+            file=sys.stderr,
+        )
     report = {"apply": apply, "files": [], "files_changed": 0, "calls_repaired": 0, "errors": []}
 
     for path in paths:
