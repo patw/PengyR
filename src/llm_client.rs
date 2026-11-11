@@ -117,6 +117,12 @@ fn is_image_input_error(status_code: u16, body: &serde_json::Value, error_text: 
         "image inputs are not supported", "image input is not supported",
         "images are not supported", "image_url is not supported",
         "unsupported image input", "unsupported vision input",
+        // Fireworks' GLM router answers this to *any* image part -- a 1x1 PNG
+        // included -- while text-only requests on the same route succeed, so it
+        // means "no vision here", not "this particular image is corrupt".
+        // Measured 2026-11-10: `smart` (glm-latest) with a 51 KB JPEG and again
+        // with an 8x8 PNG; `fast` and `kimi-latest` take the same bytes.
+        "invalid image or video input",
     ];
     unsupported_input_phrases.iter().any(|phrase| lower.contains(phrase))
         || ((lower.contains("text-only") || lower.contains("only text"))
@@ -2323,6 +2329,9 @@ mod tests {
         let empty = serde_json::json!({});
         assert!(is_image_input_error(400, &empty, "Only text content parts are supported by this upstream format"));
         assert!(is_image_input_error(400, &empty, "This model does not support image inputs"));
+        // The GLM router's wording for the same thing (measured 2026-11-10); it
+        // must not widen the match to corrupt-image errors like "Invalid image URL".
+        assert!(is_image_input_error(400, &empty, "Invalid image or video input"));
         for message in ["Unsupported parameter: temperature", "Invalid image URL",
             "Unsupported image format", "Unsupported image detail", "context length exceeded"] {
             assert!(!is_image_input_error(400, &empty, message), "{message}");
