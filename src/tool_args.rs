@@ -21,7 +21,46 @@
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
+use crate::chat_manager::ChatMessage;
+
 const RAW_KEY: &str = "_raw_arguments";
+
+/// A call whose `arguments` are not JSON cannot be replayed to a strict engine.
+///
+/// A truncated or malformed generation (the model stopped mid-object, the output
+/// allowance ran out) is stored verbatim, which keeps the transcript honest and
+/// its execution already fails cleanly with "not valid JSON". *Replaying* that
+/// raw string is what hurts: an engine that parses every call's arguments —
+/// Basalt/Strata among them — rejects the whole request with
+/// `400 Expecting ',' delimiter: line 1 column N`, so one bad entry in an old
+/// chat breaks every later turn on that route while the same chat still works on
+/// a lenient hosted API. The call keeps its `id`/`type`/`name` (the assistant to
+/// tool-result pairing stays intact) and gets a stable handle derived from the
+/// original bytes.
+pub fn repair_unparseable_arguments(messages: &mut [ChatMessage]) -> usize {
+    let mut repaired = 0;
+    for message in messages {
+        for call in &mut message.tool_calls {
+            let raw = &call.function.arguments;
+            if raw.trim().is_empty() || serde_json::from_str::<Value>(raw).is_ok() {
+                continue;
+            }
+            let head: String = raw.chars().take(160).collect();
+            call.function.arguments = serde_json::json!({
+                "_repaired": true,
+                "note": "The original arguments for this call were not valid JSON (a \
+                         truncated or malformed generation) and the call was never run. \
+                         Detail kept: character count, sha256 and a short preview.",
+                "chars": raw.chars().count(),
+                "sha256": &crate::context_recovery::hash(raw)[..16],
+                "preview": head,
+            })
+            .to_string();
+            repaired += 1;
+        }
+    }
+    repaired
+}
 
 fn describe(v: &Value) -> &'static str {
     match v {
@@ -262,6 +301,51 @@ mod tests {
             .find(|t| t["function"]["name"] == name)
             .unwrap()["function"]["parameters"]
             .clone()
+    }
+
+    #[test]
+    fn repairs_arguments_that_never_parsed_and_leaves_valid_ones_alone() {
+        let mut history = vec![
+            ChatMessage::new("assistant", Some(json!("wiring it up"))),
+            ChatMessage::new("tool", Some(json!("Error: not valid JSON"))),
+        ];
+        // A length-capped generation: the object simply stops.
+        let broken = "{\"changes\": [{\"operations\": [{\"kind\": \"replace\", \"old\": \"a\", \"new\": \"b\"}]}";
+        let intact = json!({"path": "/tmp/f"}).to_string();
+        history[0].tool_calls = vec![
+            crate::chat_manager::ToolCall {
+                id: "call_broken".into(),
+                call_type: "function".into(),
+                function: crate::chat_manager::FunctionCall {
+                    name: "apply_changes".into(),
+                    arguments: broken.into(),
+                },
+            },
+            crate::chat_manager::ToolCall {
+                id: "call_ok".into(),
+                call_type: "function".into(),
+                function: crate::chat_manager::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: intact.clone(),
+                },
+            },
+        ];
+        let repaired = repair_unparseable_arguments(&mut history);
+        assert_eq!(repaired, 1, "only the unparseable call is repaired");
+        let calls = &history[0].tool_calls;
+        // Pairing survives: the id/type/name the tool result answers to are kept.
+        assert_eq!(calls[0].id, "call_broken");
+        assert_eq!(calls[0].call_type, "function");
+        assert_eq!(calls[0].function.name, "apply_changes");
+        // The replacement is JSON a strict engine can parse, and it keeps the detail.
+        let handle: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(handle["_repaired"], json!(true));
+        assert_eq!(handle["chars"], json!(broken.chars().count()));
+        assert_eq!(handle["sha256"].as_str().unwrap().len(), 16);
+        // Negative control: a valid call is byte-identical afterwards.
+        assert_eq!(calls[1].function.arguments, intact);
+        // Idempotent: a second pass has nothing to do.
+        assert_eq!(repair_unparseable_arguments(&mut history), 0);
     }
 
     #[test]

@@ -101,7 +101,7 @@ pub struct Plan {
     before: usize,
     source_len: usize,
 }
-fn hash(s: &str) -> String {
+pub(crate) fn hash(s: &str) -> String {
     format!("{:x}", Sha256::digest(s.as_bytes()))
 }
 pub fn text(m: &Value) -> String {

@@ -898,7 +898,7 @@ fn provider_messages(messages: &[ChatMessage], keep_turns: usize) -> Vec<ChatMes
     let user_indices: Vec<usize> = messages.iter().enumerate()
         .filter_map(|(i, m)| (m.role == "user").then_some(i)).collect();
     let keep_from = if keep_turns == 0 { 0 } else { user_indices.len().saturating_sub(keep_turns) };
-    messages.iter().enumerate().map(|(index, original)| {
+    let mut view: Vec<ChatMessage> = messages.iter().enumerate().map(|(index, original)| {
         let mut msg = original.clone();
         let refs = std::mem::take(&mut msg.attachments);
         let retained = msg.role == "user" && !refs.is_empty()
@@ -919,7 +919,13 @@ fn provider_messages(messages: &[ChatMessage], keep_turns: usize) -> Vec<ChatMes
             if !parts.is_empty() { msg.content = Some(serde_json::Value::Array(parts)); }
         }
         msg
-    }).collect()
+    }).collect();
+    // A stored call whose arguments never parsed (a truncated generation) would
+    // make a strict engine reject the whole request: the chat stays readable
+    // here, but every turn on that route would 400. Repair the view, never the
+    // transcript.
+    crate::tool_args::repair_unparseable_arguments(&mut view);
+    view
 }
 
 /// Keep only our tagged proxy's opaque replay state independent of the UI's
