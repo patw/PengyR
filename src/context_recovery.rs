@@ -15,6 +15,15 @@ const CALL_STUB: &str =
 /// with {"path": "..."} is left alone).
 const CALL_MIN_CHARS: usize = 512;
 
+/// Reductions allowed before the turn is reported as failed. Only the cheap,
+/// model-free stages are counted here; the last-resort active-turn stage may run
+/// once more after this budget is spent (see `deep_plan`).
+const MAX_ATTEMPTS: u32 = 4;
+
+/// Messages at the end of the conversation that even the last-resort stage keeps
+/// intact: the model must still see the work it just did.
+const DEEP_TAIL_MESSAGES: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub enabled: bool,
@@ -85,6 +94,12 @@ pub struct State {
     #[serde(default)]
     calls: BTreeMap<String, u32>,
     reasoning: bool,
+    /// Messages at the END that the active-turn elision still protects.
+    /// `None` means the stage has never run; `Some(n)` means everything before
+    /// the last `n` messages is elided too, including the current turn's own
+    /// work. Set only as a last resort (see `deep_plan`).
+    #[serde(default)]
+    deep: Option<usize>,
 }
 pub struct Recovery {
     pub options: Options,
@@ -247,6 +262,11 @@ fn apply(state: &State, messages: &[Value]) -> Vec<Value> {
     let last_user = messages
         .iter()
         .rposition(|m| m["role"] == "user" && !synthetic(m));
+    // Everything before `deep_from` is elided even inside the active turn: the
+    // last `keep` messages are the only ones still protected.
+    let deep_from = state
+        .deep
+        .map(|keep| messages.len().saturating_sub(keep));
     let mut index = 0;
     let mut result = Vec::new();
     for (i, original) in messages.iter().enumerate() {
@@ -259,7 +279,11 @@ fn apply(state: &State, messages: &[Value]) -> Vec<Value> {
         } else if synthetic(&m) && index <= state.drop {
             continue;
         }
-        if state.reasoning && last_user.is_some_and(|last| i < last) && m["role"] == "assistant" {
+        if state.reasoning
+            && m["role"] == "assistant"
+            && (last_user.is_some_and(|last| i < last)
+                || deep_from.is_some_and(|from| i < from))
+        {
             // Unknown reasoning_details may carry provider-required signatures.
             if let Some(o) = m.as_object_mut() {
                 o.remove("reasoning");
@@ -320,6 +344,7 @@ impl Recovery {
             tools: BTreeMap::new(),
             calls: BTreeMap::new(),
             reasoning: false,
+            deep: None,
         };
         if options.enabled {
             if let Some(loaded) = path
@@ -369,8 +394,14 @@ impl Recovery {
         }
     }
     pub fn plan(&self, messages: &[Value]) -> Option<Plan> {
-        if !self.options.enabled || self.attempts >= 4 {
+        if !self.options.enabled {
             return None;
+        }
+        // The attempt budget is spent: the only thing left is the last-resort
+        // stage below, and only if it has never run for this chat.
+        if self.attempts >= MAX_ATTEMPTS {
+            let before = size(&self.apply(messages));
+            return self.deep_plan(messages, self.state.clone(), before);
         }
         let before_messages = self.apply(messages);
         let before = size(&before_messages);
@@ -479,7 +510,56 @@ impl Recovery {
                 });
             }
         }
-        self.summary_plan(messages, state, before)
+        if let Some(plan) = self.summary_plan(messages, state.clone(), before) {
+            return Some(plan);
+        }
+        self.deep_plan(messages, state, before)
+    }
+
+    /// Last resort: elide all but the newest few messages of the ACTIVE turn.
+    ///
+    /// Every stage above protects the current turn — `apply` only strips
+    /// reasoning before the last user message, and tool-argument elision has
+    /// the same boundary — on the theory that a long agentic turn needs to see
+    /// its own work. When that protection is all that stands between the
+    /// payload and the window, the turn dies with "retried after 4 context
+    /// reduction(s) without success", and the only way through is for a new
+    /// user message to arrive and move the boundary.
+    ///
+    /// That is exactly what a manual "try again" does, measured 2026-11-11: the
+    /// retry reported `historical reasoning; 306008 fewer characters` and
+    /// `tool call arguments; 371360 fewer characters` and then answered. This
+    /// stage does the same thing without waiting for the user: keep the newest
+    /// `DEEP_TAIL_MESSAGES` messages intact, elide everything older in the turn,
+    /// and let the turn carry on. It runs at most once per chat, and only after
+    /// every cheaper stage is spent.
+    fn deep_plan(&self, messages: &[Value], mut state: State, before: usize) -> Option<Plan> {
+        if self.state.deep.is_some() || messages.len() <= DEEP_TAIL_MESSAGES {
+            return None;
+        }
+        let boundary = messages.len() - DEEP_TAIL_MESSAGES;
+        state.deep = Some(DEEP_TAIL_MESSAGES);
+        state.reasoning = true;
+        for (i, m) in messages.iter().enumerate() {
+            if i < boundary
+                && m["tool_calls"].as_array().is_some_and(|a| !a.is_empty())
+                && arguments_chars(m) > CALL_MIN_CHARS
+                && !state.calls.contains_key(&fingerprint(m))
+            {
+                state.calls.insert(fingerprint(m), 1);
+            }
+        }
+        if size(&apply(&state, messages)) >= before {
+            return None;
+        }
+        Some(Plan {
+            state,
+            chunks: vec![],
+            strategy: "active_turn".into(),
+            turns: 0,
+            before,
+            source_len: 0,
+        })
     }
     fn summary_plan(&self, messages: &[Value], mut state: State, before: usize) -> Option<Plan> {
         let users: Vec<usize> = messages
@@ -594,10 +674,11 @@ impl Recovery {
         }
         self.state = plan.state;
         self.attempts += 1;
+        let max_attempts = self.attempts.max(MAX_ATTEMPTS);
         Ok(Some(
-            json!({"attempt":self.attempts,"max_attempts":4,"chars_removed":plan.before-after,
+            json!({"attempt":self.attempts,"max_attempts":max_attempts,"chars_removed":plan.before-after,
             "strategy":plan.strategy,"turns_summarized":plan.turns,
-            "message":format!("Context recovery — {}; {} fewer characters, {} older turns summarized. Full history retained. Retrying {}/4.",plan.strategy.replace('_'," "),plan.before-after,plan.turns,self.attempts)}),
+            "message":format!("Context recovery — {}; {} fewer characters, {} older turns summarized. Full history retained. Retrying {}/{max_attempts}.",plan.strategy.replace('_'," "),plan.before-after,plan.turns,self.attempts)}),
         ))
     }
 }
