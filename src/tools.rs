@@ -221,7 +221,7 @@ fn base_tool_definitions() -> Vec<ToolDef> {
               ("replace_all", "boolean", "Replace every occurrence")],
             &["path", "old_str", "new_str"]),
         apply_changes_definition(),
-        td("run_bash", "Run a bash command and return its output. Non-interactive: stdin is closed, so prompts fail instead of waiting -- pass non-interactive flags. Without host it runs here; with host (an ssh destination, key login already working) it runs on that machine and cwd/paths are that machine's. Do not wrap the command in ssh yourself. For root, include an explicit sudo in the command AND set elevated=true: elevated alone is rejected, not silently ignored, and Pengy then asks the user for that host's sudo password. Killed after the tool timeout.",
+        td("run_bash", "Run a bash command and return its output. Non-interactive (stdin closed): pass non-interactive flags. With host, it runs on that ssh target and cwd/paths are its own; never wrap the command in ssh yourself. For root, include sudo in the command and set elevated=true -- elevated alone is rejected. Killed after the tool timeout.",
             &[("command", "string", "Bash command"),
               ("cwd", "string", "Working directory (on the target when host is set)"),
               ("host", "string", "ssh destination to run on instead of locally (key login must already work)"),
@@ -241,7 +241,7 @@ fn base_tool_definitions() -> Vec<ToolDef> {
             &[("url", "string", "URL to fetch"),
               ("max_chars", "integer", "Maximum characters returned (0 = no limit)")],
             &["url"]),
-        td("run_python", "Run Python code in a fresh process; only printed output comes back. Killed after the tool timeout.",
+        td("run_python", "Run Python code in a fresh process; stdout and stderr both come back. Killed after the tool timeout.",
             &[("code", "string", "Python source"),
               ("cwd", "string", "Working directory")],
             &["code"]),
@@ -259,10 +259,10 @@ fn base_tool_definitions() -> Vec<ToolDef> {
               ("path", "string", "Directory or file to search"),
               ("file_glob", "string", "Only files matching this glob, e.g. *.py or src/**/*.ts"),
               ("context_lines", "integer", "Lines of context around each match"),
-              ("max_results", "integer", "Maximum matches (default 50)"),
+              ("max_results", "integer", "Maximum match blocks (adjacent matches group; default 50)"),
               ("ignore_case", "boolean", "Case-insensitive match")],
             &["pattern", "path"]),
-        td("glob", "Find files by glob pattern; ** matches any depth. Skips hidden and build/vendor directories; at most 200 results.",
+        td("glob", "Find files by glob pattern; ** matches any depth. Skips hidden and build/dist/target directories; at most 200 results.",
             &[("pattern", "string", "Glob, e.g. src/**/*.py"),
               ("path", "string", "Directory to search (default: current)")],
             &["pattern"]),
@@ -274,13 +274,13 @@ fn base_tool_definitions() -> Vec<ToolDef> {
 fn apply_changes_definition() -> ToolDef {
     ToolDef { tool_type: "function".into(), function: FunctionDef {
         name: "apply_changes".into(),
-        description: "Apply several exact-text edits across existing files, all or nothing. dry_run=true returns the unified diff without writing.".into(),
+        description: "Apply several exact-text edits across existing files, all or nothing.".into(),
         parameters: ParametersDef {
             param_type: "object".into(),
             properties: serde_json::json!({
                 "changes": {
                     "type": "array",
-                    "description": "Per file: path and operations. An operation is replace (old, new), delete (old) or insert_after (anchor, text); old/anchor must match expected_matches times (default 1)",
+                    "description": "Per file: path and operations. An operation is replace (old, new), delete (old) or insert_after (anchor, text)",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -304,7 +304,7 @@ fn apply_changes_definition() -> ToolDef {
                         "required": ["path", "operations"]
                     }
                 },
-                "dry_run": {"type": "boolean", "description": "Preview only; nothing is written"},
+                "dry_run": {"type": "boolean", "description": "Return the unified diff without writing"},
                 "postconditions": {
                     "type": "array",
                     "description": "Optional {path, contains, does_not_contain} plain-substring checks on a file's whole edited text, comments and strings included; a failed check cancels every edit",
@@ -1206,19 +1206,28 @@ async fn read_file(path: String, offset: Option<usize>, limit: Option<usize>) ->
     }
 
     let lines: Vec<&str> = text.split('\n').collect();
-    let total = lines.len();
+    // split() leaves a phantom "" after a trailing newline, so "a\nb\n" would
+    // report 3 lines where wc -l says 2 (and offset=3 would "work").  Slicing
+    // keeps the whole vector — a whole-file read must still return the text
+    // byte for byte — so only the count we report and the past-the-end check
+    // use real lines.  Same fix as the Python and C++ editions.
+    let raw_total = lines.len();
+    let total = raw_total - usize::from(raw_total > 0 && lines[raw_total - 1].is_empty());
+    if text.is_empty() {
+        return String::new();
+    }
     let start = offset.unwrap_or(1).max(1);
     if start > total {
         return format!(
             "Error: offset {start} is past the end of {path}, which has {total} lines."
         );
     }
-    let count = limit.map(|l| l.max(1)).unwrap_or(total - start + 1);
-    let end = total.min(start + count - 1);
+    let count = limit.map(|l| l.max(1)).unwrap_or(raw_total - start + 1);
+    let end = raw_total.min(start + count - 1);
 
     let body = lines[start - 1..end].join("\n");
     let (body, kept, truncated) = truncate_head_lines(&body, None);
-    let shown_end = start + kept - 1;
+    let shown_end = (start + kept - 1).min(total);
 
     // A plain whole-file read that fit stays bare — no header to parse.
     if !truncated && offset.is_none() && limit.is_none() {
@@ -4088,7 +4097,7 @@ async fn search_content(
     let mut truncated = false;
 
     if root.is_file() {
-        search_one_file(
+        let hit_limit = search_one_file(
             &root,
             &compiled,
             context_lines,
@@ -4099,7 +4108,17 @@ async fn search_content(
         if results.is_empty() {
             return format!("No matches found for '{pattern}' in {path}");
         }
-        return results.join("\n\n");
+        let mut out = results.join("\n\n");
+        // A capped search must never look complete: this branch used to drop the
+        // limit flag on the floor, so a big log came back as five blocks with no
+        // sign that the rest existed.  Same text as the Python and C++ editions.
+        if hit_limit {
+            out.push_str(&format!(
+                "\n\n(results truncated at {max_results} match blocks; \
+                 raise max_results or narrow the pattern)"
+            ));
+        }
+        return snip_tool_output(out);
     }
 
     // The root itself is never filtered: searching "." or ~/.config or a dir
@@ -4179,7 +4198,7 @@ async fn search_content(
 
     let out = results.join("\n\n");
     let mut summary = format!(
-        "Found {} match(es) for '{pattern}' across {files_searched} file(s)",
+        "Found {} match block(s) for '{pattern}' across {files_searched} file(s)",
         results.len()
     );
     if truncated {
@@ -4581,6 +4600,48 @@ mod tests {
         let result = read_file(path.to_str().unwrap().to_string(), Some(99), None).await;
         assert!(result.contains("Error"), "{result}");
         assert!(result.contains("3 lines"), "{result}");
+    }
+
+    /// Lines are counted like `wc -l`: a trailing newline is not a line.
+    /// It used to report N+1 for every file ending in a newline, so the header
+    /// lied and offset=N+1 returned a phantom empty line instead of "past the
+    /// end".  Whole-file reads must stay byte-identical either way.
+    /// Mirrors Python's test_read_file_counts_lines_like_wc.
+    #[tokio::test]
+    async fn read_file_counts_lines_like_wc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.txt");
+        let p = path.to_str().unwrap().to_string();
+
+        std::fs::write(&path, "a\nb\n").unwrap();
+        assert_eq!(read_file(p.clone(), None, None).await, "a\nb\n");
+        let ranged = read_file(p.clone(), Some(1), None).await;
+        assert!(
+            ranged.starts_with(&format!("[Lines 1-2 of 2 in {p}]")),
+            "{ranged}"
+        );
+        let past = read_file(p.clone(), Some(3), None).await;
+        assert!(past.contains("2 lines"), "{past}");
+
+        // No trailing newline: same count, and a page at the end still clamps.
+        std::fs::write(&path, "a\nb").unwrap();
+        let ranged = read_file(p.clone(), Some(1), None).await;
+        assert!(
+            ranged.starts_with(&format!("[Lines 1-2 of 2 in {p}]")),
+            "{ranged}"
+        );
+        let tail = read_file(p.clone(), Some(2), Some(9)).await;
+        assert_eq!(tail.lines().skip(1).collect::<Vec<_>>(), vec!["b"]);
+
+        // A blank line at the end IS a line; an empty file is empty.
+        std::fs::write(&path, "a\n\n").unwrap();
+        let ranged = read_file(p.clone(), Some(1), None).await;
+        assert!(
+            ranged.starts_with(&format!("[Lines 1-2 of 2 in {p}]")),
+            "{ranged}"
+        );
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_file(p, None, None).await, "");
     }
 
     // ── is_readonly_tool ───────────────────────────────────────────
@@ -5370,6 +5431,67 @@ mod tests {
         )
         .await;
         assert!(result.contains("println"));
+    }
+
+    /// `max_results` counts match BLOCKS, and a capped search says so.
+    /// Adjacent matches group into one block however long it runs, so a limit
+    /// bounds hunks rather than matched lines.  A single-file search used to
+    /// drop the limit flag on the floor: five blocks came back with nothing to
+    /// say the rest of the log existed.  Mirrors Python's
+    /// test_search_content_reports_being_capped.
+    #[tokio::test]
+    async fn search_content_reports_being_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let separated = dir.path().join("sep.txt");
+        let lines: Vec<String> = (0..300)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("hit{i}")
+                } else {
+                    format!("miss{i}")
+                }
+            })
+            .collect();
+        std::fs::write(&separated, lines.join("\n")).unwrap();
+        let p = separated.to_str().unwrap().to_string();
+
+        let capped = search_content("hit".into(), p.clone(), None, 0, 5, false, false).await;
+        assert_eq!(capped.matches('📄').count(), 5, "{capped}");
+        assert!(
+            capped.contains("results truncated at 5 match blocks"),
+            "{capped}"
+        );
+
+        // One contiguous run is a single block, so the cap never fires.
+        let adjoining = dir.path().join("run.txt");
+        let hits: Vec<String> = (0..300).map(|i| format!("hit{i}")).collect();
+        std::fs::write(&adjoining, hits.join("\n")).unwrap();
+        let one = search_content(
+            "hit".into(),
+            adjoining.to_str().unwrap().into(),
+            None,
+            0,
+            5,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(one.matches('📄').count(), 1, "{one}");
+        assert!(!one.contains("truncated"), "{one}");
+
+        // A directory search reports the cap in its summary line.
+        let dir_out = search_content(
+            "hit".into(),
+            dir.path().to_str().unwrap().into(),
+            None,
+            0,
+            5,
+            false,
+            false,
+        )
+        .await;
+        assert!(dir_out.contains("match block(s)"), "{dir_out}");
+        assert!(dir_out.contains("results truncated"), "{dir_out}");
     }
 
     #[tokio::test]
