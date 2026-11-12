@@ -292,9 +292,9 @@ fn apply_changes_definition() -> ToolDef {
                                     "properties": {
                                         "kind": {"type": "string", "enum": ["replace", "insert_after", "delete"]},
                                         "old": {"type": "string", "description": "Exact text for replace/delete"},
-                                        "anchor": {"type": "string", "description": "Exact text to insert after"},
+                                        "anchor": {"type": "string", "description": "Exact text to insert after; the splice lands at the end of the match, not the end of its line"},
                                         "new": {"type": "string", "description": "Replacement text"},
-                                        "text": {"type": "string", "description": "Text to insert"},
+                                        "text": {"type": "string", "description": "Text to insert immediately after the anchor; start it with a newline to put it on its own line(s)"},
                                         "expected_matches": {"type": "integer", "description": "Required match count (default 1)"}
                                     },
                                     "required": ["kind"]
@@ -730,6 +730,7 @@ async fn apply_changes(args: &serde_json::Value) -> String {
     // Files in the order given, so the diff and the commit order are stable.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut errors = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
     let mut ops = 0usize;
     let mut result_bytes = 0usize;
     for (fi, change) in changes.iter().enumerate() {
@@ -830,6 +831,11 @@ async fn apply_changes(args: &serde_json::Value) -> String {
                 ));
                 continue;
             }
+            if kind == "insert_after" {
+                if let Some(note) = insert_join_note(&current, &needle, &replacement, raw, expected) {
+                    notes.push(note);
+                }
+            }
             let repl = if kind == "insert_after" {
                 format!("{needle}{replacement}")
             } else {
@@ -899,11 +905,13 @@ async fn apply_changes(args: &serde_json::Value) -> String {
             diff.push_str(&unified_diff(&path.display().to_string(), old, new));
         }
     }
+    // Notes sit between the header and the diff so they appear on a dry run and
+    // a real write alike; with no notes the output is unchanged byte for byte.
+    let note_text = if notes.is_empty() { String::new() } else { format!("{}\n", notes.join("\n")) };
     if dry {
         return format!(
-            "Dry run: no changes applied.\nFiles: {}\n\n{}",
-            prepared.len(),
-            diff
+            "Dry run: no changes applied.\nFiles: {}\n{note_text}\n{diff}",
+            prepared.len()
         )
         .trim_end()
         .into();
@@ -930,7 +938,7 @@ async fn apply_changes(args: &serde_json::Value) -> String {
             );
         }
     }
-    format!("Applied changes to {} file(s).\n\n{}", prepared.len(), diff)
+    format!("Applied changes to {} file(s).\n{note_text}\n{diff}", prepared.len())
         .trim_end()
         .into()
 }
@@ -1625,6 +1633,46 @@ fn diff_opcodes(a: &[&str], b: &[&str]) -> Vec<(char, usize, usize, usize, usize
         merged.push(op);
     }
     merged
+}
+
+/// The result line announcing an `insert_after` that shares a line, if it does.
+///
+/// `insert_after` is a character splice, not a line insert, so the inserted
+/// text can end up on a line with existing text from either side: the anchor
+/// does not end a line and `text` does not start with one (`beta` + `X` becomes
+/// `betaX`), or the anchor does end a line and `text` does not end with one
+/// (`beta\n` + `X` becomes `beta\nXgamma`).  In .env, YAML, CSV, a Makefile, a
+/// shell `export` line or a commented-out setting either result is valid text,
+/// so the corruption is silent and surfaces much later.  The note names the
+/// file and line and the missing newline; it is a contract reminder, not an
+/// error, because the edit did exactly what was asked.  `None` means nothing
+/// shares a line.  Same rule and same wording as the Python and C++ editions.
+fn insert_join_note(content: &str, anchor: &str, text: &str, path: &str, matches: usize) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let anchor_end = content.find(anchor)? + anchor.len();
+    let more = if matches > 1 { format!(" (+{} more)", matches - 1) } else { String::new() };
+    let starts_line = text.starts_with('\n') || text.starts_with('\r');
+    let ends_line = text.ends_with('\n') || text.ends_with('\r');
+    let anchor_ends_line = anchor.ends_with('\n') || anchor.ends_with('\r');
+    let line = content[..anchor_end].matches('\n').count() + 1;
+    if !starts_line && !anchor_ends_line {
+        return Some(format!(
+            "note: insert_after joined text to the end of line {line}{more} in {path}: \
+             the anchor does not end a line and text does not start with a newline. \
+             Start text with a newline to insert whole lines."
+        ));
+    }
+    let next_runs_on = content[anchor_end..].chars().next().is_some_and(|c| c != '\n' && c != '\r');
+    if !ends_line && next_runs_on {
+        return Some(format!(
+            "note: insert_after joined text to the start of line {line}{more} in {path}: \
+             the anchor ends a line and text does not end with a newline, so the inserted \
+             text runs into the line that follows. End text with a newline to insert whole lines."
+        ));
+    }
+    None
 }
 
 /// Where `needle` first occurs in `content`, for a failed `does_not_contain`:
@@ -7172,6 +7220,83 @@ mod hardening_tests {
         assert!(r.starts_with("Dry run: no changes applied."), "{r}");
         assert!(r.contains("@@ -1,2 +1,2 @@\n alpha\n-beta\n+BETA"), "{r}");
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\nbeta\n");
+    }
+
+    /// `insert_after` is a character splice (defect report 2026-11-12): `text`
+    /// with no leading newline joins the anchor's line, and that is valid text
+    /// in .env, YAML, CSV, a Makefile or a commented-out setting, so the damage
+    /// was silent.  The splice is unchanged on purpose; the result now says so,
+    /// on a dry run and a real write alike.  Mirrors the Python and C++ tests.
+    #[tokio::test]
+    async fn insert_after_announces_a_joined_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let insert = |anchor: &str, text: &str| {
+            json!({"changes": [{"path": p, "operations": [
+                {"kind": "insert_after", "anchor": anchor, "text": text}]}], "dry_run": true})
+        };
+        let notes = |r: &str| -> Vec<String> {
+            r.lines().filter(|l| l.starts_with("note:")).map(|l| l.to_string()).collect()
+        };
+
+        // The reported case: text has no leading newline.
+        let r = run("apply_changes", insert("beta", "INSERTED-1\nINSERTED-2")).await;
+        let n = notes(&r);
+        assert_eq!(n.len(), 1, "{n:?}");
+        // Exact text, so the three editions cannot drift apart on wording.
+        assert_eq!(
+            n[0],
+            format!(
+                "note: insert_after joined text to the end of line 2 in {p}: \
+                 the anchor does not end a line and text does not start with a newline. \
+                 Start text with a newline to insert whole lines."
+            ),
+            "{n:?}"
+        );
+        // The note sits between the header and the diff, so a preview shows it.
+        assert!(r.starts_with("Dry run: no changes applied.\nFiles: 1\nnote: "), "{r}");
+        assert!(r.contains("\n\n--- "), "{r}");
+
+        // The same hazard from the other side: the anchor ends the line and the
+        // text does not end with a newline, so it runs into the following line.
+        let n = notes(&run("apply_changes", insert("beta\n", "X")).await);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("joined text to the start of line 3"), "{}", n[0]);
+
+        // A mid-token anchor joins too, and the note does not pretend otherwise.
+        let n = notes(&run("apply_changes", insert("et", "-MID-")).await);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("end of line 2"), "{}", n[0]);
+
+        // Repeated anchors report how many locations joined.
+        std::fs::write(&f, "dup\ndup\ntail\n").unwrap();
+        let n = notes(&run("apply_changes", json!({"changes": [{"path": p, "operations": [
+            {"kind": "insert_after", "anchor": "dup", "text": "X", "expected_matches": 2}]}],
+            "dry_run": true})).await);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("(+1 more)"), "{}", n[0]);
+
+        // Every documented whole-line form is silent.
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        for (anchor, text) in [
+            ("beta", "\nINSERTED"),
+            ("beta\n", "INSERTED\n"),
+            ("beta", "\nINSERTED\n"),
+            ("gamma\n", "X"),
+            ("beta", ""),
+        ] {
+            let n = notes(&run("apply_changes", insert(anchor, text)).await);
+            assert!(n.is_empty(), "{anchor:?} {text:?} -> {n:?}");
+        }
+
+        // A real write keeps the exact splice and carries the note the dry run
+        // showed, so the preview and the write agree.
+        let r = run("apply_changes", json!({"changes": [{"path": p, "operations": [
+            {"kind": "insert_after", "anchor": "beta", "text": "X"}]}]})).await;
+        assert!(r.contains("note: insert_after joined text to the end of line 2"), "{r}");
+        assert_eq!(std::fs::read(&f).unwrap(), b"alpha\nbetaX\ngamma\n");
     }
 
     #[test]
