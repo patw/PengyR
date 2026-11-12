@@ -1876,59 +1876,124 @@ static SUDO_PROMPT_RE: LazyLock<Regex> =
 
 /// Return spans for unquoted `sudo` command words; data mentions stay inert.
 fn sudo_invocation_spans(command: &str) -> Vec<(usize, usize)> {
+    // A small shell lexical pass, not a parser. It must agree with the Python
+    // edition (spec.md, "sudo support"): heredoc bodies are data, `<<<` opens no
+    // body, `<<-` names the same delimiter as `<<`, and `command`/`env` wrappers
+    // still count as an invocation. The previous byte-scan reset "command start"
+    // at every `(` and newline with no heredoc state at all, so heredoc text —
+    // a commit message, a document — could be read as a subshell invocation and
+    // a real sudo after a heredoc was missed.
+    fn is_sudo_word(word: &str) -> bool {
+        matches!(word, "sudo" | "/usr/bin/sudo" | "/bin/sudo")
+    }
     let b = command.as_bytes();
-    let mut i = 0;
-    let mut at_command_start = true;
-    let mut out = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut heredocs: Vec<String> = Vec::new();
+    let separators = b";|&()\n";
+    let mut i = 0usize;
     while i < b.len() {
-        if b[i].is_ascii_whitespace() {
-            if b[i] == b'\n' {
-                at_command_start = true;
+        if !heredocs.is_empty() && (i == 0 || b[i - 1] == b'\n') {
+            let delimiter = heredocs.remove(0);
+            let line_end = command[i..].find('\n').map(|n| i + n).unwrap_or(b.len());
+            if command[i..line_end].trim() != delimiter {
+                heredocs.insert(0, delimiter);
+            }
+            i = (line_end + 1).min(b.len());
+            words.clear();
+            continue;
+        }
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            if c == b'\n' {
+                words.clear();
             }
             i += 1;
             continue;
         }
-        if b[i] == b'#'
-            && (i == 0 || b[i - 1].is_ascii_whitespace() || b";|&()\n".contains(&b[i - 1]))
+        if c == b'#'
+            && (i == 0 || b[i - 1].is_ascii_whitespace() || separators.contains(&b[i - 1]))
         {
             i = command[i..]
                 .find('\n')
                 .map(|n| i + n + 1)
                 .unwrap_or(b.len());
-            at_command_start = true;
+            words.clear();
             continue;
         }
-        if b";|&()".contains(&b[i]) {
-            at_command_start = true;
+        if command[i..].starts_with("&&")
+            || command[i..].starts_with("||")
+            || command[i..].starts_with(";;")
+        {
+            words.clear();
+            i += 2;
+            continue;
+        }
+        if separators.contains(&c) {
+            words.clear();
             i += 1;
             continue;
         }
         let start = i;
         let mut quoted = false;
-        while i < b.len() && !b[i].is_ascii_whitespace() && !b";|&()".contains(&b[i]) {
-            if b[i] == b'\\' {
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_whitespace() || separators.contains(&c) {
+                break;
+            }
+            if c == b'\\' {
                 i = (i + 2).min(b.len());
-            } else if b[i] == b'\'' || b[i] == b'\"' {
+                continue;
+            }
+            if c == b'\'' || c == b'"' {
                 quoted = true;
-                let q = b[i];
+                let q = c;
                 i += 1;
                 while i < b.len() && b[i] != q {
-                    i += 1;
+                    if q == b'"' && b[i] == b'\\' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
                 }
                 if i < b.len() {
                     i += 1;
                 }
-            } else {
-                i += 1;
+                continue;
             }
+            i += 1;
         }
         let word = &command[start..i];
-        if at_command_start && !quoted && matches!(word, "sudo" | "/usr/bin/sudo" | "/bin/sudo") {
-            out.push((start, i));
+        if word.starts_with("<<") && !word.starts_with("<<<") && word.len() > 2 {
+            let mut delimiter = &word[2..];
+            if let Some(rest) = delimiter.strip_prefix('-') {
+                delimiter = rest;
+            }
+            if delimiter.len() >= 2 {
+                let first = delimiter.as_bytes()[0];
+                let last = delimiter.as_bytes()[delimiter.len() - 1];
+                if (first == b'\'' || first == b'"') && first == last {
+                    delimiter = &delimiter[1..delimiter.len() - 1];
+                }
+            }
+            if !delimiter.is_empty() {
+                heredocs.push(delimiter.to_string());
+            }
         }
-        at_command_start = false;
+        let invocation = !quoted
+            && is_sudo_word(word)
+            && match words.first() {
+                None => true,
+                Some(&"command") => words[1..].iter().all(|w| w.starts_with('-')),
+                Some(&"env") => words[1..].iter().all(|w| w.starts_with('-') || w.contains('=')),
+                Some(_) => false,
+            };
+        if invocation {
+            spans.push((start, i));
+        }
+        words.push(word);
     }
-    out
+    spans
 }
 
 /// Rewrite only parsed sudo commands to use askpass.
@@ -4499,6 +4564,41 @@ mod tests {
         for command in ["echo sudo", "echo 'sudo apt update'", "# sudo\necho ok"] {
             assert!(sudo_invocation_spans(command).is_empty(), "{command}");
             assert_eq!(rewrite_sudo_for_askpass(command), command);
+        }
+    }
+
+    /// The span parser must agree with the Python edition case for case
+    /// (spec.md, "sudo support"). Heredoc bodies are data; a here-string opens
+    /// no body and `<<-` names the same delimiter as `<<`, so neither may
+    /// swallow the rest of the command; `command`/`env` wrappers still count.
+    #[test]
+    fn sudo_span_parser_matches_the_python_case_table() {
+        let s = "sudo";
+        let cases: Vec<(String, bool)> = vec![
+            (format!("cat > f <<'EOF'\n{s} is a word\nEOF"), false),
+            (format!("cat > f <<'EOF'\n{s} apt update\nEOF"), false),
+            (format!("cat > f <<'EOF'\nsee ({s} rule\nEOF"), false),
+            (format!("cat > f <<'EOF'\ntext\nEOF\n{s} ls"), true),
+            (format!("{s} ls && cat <<'EOF'\n{s} word\nEOF"), true),
+            (format!("cat <<< \"hi\"\n{s} ls"), true),
+            (format!("cat <<-EOF\n\tbody\n\tEOF\n{s} ls"), true),
+            (format!("cat <<A <<B\na1\nA\nb1\nB\n{s} ls"), true),
+            (format!("cat <<A <<B\n{s} a\nA\n{s} b\nB"), false),
+            (format!("cat <<\"E O F\"\n{s} x\nE O F"), false),
+            (format!("cat <<EOF\n{s} ls"), false),
+            (format!("{s} apt update"), true),
+            (format!("echo \"{s} apt\""), false),
+            (format!("# {s} apt\necho ok"), false),
+            (format!("env -i {s} ls"), true),
+            (format!("command {s} ls"), true),
+            (format!("({s} true)"), true),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                !sudo_invocation_spans(&command).is_empty(),
+                expected,
+                "{command:?}"
+            );
         }
     }
 
