@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include "pengy_ffi.h"
 #include "mainwindow.h"
+#include "appicon.h"
 #include "themehelper.h"
 #include "version.h"
 
@@ -77,7 +78,7 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("Pengy");
     app.setOrganizationName("Pengy");
-    app.setWindowIcon(QIcon(":/pengy.png"));
+    app.setWindowIcon(pengyApplicationIcon());
 
     QFont font = QFontDatabase::systemFont(QFontDatabase::GeneralFont);
     font = scaledSystemFont(cfg.value("ui_scale").toInt(100));
