@@ -3,6 +3,7 @@
 
 # C++ / CMake build
 gui/build/
+gui/build_ci*/
 gui/build_macos/
 gui/build_windows/
 
