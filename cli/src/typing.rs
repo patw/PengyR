@@ -238,6 +238,16 @@ fn capture_loop() {
 mod tests {
     use super::*;
 
+    /// The queue is process-global (the prompt path, the turn loop and the sudo
+    /// callback all reach it), and cargo runs tests on threads: without this,
+    /// one test's reset() empties the queue another test is mid-way through.
+    /// Cost me a red CI run on the v1.16.1 tag.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn reset() {
         clear();
         let _ = stop();
@@ -248,6 +258,7 @@ mod tests {
 
     #[test]
     fn queue_is_fifo_for_sending_and_lifo_for_recall() {
+        let _serial = serial();
         reset();
         enqueue("first");
         enqueue("second");
@@ -261,6 +272,7 @@ mod tests {
 
     #[test]
     fn blank_lines_are_not_queue_entries() {
+        let _serial = serial();
         reset();
         enqueue("");
         enqueue("   ");
@@ -270,6 +282,7 @@ mod tests {
 
     #[test]
     fn previews_are_single_line_and_elided() {
+        let _serial = serial();
         reset();
         enqueue("read the logs\nand then summarise");
         enqueue(&"x".repeat(200));
@@ -282,6 +295,7 @@ mod tests {
 
     #[test]
     fn held_flag_parks_and_releases() {
+        let _serial = serial();
         reset();
         enqueue("parked");
         assert!(!is_held());
@@ -297,6 +311,7 @@ mod tests {
 
     #[test]
     fn taking_from_an_empty_queue_is_harmless() {
+        let _serial = serial();
         reset();
         assert_eq!(take_oldest(), None);
         assert_eq!(take_newest(), None);
@@ -305,6 +320,7 @@ mod tests {
 
     #[test]
     fn suspend_without_capture_is_a_no_op() {
+        let _serial = serial();
         reset();
         assert!(!suspend());
         // resume(false) must not start anything
