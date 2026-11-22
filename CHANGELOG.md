@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.16.0 — 2026-11-22
 
 - **Chat role labels say who is speaking, and every part of the label is a setting.** Issue #3 (kodekrash), adopted as proposed: resolved at render time from this node's config, nothing written to a chat file, `actor` field out of scope. Labels are complete config strings (`user_label` default `You 🧑`, `assistant_label` default `Pengy{hostname} 🤖`) expanded by `config::chat_identity()` with `{username}` / `{hostname}`, the system message's own placeholder vocabulary; the CLI box titles and `/show` print the derived string verbatim, and the Qt view draws it verbatim after escaping. Deleting the emoji, moving it before the name, or renaming the agent are settings edits; label order standardised on label-first.
 
