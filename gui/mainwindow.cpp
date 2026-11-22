@@ -186,6 +186,14 @@ void MainWindow::setupUi() {
     inputLayout->setContentsMargins(8, 4, 8, 4);
     m_chatInput = new ChatInputWidget;
     connect(m_chatInput, &ChatInputWidget::messageSent, this, &MainWindow::sendMessage);
+    connect(m_chatInput, &ChatInputWidget::queueRecallRequested, this, [this](int direction) {
+        TabSession* active = tabForChat(m_activeChatId);
+        if (active) recallQueued(active, direction);
+    });
+    connect(m_chatInput, &ChatInputWidget::emptySubmit, this, [this] {
+        TabSession* active = tabForChat(m_activeChatId);
+        if (active && !sessionBusy(active)) releaseQueued(active);
+    });
     inputLayout->addWidget(m_chatInput);
 
     m_redactBtn = new QPushButton("Redact");
@@ -497,6 +505,7 @@ void MainWindow::onTabChanged(int index) {
             m_chatHistory->selectChatById(it.key());
             updateQuickSettingsFor(&it.value());
             m_stopBtn->setVisible(it->thinking);
+            refreshQueueUi(&it.value());
             return;
         }
     }
@@ -800,8 +809,25 @@ void MainWindow::openTasks() {
 
 // ── Sending messages ──────────────────────────────────────────────
 
+// Enter in the composer. A turn that is already in flight used to be abandoned
+// from here (processResponse -> abandonWorkerFor cancels the worker), so typing a
+// second thought while the agent worked silently threw the first one away. Now it
+// is queued, shown above the composer, and sent when the turn ends.
 void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     TabSession* session = tabForChat(m_activeChatId);
+    if (!session) return;
+    if (sessionBusy(session)) {
+        enqueueForTurn(session, text, images);
+        return;
+    }
+    startTurn(session, text, images);
+}
+
+bool MainWindow::sessionBusy(TabSession* session) const {
+    return session && (session->worker != nullptr || session->thinking);
+}
+
+void MainWindow::startTurn(TabSession* session, const QString& text, const QStringList& images) {
     if (!session || session->chat.isEmpty()) return;
 
     // Build display content with placeholders for images
@@ -867,9 +893,13 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     pengy_chat_save(chatJson.constData());
 
     session->thinking = true;
+    // A new turn makes the queue live again (a Stop parks it until the user
+    // releases it) and the composer has to say that Enter now queues.
+    session->queue.setHeld(false);
     updateTabTitle(session);
     updateQuickSettingsFor(session);
-    m_stopBtn->show();
+    if (session == tabForChat(m_activeChatId)) m_stopBtn->show();
+    refreshQueueUi(session);
 
     // Build API message list
     QJsonArray apiMessages;
@@ -936,6 +966,49 @@ void MainWindow::sendMessage(const QString& text, const QStringList& images) {
     }
 
     processResponse(session, apiMessages);
+}
+
+// ── Queued input (typed while a turn runs) ───────────────────────
+
+void MainWindow::enqueueForTurn(TabSession* session, const QString& text,
+                                const QStringList& images) {
+    if (!session) return;
+    session->queue.enqueue(text, images);
+    refreshQueueUi(session);
+}
+
+void MainWindow::refreshQueueUi(TabSession* session) {
+    // One composer is shared by every tab, so only the active tab's queue is on
+    // screen; the others refresh when they become active (onTabChanged).
+    if (!session || session != tabForChat(m_activeChatId)) return;
+    if (!m_chatInput) return;  // tab bookkeeping can run before setupUi() builds it
+    m_chatInput->setQueueState(session->queue.previews(), session->queue.held(),
+                               sessionBusy(session));
+}
+
+// Send the oldest queued message. Callers check that the tab is idle first: a
+// running turn's own end is what releases the queue, and a Stop parks it.
+void MainWindow::releaseQueued(TabSession* session) {
+    if (!session || sessionBusy(session) || session->chat.isEmpty()) return;
+    if (session->queue.isEmpty()) return;
+    const QueuedMessage next = session->queue.takeHead();
+    session->queue.setHeld(false);
+    refreshQueueUi(session);
+    startTurn(session, next.text, next.images);
+}
+
+// Up (-1) puts the newest queued message back in the composer to edit; Down (+1)
+// the oldest. The entry leaves the queue while it is being edited, so pressing
+// Enter re-queues it (while the turn runs) and nothing is ever sent twice.
+void MainWindow::recallQueued(TabSession* session, int direction) {
+    if (!session || session->queue.isEmpty()) return;
+    if (!m_chatInput->composerEmpty()) return;
+    const QueuedMessage item = direction < 0 ? session->queue.takeNewest()
+                                             : session->queue.takeOldest();
+    if (item.text.isEmpty() && item.images.isEmpty()) return;
+    m_chatInput->setComposerText(item.text);
+    if (!item.images.isEmpty()) m_chatInput->attachPaths(item.images);
+    refreshQueueUi(session);
 }
 
 void MainWindow::processResponse(TabSession* session, const QJsonArray& apiMessages) {
@@ -1191,6 +1264,9 @@ void MainWindow::handleTurnError(TabSession* session, const QJsonObject& event) 
         m_stopBtn->hide();
         updateQuickSettingsFor(session);
     }
+    // The turn died mid-flight: hold what the user queued rather than spend it on
+    // a chat that just failed. Enter releases the oldest.
+    refreshQueueUi(session);
 }
 
 void MainWindow::handleToolConfirm(TabSession* session, const QJsonObject& req) {
@@ -1237,6 +1313,8 @@ void MainWindow::onWorkerError(const QString& msg) {
         m_stopBtn->hide();
         updateQuickSettingsFor(session);
     }
+    // A failed turn does not spend the queue: it stays visible, and Enter sends it.
+    refreshQueueUi(session);
 }
 
 void MainWindow::onWorkerFinished() {
@@ -1276,6 +1354,14 @@ void MainWindow::onWorkerFinished() {
         m_confirmTimer->stop();
         updateQuickSettingsFor(session);
     }
+
+    // The turn ended on its own, so what was typed while it ran goes out now.
+    // (A Stop parks the queue instead -- see stopWorker -- and a failed turn holds
+    // it for the user to decide.)
+    if (!session->queue.isEmpty() && !session->queue.held())
+        releaseQueued(session);
+    else
+        refreshQueueUi(session);
 
     disconnect(worker, nullptr, this, nullptr);
     worker->deleteLater();
@@ -1334,6 +1420,11 @@ void MainWindow::stopWorker() {
     session->toolRunning = false;
     updateTabTitle(session);
     updateQuickSettingsFor(session);
+
+    // Stop means stop: the queue is parked, not spent, so the next thing that runs
+    // is the user's decision. Enter in an empty composer releases it.
+    if (!session->queue.isEmpty()) session->queue.setHeld(true);
+    refreshQueueUi(session);
 
     if (!session->chat.isEmpty()) {
         QByteArray priorJson = QJsonDocument(session->chat["messages"].toArray())

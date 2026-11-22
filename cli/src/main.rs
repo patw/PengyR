@@ -1,4 +1,5 @@
 mod sigwatch;
+mod typing;
 
 use pengy_core::about;
 use pengy_core::chat_manager::{self, Chat, ChatMessage};
@@ -13,6 +14,10 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{history::FileHistory, Editor};
+use rustyline::{
+    Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyCode, KeyEvent, Modifiers,
+    RepeatCount,
+};
 use rustyline::{Context, Helper};
 
 use std::io::{self, IsTerminal, Write};
@@ -32,6 +37,36 @@ const MAX_PANEL_WIDTH: usize = 140;
 const MIN_PANEL_WIDTH: usize = 60;
 
 // ── Slash command completion ──────────────────────────────────
+
+/// Up/Down on an *empty* line recall a message queued during the turn for editing.
+///
+/// Returning `None` leaves the key to readline, so history navigation and ordinary
+/// cursor movement are untouched -- the recall only wins on an empty line, which is
+/// exactly where Up means "give me back what I typed while you were busy".
+struct RecallQueuedHandler {
+    /// -1 = newest (Up), +1 = oldest (Down).
+    direction: i8,
+}
+
+impl ConditionalEventHandler for RecallQueuedHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if !ctx.line().is_empty() {
+            return None;
+        }
+        let text = if self.direction < 0 {
+            typing::take_newest()?
+        } else {
+            typing::take_oldest()?
+        };
+        Some(Cmd::Insert(1, text))
+    }
+}
 
 /// Every slash command the REPL dispatches, for tab completion.
 const SLASH_COMMANDS: &[&str] = &[
@@ -66,6 +101,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/redact",
     "/tasks",
     "/task",
+    "/queue",
     "/about",
     "/quit",
     "/exit",
@@ -328,6 +364,18 @@ impl PengyCli {
 
         let mut rl: Editor<PengyHelper, FileHistory> = Editor::new().expect("rustyline editor");
         rl.set_helper(Some(PengyHelper));
+        // A message typed while a turn ran can be pulled back for editing instead of
+        // being sent verbatim: Up on an empty line takes the newest, Down the oldest.
+        // Both fall through to readline on a non-empty line, so cursor keys and
+        // history behave exactly as before.
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Up, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(RecallQueuedHandler { direction: -1 })),
+        );
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Down, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(RecallQueuedHandler { direction: 1 })),
+        );
         let _ = rl.load_history(&hist_path);
 
         Self {
@@ -401,12 +449,36 @@ impl PengyCli {
         self.set_sudo_provider();
 
         loop {
+            // A message typed while the last turn ran goes out before we ask for
+            // anything: that is the whole point of queueing it.
+            if !typing::is_empty() && !typing::is_held() {
+                if let Some(queued) = typing::take_oldest() {
+                    eprintln!(
+                        "{}→ sending queued message: {}{}",
+                        DIM,
+                        truncate(&queued.replace('\n', " "), 60),
+                        RESET
+                    );
+                    if !self.dispatch_text(&queued) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             let title = self
                 .current_chat
                 .as_ref()
                 .map(|c| truncate(&c.title, 30))
                 .unwrap_or_else(|| "?".to_string());
-            let prompt_label = format!("\n{} › You: ", title);
+            let queue_note = if typing::is_empty() {
+                String::new()
+            } else if typing::is_held() {
+                format!(" ({} queued, held)", typing::len())
+            } else {
+                format!(" ({} queued)", typing::len())
+            };
+            let prompt_label = format!("\n{} › You{}: ", title, queue_note);
             let line = match self.prompt(&prompt_label) {
                 Some(l) => l,
                 None => break,
@@ -414,24 +486,70 @@ impl PengyCli {
 
             let text = line.trim();
             if text.is_empty() {
-                continue;
-            }
-
-            if text.starts_with('/') {
-                if !self.handle_slash(text) {
-                    break;
+                // Enter on an empty line releases the oldest queued message instead
+                // of doing nothing -- how a queue parked by Ctrl-C gets going again.
+                if let Some(queued) = typing::take_oldest() {
+                    typing::set_held(false);
+                    if !self.dispatch_text(&queued) {
+                        break;
+                    }
                 }
                 continue;
             }
 
-            let (resolved_text, file_content, images) = resolve_attachments(text);
-            let final_text = if file_content.is_empty() { resolved_text } else { format!("{}\n{}", file_content, resolved_text) };
-            self.send_text_with_attachments(&final_text, images);
+            if !self.dispatch_text(text) {
+                break;
+            }
         }
 
         self.clear_sudo_provider();
         let _ = self.rl.save_history(&self.hist_path);
         println!("\nGoodbye!");
+    }
+
+    /// Everything the REPL can do with one line: a slash command or a message.
+    /// Returns false when the user asked to quit.
+    ///
+    /// Capturing runs for the duration: what the user types while the turn is in
+    /// flight is queued, not dropped, and never lands in a prompt (each prompt
+    /// suspends the capture itself).
+    fn dispatch_text(&mut self, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return true;
+        }
+        typing::start();
+        let mut quit = false;
+        if text.starts_with('/') {
+            quit = !self.handle_slash(text);
+        } else {
+            let (resolved_text, file_content, images) = resolve_attachments(text);
+            let final_text = if file_content.is_empty() {
+                resolved_text
+            } else {
+                format!("{}\n{}", file_content, resolved_text)
+            };
+            self.send_text_with_attachments(&final_text, images);
+        }
+        // Announce anything captured but not yet shown, then hand the terminal back.
+        self.announce_queued(typing::stop());
+        // Callers read "false" as "the user asked to quit", so invert the local.
+        !quit
+    }
+
+    /// Add captured lines to the queue and say so. Called from the turn loop as
+    /// lines arrive, and once more when the turn ends.
+    fn announce_queued(&self, lines: Vec<String>) {
+        for line in lines {
+            typing::enqueue(&line);
+            eprintln!(
+                "{}  \u{21e2} queued {}: {}{}",
+                DIM,
+                typing::len(),
+                truncate(&line.replace('\n', " "), 60),
+                RESET
+            );
+        }
     }
 
     fn run_single_shot(&mut self, prompt_text: &str) {
@@ -726,12 +844,31 @@ impl PengyCli {
                             eprintln!("  [{}] {label}  \x1b[2m— {desc}\x1b[0m", oi + 1);
                         }
                         eprintln!();
-                        let mut input = String::new();
-                        if std::io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
+                        // A prompt never consumes type-ahead: stop capturing (and drop
+                        // a half-typed line) for as long as this form is being answered.
+                        let was_capturing = typing::suspend();
+                        let choice = loop {
+                            let mut input = String::new();
+                            if std::io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
+                                break None;
+                            }
+                            let trimmed = input.trim();
+                            // Enter alone is not an answer: an empty line used to pick
+                            // option 1, which is how a stray keystroke answered a
+                            // question the model had asked.
+                            match trimmed.parse::<usize>() {
+                                Ok(n) if n >= 1 && n <= opts.len() => break Some(n),
+                                _ => eprintln!(
+                                    "\x1b[2m  Choose 1-{}, or press Ctrl-C to cancel.\x1b[0m",
+                                    opts.len()
+                                ),
+                            }
+                        };
+                        typing::resume(was_capturing);
+                        let Some(choice) = choice else {
                             cancelled = true;
                             break;
-                        }
-                        let choice: usize = input.trim().parse().unwrap_or(1);
+                        };
                         let answer = opts
                             .get(choice.saturating_sub(1))
                             .and_then(|opt| opt.get("label"))
@@ -854,6 +991,9 @@ impl PengyCli {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             task.abort();
             eprint!("\r{}\r", " ".repeat(40));
+            // Ctrl-C means stop: park whatever was typed while this turn ran rather
+            // than spending it on the next one. Enter releases it, or Up edits it.
+            typing::set_held(true);
         }
 
         // An abort or an error leaves the loop mid-turn, where the last
@@ -893,6 +1033,16 @@ impl PengyCli {
         loop {
             if sigwatch::pending() != 0 {
                 return None;
+            }
+            // Type-ahead is collected here, not between events: this loop polls
+            // every 100 ms, while the outer one only runs when the turn emits
+            // something -- which can be seconds away, exactly when the user is
+            // typing. Announcing it promptly is the whole point.
+            let captured = typing::collect();
+            if !captured.is_empty() {
+                eprint!("\r{}\r", " ".repeat(40));
+                self.announce_queued(captured);
+                eprint!("{}Thinking...{}", DIM, RESET);
             }
             let poll = async {
                 tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
@@ -1085,10 +1235,13 @@ impl PengyCli {
                 return 4;
             };
             match input.trim() {
-                "1" | "" => return 1,
+                "1" => return 1,
                 "2" => return 2,
                 "3" => return 3,
                 "4" => return 4,
+                // Enter alone must never mean "run the tool": hammering Enter while
+                // waiting used to approve the next write. Ask again instead.
+                "" => println!("{}Press 1 to execute, 3 to decline.{}{}", DIM, RESET, ""),
                 _ => println!("{}Please enter 1, 2, 3, or 4.{}", RED, RESET),
             }
         }
@@ -1119,7 +1272,12 @@ impl PengyCli {
                 ),
             }
             io::stderr().flush().ok();
-            rpassword::read_password().ok()
+            // The password prompt must not read type-ahead either: a queued message
+            // would otherwise be submitted as the sudo password.
+            let was_capturing = typing::suspend();
+            let password = rpassword::read_password().ok();
+            typing::resume(was_capturing);
+            password
         })));
     }
 
@@ -1167,10 +1325,39 @@ impl PengyCli {
             "/redact" => self.cmd_redact(args),
             "/tasks" => self.cmd_tasks(),
             "/task" => self.cmd_task(args),
+            "/queue" => self.cmd_queue(args),
             "/about" => self.cmd_about(),
             _ => println!("{}Unknown command:{} {}  (try /help)", RED, RESET, cmd),
         }
         true
+    }
+
+    /// `/queue [clear]` -- what was typed while the last turn ran.
+    fn cmd_queue(&mut self, args: &[&str]) {
+        if matches!(args.first().map(|a| a.to_lowercase()).as_deref(), Some("clear")) {
+            let n = typing::len();
+            typing::clear();
+            println!("{}Cleared {} queued message(s).{}", DIM, n, RESET);
+            return;
+        }
+        if typing::is_empty() {
+            println!(
+                "{}No queued messages. Type while a turn runs and Enter queues it; \
+                 Up on an empty line pulls the newest back for editing.{}",
+                DIM, RESET
+            );
+            return;
+        }
+        println!();
+        println!("{}Queued messages{} (oldest first){}", BOLD, DIM, RESET);
+        for (i, preview) in typing::previews(72).iter().enumerate() {
+            println!("  {}{}.{} {}", DIM, i + 1, RESET, preview);
+        }
+        println!(
+            "{}Enter on an empty line sends the oldest · Up edits the newest · \
+             Down the oldest · /queue clear drops them all{}",
+            DIM, RESET
+        );
     }
 
     fn cmd_help(&self) {
@@ -1219,6 +1406,7 @@ impl PengyCli {
                 "Run a Task by its /tasks index, prompting for any %placeholders%",
             ),
             ("/list", "List recent chats"),
+            ("/queue [clear]", "Show (or clear) messages queued while a turn ran"),
             ("/load <index> [msg#]", "Load a chat by its /list index; msg# (from /search) prints that message"),
             ("/search <words>", "Search chat titles and messages (any order; \"quote\" a phrase)"),
             ("/delete <index>", "Delete a chat by its /list index"),
@@ -2368,7 +2556,12 @@ impl PengyCli {
     }
 
     fn prompt(&mut self, prompt_str: &str) -> Option<String> {
-        match self.rl.readline(prompt_str) {
+        // A prompt must never consume type-ahead. Stop capturing first (which also
+        // drops a half-typed line, so "1" answered to a half-finished sentence
+        // cannot run a tool), then let readline own the terminal. Capturing resumes
+        // afterwards if a turn is still running.
+        let was_capturing = typing::suspend();
+        let result = match self.rl.readline(prompt_str) {
             Ok(line) => {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
@@ -2379,8 +2572,15 @@ impl PengyCli {
             Err(
                 rustyline::error::ReadlineError::Eof | rustyline::error::ReadlineError::Interrupted,
             ) => None,
-            Err(_) => None,
-        }
+            // Anything else used to quit the REPL silently, which made a terminal
+            // problem look like a deliberate exit. Say so, then quit, as before.
+            Err(err) => {
+                eprintln!("{}readline error: {err}{}", DIM, RESET);
+                None
+            }
+        };
+        typing::resume(was_capturing);
+        result
     }
 }
 

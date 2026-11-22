@@ -199,6 +199,19 @@ if(PENGY_BUILD_TESTS)
   target_link_libraries(pengy_chatinput_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
   add_test(NAME pengy_chatinput_test COMMAND pengy_chatinput_test)
 
+  # The composer's message queue: pure logic, no widgets to instantiate.
+  add_executable(pengy_messagequeue_test tests/test_messagequeue.cpp)
+  target_include_directories(pengy_messagequeue_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_messagequeue_test PRIVATE Qt6::Core)
+  add_test(NAME pengy_messagequeue_test COMMAND pengy_messagequeue_test)
+
+  # The composer's queue strip and the Enter/Up/Down keys that drive it.
+  add_executable(pengy_chatinput_queue_test tests/test_chatinput_queue.cpp chatinput.cpp)
+  target_compile_definitions(pengy_chatinput_queue_test PRIVATE PENGY_UNIT_TEST)
+  target_include_directories(pengy_chatinput_queue_test PRIVATE ${CMAKE_SOURCE_DIR})
+  target_link_libraries(pengy_chatinput_queue_test PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
+  add_test(NAME pengy_chatinput_queue_test COMMAND pengy_chatinput_queue_test)
+
   # Tool-confirmation dialog: geometry (it used to open too small to read) and
   # the meaning of each button, including the tab-scoped "don't ask again".
   add_executable(pengy_toolconfirm_test
