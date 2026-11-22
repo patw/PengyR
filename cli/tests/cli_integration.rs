@@ -436,7 +436,10 @@ fn search_numbers_messages_and_load_prints_one() {
     let out = h.run(&["/search NGINX", "/load 1 #4", "/load 1 9", "/search zzz", "/search"]);
     assert!(out.contains("#3    You:") && out.contains("#4    AI:"), "{out}");
     assert!(out.contains("1 chat found. /load <#> to open one"), "{out}");
-    assert!(out.contains("── #4 Assistant"), "{out}");
+    // The panel title is the derived assistant label: the agent name, plus the
+    // host when the node is named. Assert the prefix, not the whole string --
+    // the runner's hostname is not known here.
+    assert!(out.contains("── #4 Pengy"), "{out}");
     // The whole message, the last search's words marked.
     assert!(out.contains("Install **\x1b[1m\x1b[33mnginx\x1b[0m** and edit the config."), "{out}");
     assert!(out.contains("/show 1 to read on from here"), "{out}");
