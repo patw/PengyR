@@ -1,5 +1,6 @@
 #include "settingsdialog.h"
 #include "compactionsettings.h"
+#include "chatlabels.h"
 #include "pengy_ffi.h"
 #include <QVBoxLayout>
 #include <QFormLayout>
@@ -94,18 +95,20 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
 
     // Chat role labels are derived at render time from these two; nothing is written
     // into chat files, so existing chats change label with no migration.
-    m_displayName = new QLineEdit(config["display_name"].toString());
-    m_displayName->setToolTip("Name shown on your own chat messages. Empty uses your login name.");
-    uiForm->addRow(labelWithTip("Display name:", "Name shown on your own chat messages. Empty uses your login name."), m_displayName);
-    // The label fields are the whole rendered string, glyph included; the view
-    // adds nothing. Blank restores the shipped default.
-    m_userLabel = new QLineEdit(config["user_label"].toString());
-    m_userLabel->setToolTip("Whole label for your messages, emoji included. {username} is your display name. Empty restores the default.");
-    uiForm->addRow(labelWithTip("Your label:", "Whole label for your messages, emoji included. {username} is your display name. Empty restores the default."), m_userLabel);
+    // Prefilled with the string that ships as the default -- the value used when the
+    // field is empty -- so the default shape is visible and editable in place, with
+    // {username} and {hostname} spelled out.
+    const QString defaultUser = chatDefaultUserLabel();
+    const QString defaultAssistant = chatDefaultAssistantLabel();
+    m_userLabel = new QLineEdit(chatLabelField(config["user_label"].toString(), defaultUser));
+    m_userLabel->setObjectName(QStringLiteral("userLabel"));
+    m_userLabel->setToolTip("Whole label for your messages, emoji included. {username} is your login name. Saving the default text restores it as the default.");
+    uiForm->addRow(labelWithTip("Your label:", "Whole label for your messages, emoji included. {username} is your login name. Saving the default text restores it as the default."), m_userLabel);
 
-    m_assistantLabel = new QLineEdit(config["assistant_label"].toString());
-    m_assistantLabel->setToolTip("Whole label for the assistant. {hostname} becomes ' (host)' when chat labels name the machine. Empty restores the default.");
-    uiForm->addRow(labelWithTip("Assistant label:", "Whole label for the assistant, emoji included. {hostname} becomes ' (host)' when chat labels name the machine. Empty restores the default."), m_assistantLabel);
+    m_assistantLabel = new QLineEdit(chatLabelField(config["assistant_label"].toString(), defaultAssistant));
+    m_assistantLabel->setObjectName(QStringLiteral("assistantLabel"));
+    m_assistantLabel->setToolTip("Whole label for the assistant. {hostname} becomes ' (host)' when chat labels name the machine. Saving the default text restores it as the default.");
+    uiForm->addRow(labelWithTip("Assistant label:", "Whole label for the assistant, emoji included. {hostname} becomes ' (host)' when chat labels name the machine. Saving the default text restores it as the default."), m_assistantLabel);
 
 
     m_showNodeLabel = new QCheckBox("Name the answering machine in the assistant label");
@@ -448,9 +451,8 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["ui_scale"] = m_uiScale->currentData().toInt();
         m_config["theme_mode"] = m_themeMode->currentData().toString();
         m_config["theme_accent"] = m_themeAccent->currentData().toString();
-        m_config["display_name"] = m_displayName->text().trimmed();
-        m_config["user_label"] = m_userLabel->text().trimmed();
-        m_config["assistant_label"] = m_assistantLabel->text().trimmed();
+        m_config["user_label"] = chatLabelToStore(m_userLabel->text(), chatDefaultUserLabel());
+        m_config["assistant_label"] = chatLabelToStore(m_assistantLabel->text(), chatDefaultAssistantLabel());
         m_config["show_node_in_label"] = m_showNodeLabel->isChecked();
         m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();

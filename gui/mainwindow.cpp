@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "chatlabels.h"
 #include <QShortcut>
 #include "toolconfirmdialog.h"
 #include "chathistory.h"
@@ -53,15 +54,14 @@ namespace {
 /// decides whether {hostname} becomes ' (host)' or nothing. Display-only:
 /// nothing is written into a chat file, so existing chats need no migration.
 QPair<QString, QString> chatIdentity(const QJsonObject& config) {
-    const QString userGlyph = QString::fromUtf8("\xf0\x9f\xa7\x91");
-    const QString botGlyph = QString::fromUtf8("\xf0\x9f\xa4\x96");
-    const QString defaultUser = QStringLiteral("{username} ") + userGlyph;
-    const QString defaultAssistant = QStringLiteral("Pengy{hostname} ") + botGlyph;
+    const QString defaultUser = chatDefaultUserLabel();
+    const QString defaultAssistant = chatDefaultAssistantLabel();
 
-    QString human = config["display_name"].toString().trimmed();
-    if (human.isEmpty())
-        human = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "You"));
-    if (human.isEmpty()) human = "You";
+    // {username} is the login name, the same value the system prompt uses. There is
+    // no separate display name: it would only ever fill a placeholder in the very
+    // label field next to it, so a name is written into the label itself.
+    QString human = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "You"));
+    if (human.trimmed().isEmpty()) human = QStringLiteral("You");
 
     QString hostSlot;
     if (config["show_node_in_label"].toBool(true)) {
@@ -73,12 +73,16 @@ QPair<QString, QString> chatIdentity(const QJsonObject& config) {
     }
 
     const auto expand = [&](const QString& tmpl, const QString& fallback) {
-        QString use = tmpl.trimmed().isEmpty() ? fallback : tmpl;
+        QString use = chatLabelField(tmpl, fallback);
         use.replace("{username}", human).replace("{hostname}", hostSlot);
         return use.trimmed();
     };
-    return {expand(config["user_label"].toString(), defaultUser),
-            expand(config["assistant_label"].toString(), defaultAssistant)};
+    QString user = expand(config["user_label"].toString(), defaultUser);
+    QString assistant = expand(config["assistant_label"].toString(), defaultAssistant);
+    // A label that expands to nothing must not render a label-less transcript.
+    if (user.isEmpty()) user = defaultUser;
+    if (assistant.isEmpty()) assistant = defaultAssistant;
+    return {user, assistant};
 }
 
 } // namespace
