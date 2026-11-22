@@ -1005,7 +1005,7 @@ impl PengyCli {
             "raw" => println!("{}", content),
             _ => {
                 println!();
-                print_box("Assistant 🤖", &[render_markdown_terminal(content)], None);
+                print_box(&format!("{} 🤖", config::chat_identity(&self.config).1), &[render_markdown_terminal(content)], None);
             }
         }
     }
@@ -1035,12 +1035,13 @@ impl PengyCli {
             _ => {} // pretty — fall through
         }
 
+        let assistant_label = config::chat_identity(&self.config).1;
         if content.trim().is_empty() {
-            print_box("Assistant 🤖", &["(empty response)".to_string()], None);
+            print_box(&format!("{assistant_label} 🤖"), &["(empty response)".to_string()], None);
         } else {
             println!();
             let rendered = render_markdown_terminal(content);
-            print_box("Assistant 🤖", &[rendered], None);
+            print_box(&format!("{assistant_label} 🤖"), &[rendered], None);
         }
 
         if usage.total_tokens > 0 {
@@ -1801,9 +1802,10 @@ impl PengyCli {
         let msg = &msgs[n - 1];
         let text = msg.content.as_ref().map(chat_search::text_of).unwrap_or_default();
         let text = if text.is_empty() { "(no text)".to_string() } else { text };
+        let (human_label, assistant_label) = config::chat_identity(&self.config);
         let label = match msg.role.as_str() {
-            "user" => "You".to_string(),
-            "assistant" => "Assistant".to_string(),
+            "user" => human_label,
+            "assistant" => assistant_label,
             other => {
                 let mut c = other.chars();
                 c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()

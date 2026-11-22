@@ -34,6 +34,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QMimeDatabase>
+#include <QSysInfo>
 #include <QMimeType>
 #include <QCloseEvent>
 #include <QScreen>
@@ -41,6 +42,30 @@
 #include <QGroupBox>
 #include <QButtonGroup>
 #include <QRadioButton>
+
+namespace {
+
+/// (human label, assistant label) for the chat role labels, from this node's
+/// config. Display-only: nothing is stored in a chat file, so existing chats
+/// need no migration. display_name falls back to the login name, the same
+/// convention the Rust core uses for {username} in the system message.
+QPair<QString, QString> chatIdentity(const QJsonObject& config) {
+    QString human = config["display_name"].toString().trimmed();
+    if (human.isEmpty())
+        human = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "You"));
+    if (human.isEmpty()) human = "You";
+    QString assistant = "Pengy";
+    if (config["show_node_in_label"].toBool(true)) {
+        QString hostname;
+        QFile f("/etc/hostname");
+        if (f.open(QIODevice::ReadOnly)) hostname = QString::fromUtf8(f.readAll()).trimmed();
+        if (hostname.isEmpty()) hostname = QSysInfo::machineHostName();
+        if (!hostname.isEmpty()) assistant = QString("%1 (%2)").arg(assistant, hostname);
+    }
+    return {human, assistant};
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     // Load config
@@ -234,9 +259,12 @@ void MainWindow::applyTheme() {
             "QPushButton:hover { background-color:%2; }").arg(theme["danger"], theme["danger_hover"]));
     }
     // Re-theme all open tab chat views
+    const QPair<QString, QString> identity = chatIdentity(m_config);
     for (auto& session : m_openTabs) {
-        if (session.chatView)
+        if (session.chatView) {
             session.chatView->applyTheme(theme, themeScale);
+            session.chatView->applyIdentity(identity.first, identity.second);
+        }
     }
     for (int i = 0; i < m_tabWidget->count(); ++i) {
         if (auto* button = qobject_cast<QToolButton*>(m_tabWidget->tabBar()->tabButton(i, QTabBar::RightSide))) {
@@ -354,6 +382,9 @@ TabSession* MainWindow::addTab(const QJsonObject& chat, bool switchTo) {
     Theme theme = makeTheme(m_config["theme_mode"].toString("system"),
                             m_config["theme_accent"].toString("default"));
     chatView->applyTheme(theme, themeScale);
+    // Labels come from this node's config, not from the chat.
+    const QPair<QString, QString> tabIdentity = chatIdentity(m_config);
+    chatView->applyIdentity(tabIdentity.first, tabIdentity.second);
 
     // Render existing messages
     QJsonArray messages = chat["messages"].toArray();

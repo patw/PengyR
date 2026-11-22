@@ -92,6 +92,15 @@ pub struct Config {
     /// Accent colour: default | blue | teal | green | orange | red | pink | purple.
     #[serde(default = "default_theme_accent")]
     pub theme_accent: String,
+    /// Human side of the chat role labels. Empty falls back to the login name,
+    /// the same value `{username}` gets in the system message.
+    #[serde(default)]
+    pub display_name: String,
+
+    /// Name the answering machine in the assistant label, e.g. `Pengy (behopc)`.
+    /// Matters because the same chats are opened on several machines.
+    #[serde(default = "default_show_node_in_label")]
+    pub show_node_in_label: bool,
 
     /// User-Agent header sent in HTTP requests.
     #[serde(default = "default_user_agent")]
@@ -148,6 +157,7 @@ fn default_tool_confirmation() -> String {
     "none".into()
 }
 fn default_compact_at_percent() -> u64 { 75 }
+fn default_show_node_in_label() -> bool { true }
 fn default_auto_context_recovery() -> bool { true }
 fn default_recovery_keep_turns() -> usize { 3 }
 fn default_output_token_parameter() -> String { "max_tokens".into() }
@@ -213,6 +223,8 @@ impl Default for Config {
             ui_scale: default_ui_scale(),
             theme_mode: default_theme_mode(),
             theme_accent: default_theme_accent(),
+            display_name: String::new(),
+            show_node_in_label: default_show_node_in_label(),
             user_agent: default_user_agent(),
             llm_timeout: default_llm_timeout(),
             tool_timeout: default_tool_timeout(),
@@ -340,6 +352,8 @@ pub fn load_config() -> Config {
                     if let Some(n) = obj.get("context_window").and_then(|v| v.as_u64()) { config.context_window = n; }
                     if let Some(b) = obj.get("context_window_auto").and_then(|v| v.as_bool()) { config.context_window_auto = b; }
                     if let Some(n) = obj.get("compact_at_percent").and_then(|v| v.as_u64()) { config.compact_at_percent = n; }
+                    if let Some(s) = obj.get("display_name").and_then(|v| v.as_str()) { config.display_name = s.into(); }
+                    if let Some(b) = obj.get("show_node_in_label").and_then(|v| v.as_bool()) { config.show_node_in_label = b; }
                     if let Some(v) = obj.get("context_windows") { config.context_windows = serde_json::from_value(v.clone()).unwrap_or_default(); }
                     if let Some(v) = obj.get("context_window_modes") { config.context_window_modes = serde_json::from_value(v.clone()).unwrap_or_default(); }
                     if let Some(s) = obj.get("empty_reply_thinking_off").and_then(|v| v.as_str()) { config.empty_reply_thinking_off = s.into(); }
@@ -463,6 +477,26 @@ fn whoami() -> String {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".into())
 }
+/// The name Pengy calls itself in chat role labels.
+pub const AGENT_NAME: &str = "Pengy";
+
+/// (human label, assistant label) for the chat role labels, derived from this
+/// node's config. Display-only: nothing is written to a chat file, so existing
+/// chats need no migration -- "who answered this" is a property of the machine
+/// rendering it, and chats are shared between machines.
+pub fn chat_identity(config: &Config) -> (String, String) {
+    let human = {
+        let trimmed = config.display_name.trim();
+        if trimmed.is_empty() { whoami() } else { trimmed.to_string() }
+    };
+    let assistant = if config.show_node_in_label {
+        let host = hostname();
+        if host.is_empty() { AGENT_NAME.to_string() } else { format!("{AGENT_NAME} ({host})") }
+    } else {
+        AGENT_NAME.to_string()
+    };
+    (human, assistant)
+}
 
 fn hostname() -> String {
     let mut cmd = std::process::Command::new("hostname");
@@ -478,6 +512,50 @@ fn hostname() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_identity_prefers_display_name_and_names_the_node() {
+        let mut cfg = Config::default();
+        cfg.display_name = "  Pat  ".into();
+        let (human, assistant) = chat_identity(&cfg);
+        assert_eq!(human, "Pat", "the setting is trimmed");
+        assert!(assistant.starts_with(AGENT_NAME));
+        assert!(assistant.contains('('), "the node is named by default");
+    }
+
+    #[test]
+    fn chat_identity_falls_back_to_the_login_name() {
+        // Same value the system message gets for {username}, so the label can
+        // never be worse-informed than the prompt.
+        let cfg = Config::default();
+        let (human, _) = chat_identity(&cfg);
+        assert_eq!(human, whoami());
+    }
+
+    #[test]
+    fn chat_identity_can_drop_the_node_from_the_label() {
+        let mut cfg = Config::default();
+        cfg.show_node_in_label = false;
+        let (_, assistant) = chat_identity(&cfg);
+        assert_eq!(assistant, AGENT_NAME);
+        assert!(!assistant.contains('('));
+    }
+
+    #[test]
+    fn chat_identity_defaults_survive_an_older_settings_file() {
+        // A settings.json written before these keys existed must parse, and the
+        // node must default to named.
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("display_name");
+        obj.remove("show_node_in_label");
+        let cfg: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.display_name, "");
+        assert!(cfg.show_node_in_label, "node naming is on by default");
+        let (human, assistant) = chat_identity(&cfg);
+        assert_eq!(human, whoami());
+        assert!(assistant.starts_with(AGENT_NAME));
+    }
+
     use super::*;
     use std::ffi::OsString;
 
@@ -595,6 +673,8 @@ mod tests {
             ui_scale: 150,
             theme_mode: "dark".into(),
             theme_accent: "purple".into(),
+            display_name: "Pat".into(),
+            show_node_in_label: true,
             user_agent: "TestAgent/1.0".into(),
             llm_timeout: 120,
             tool_timeout: 120,

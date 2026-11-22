@@ -92,6 +92,17 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_themeAccent->setToolTip("Highlight color for buttons, links, and selection highlights.");
     uiForm->addRow(labelWithTip("Accent color:", "Highlight color for buttons, links, and selection highlights."), m_themeAccent);
 
+    // Chat role labels are derived at render time from these two; nothing is written
+    // into chat files, so existing chats change label with no migration.
+    m_displayName = new QLineEdit(config["display_name"].toString());
+    m_displayName->setToolTip("Name shown on your own chat messages. Empty uses your login name.");
+    uiForm->addRow(labelWithTip("Display name:", "Name shown on your own chat messages. Empty uses your login name."), m_displayName);
+
+    m_showNodeLabel = new QCheckBox("Name the answering machine in the assistant label");
+    m_showNodeLabel->setChecked(config["show_node_in_label"].toBool(true));
+    m_showNodeLabel->setToolTip("Shows e.g. 'Pengy (behopc)'. Useful when the same chats are shared between machines.");
+    uiForm->addRow(labelWithTip("Chat labels:", "Shows e.g. 'Pengy (behopc)' as the assistant label. Useful when the same chats are shared between machines."), m_showNodeLabel);
+
     auto* bulkRenameBtn = new QPushButton("Bulk Rename Chats");
     bulkRenameBtn->setObjectName("bulkRenameBtn");
     bulkRenameBtn->setToolTip("Generate a new title for every existing chat with the default model.");
@@ -427,6 +438,8 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["ui_scale"] = m_uiScale->currentData().toInt();
         m_config["theme_mode"] = m_themeMode->currentData().toString();
         m_config["theme_accent"] = m_themeAccent->currentData().toString();
+        m_config["display_name"] = m_displayName->text().trimmed();
+        m_config["show_node_in_label"] = m_showNodeLabel->isChecked();
         m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();
         m_config["tool_output_max_chars"] = m_toolOutputMax->value();
