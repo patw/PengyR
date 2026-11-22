@@ -1293,9 +1293,11 @@ async fn chat_send(
                     }
                 }
             } else if let Ok(decoded) = base64_decode(&f.data) {
-                if let Ok(text) = String::from_utf8(decoded) {
-                    text_blocks.push(format!("[File: {}]\n```\n{}\n```", f.name, text));
-                }
+                // Attached text is paid for in context: capped against the
+                // model's context window, with the cut announced in the message.
+                let budget = pengy_core::text_attach::budget_for_model(&config, "");
+                let (text, note) = pengy_core::text_attach::read_text_attachment_bytes(&decoded, budget);
+                text_blocks.push(format!("[File: {}]\n```\n{}{}\n```", f.name, text, note));
             }
         }
     }

@@ -53,6 +53,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     setupUi();
     applyTheme();
+
+    // Attached text is paid for in context, so the per-file budget follows the
+    // context window configured for the model in play (config comes from the
+    // Rust core as JSON: model, context_window, context_windows).
+    qulonglong window = m_config["context_windows"].toObject()
+                            .value(m_config["model"].toString()).toVariant().toULongLong();
+    if (!window) window = m_config["context_window"].toVariant().toULongLong();
+    m_chatInput->setEmbedBudgetBytes(ChatInputWidget::embedBudgetForContext(window));
     updateLlmClient();
     loadChatList();
     refreshModelCombo();

@@ -18,6 +18,7 @@ pub mod image_capabilities;
 pub mod llm_client;
 pub mod model_cache;
 pub mod task_manager;
+pub mod text_attach;
 pub mod tool_args;
 pub mod tools;
 

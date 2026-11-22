@@ -2822,13 +2822,19 @@ fn resolve_attachments(text: &str) -> (String, String, Vec<pengy_core::attachmen
                     images.push(reference);
                     resolved = resolved.replacen(&cap[0], "", 1);
                 }
-            } else if let Ok(content) = std::fs::read_to_string(path) {
+            } else if let Ok(content_bytes) = std::fs::read(path) {
+                // Attached text is paid for in context, so it is capped against
+                // the model's context window and the cut is announced.
+                let cfg = pengy_core::config::load_config();
+                let budget = pengy_core::text_attach::budget_for_model(&cfg, "");
+                let (content, note) = pengy_core::text_attach::read_text_attachment_bytes(&content_bytes, budget);
                 blocks.push(format!(
-                    "[File: {}]\n```\n{}\n```",
+                    "[File: {}]\n```\n{}{}\n```",
                     path.file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(path_str),
-                    content
+                    content,
+                    note
                 ));
                 resolved = resolved.replacen(&cap[0], "", 1);
             }
