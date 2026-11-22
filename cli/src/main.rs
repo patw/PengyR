@@ -1005,7 +1005,7 @@ impl PengyCli {
             "raw" => println!("{}", content),
             _ => {
                 println!();
-                print_box(&format!("{} 🤖", config::chat_identity(&self.config).1), &[render_markdown_terminal(content)], None);
+                print_box(&config::chat_identity(&self.config).1, &[render_markdown_terminal(content)], None);
             }
         }
     }
@@ -1037,11 +1037,11 @@ impl PengyCli {
 
         let assistant_label = config::chat_identity(&self.config).1;
         if content.trim().is_empty() {
-            print_box(&format!("{assistant_label} 🤖"), &["(empty response)".to_string()], None);
+            print_box(&assistant_label, &["(empty response)".to_string()], None);
         } else {
             println!();
             let rendered = render_markdown_terminal(content);
-            print_box(&format!("{assistant_label} 🤖"), &[rendered], None);
+            print_box(&assistant_label, &[rendered], None);
         }
 
         if usage.total_tokens > 0 {

@@ -97,6 +97,16 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
     m_displayName = new QLineEdit(config["display_name"].toString());
     m_displayName->setToolTip("Name shown on your own chat messages. Empty uses your login name.");
     uiForm->addRow(labelWithTip("Display name:", "Name shown on your own chat messages. Empty uses your login name."), m_displayName);
+    // The label fields are the whole rendered string, glyph included; the view
+    // adds nothing. Blank restores the shipped default.
+    m_userLabel = new QLineEdit(config["user_label"].toString());
+    m_userLabel->setToolTip("Whole label for your messages, emoji included. {username} is your display name. Empty restores the default.");
+    uiForm->addRow(labelWithTip("Your label:", "Whole label for your messages, emoji included. {username} is your display name. Empty restores the default."), m_userLabel);
+
+    m_assistantLabel = new QLineEdit(config["assistant_label"].toString());
+    m_assistantLabel->setToolTip("Whole label for the assistant. {hostname} becomes ' (host)' when chat labels name the machine. Empty restores the default.");
+    uiForm->addRow(labelWithTip("Assistant label:", "Whole label for the assistant, emoji included. {hostname} becomes ' (host)' when chat labels name the machine. Empty restores the default."), m_assistantLabel);
+
 
     m_showNodeLabel = new QCheckBox("Name the answering machine in the assistant label");
     m_showNodeLabel->setChecked(config["show_node_in_label"].toBool(true));
@@ -439,6 +449,8 @@ SettingsDialog::SettingsDialog(QJsonObject config, QWidget* parent)
         m_config["theme_mode"] = m_themeMode->currentData().toString();
         m_config["theme_accent"] = m_themeAccent->currentData().toString();
         m_config["display_name"] = m_displayName->text().trimmed();
+        m_config["user_label"] = m_userLabel->text().trimmed();
+        m_config["assistant_label"] = m_assistantLabel->text().trimmed();
         m_config["show_node_in_label"] = m_showNodeLabel->isChecked();
         m_config["llm_timeout"] = m_llmTimeout->value();
         m_config["tool_timeout"] = m_toolTimeout->value();

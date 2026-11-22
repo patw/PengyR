@@ -46,23 +46,39 @@
 namespace {
 
 /// (human label, assistant label) for the chat role labels, from this node's
-/// config. Display-only: nothing is stored in a chat file, so existing chats
-/// need no migration. display_name falls back to the login name, the same
-/// convention the Rust core uses for {username} in the system message.
+/// config. The label is the whole string the view draws -- no glyph is appended
+/// by the view, so the emoji lives in the string and removing it is a settings
+/// edit. {username} / {hostname} expand as they do in the system message;
+/// displayName supplies {username} (empty = login name) and show_node_in_label
+/// decides whether {hostname} becomes ' (host)' or nothing. Display-only:
+/// nothing is written into a chat file, so existing chats need no migration.
 QPair<QString, QString> chatIdentity(const QJsonObject& config) {
+    const QString userGlyph = QString::fromUtf8("\xf0\x9f\xa7\x91");
+    const QString botGlyph = QString::fromUtf8("\xf0\x9f\xa4\x96");
+    const QString defaultUser = QStringLiteral("{username} ") + userGlyph;
+    const QString defaultAssistant = QStringLiteral("Pengy{hostname} ") + botGlyph;
+
     QString human = config["display_name"].toString().trimmed();
     if (human.isEmpty())
         human = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "You"));
     if (human.isEmpty()) human = "You";
-    QString assistant = "Pengy";
+
+    QString hostSlot;
     if (config["show_node_in_label"].toBool(true)) {
         QString hostname;
         QFile f("/etc/hostname");
         if (f.open(QIODevice::ReadOnly)) hostname = QString::fromUtf8(f.readAll()).trimmed();
         if (hostname.isEmpty()) hostname = QSysInfo::machineHostName();
-        if (!hostname.isEmpty()) assistant = QString("%1 (%2)").arg(assistant, hostname);
+        if (!hostname.isEmpty()) hostSlot = QStringLiteral(" (%1)").arg(hostname);
     }
-    return {human, assistant};
+
+    const auto expand = [&](const QString& tmpl, const QString& fallback) {
+        QString use = tmpl.trimmed().isEmpty() ? fallback : tmpl;
+        use.replace("{username}", human).replace("{hostname}", hostSlot);
+        return use.trimmed();
+    };
+    return {expand(config["user_label"].toString(), defaultUser),
+            expand(config["assistant_label"].toString(), defaultAssistant)};
 }
 
 } // namespace

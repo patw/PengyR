@@ -94,8 +94,23 @@ pub struct Config {
     pub theme_accent: String,
     /// Human side of the chat role labels. Empty falls back to the login name,
     /// the same value `{username}` gets in the system message.
-    #[serde(default)]
+    /// Defaulted by name, not by `#[serde(default)]`: that path uses `String::default()`
+    /// (an empty string), so an older settings.json would fall back to the login name
+    /// here while the other two editions render "You".
+    #[serde(default = "default_display_name")]
     pub display_name: String,
+    /// Whole label for the human's messages, glyph included -- the renderer adds
+    /// nothing of its own, so deleting the emoji is a settings edit. `{username}`
+    /// expands to `display_name`. Blank restores the shipped default.
+    #[serde(default)]
+    pub user_label: String,
+
+    /// Whole label for the assistant, glyph included. `{hostname}` expands to
+    /// ' (host)' when `show_node_in_label` is on, and to nothing otherwise.
+    /// Blank restores the shipped default.
+    #[serde(default)]
+    pub assistant_label: String,
+
 
     /// Name the answering machine in the assistant label, e.g. `Pengy (behopc)`.
     /// Matters because the same chats are opened on several machines.
@@ -158,6 +173,7 @@ fn default_tool_confirmation() -> String {
 }
 fn default_compact_at_percent() -> u64 { 75 }
 fn default_show_node_in_label() -> bool { true }
+fn default_display_name() -> String { "You".into() }
 fn default_auto_context_recovery() -> bool { true }
 fn default_recovery_keep_turns() -> usize { 3 }
 fn default_output_token_parameter() -> String { "max_tokens".into() }
@@ -223,7 +239,9 @@ impl Default for Config {
             ui_scale: default_ui_scale(),
             theme_mode: default_theme_mode(),
             theme_accent: default_theme_accent(),
-            display_name: String::new(),
+            display_name: "You".into(),
+            user_label: String::new(),
+            assistant_label: String::new(),
             show_node_in_label: default_show_node_in_label(),
             user_agent: default_user_agent(),
             llm_timeout: default_llm_timeout(),
@@ -353,6 +371,8 @@ pub fn load_config() -> Config {
                     if let Some(b) = obj.get("context_window_auto").and_then(|v| v.as_bool()) { config.context_window_auto = b; }
                     if let Some(n) = obj.get("compact_at_percent").and_then(|v| v.as_u64()) { config.compact_at_percent = n; }
                     if let Some(s) = obj.get("display_name").and_then(|v| v.as_str()) { config.display_name = s.into(); }
+                    if let Some(s) = obj.get("user_label").and_then(|v| v.as_str()) { config.user_label = s.into(); }
+                    if let Some(s) = obj.get("assistant_label").and_then(|v| v.as_str()) { config.assistant_label = s.into(); }
                     if let Some(b) = obj.get("show_node_in_label").and_then(|v| v.as_bool()) { config.show_node_in_label = b; }
                     if let Some(v) = obj.get("context_windows") { config.context_windows = serde_json::from_value(v.clone()).unwrap_or_default(); }
                     if let Some(v) = obj.get("context_window_modes") { config.context_window_modes = serde_json::from_value(v.clone()).unwrap_or_default(); }
@@ -477,25 +497,42 @@ fn whoami() -> String {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".into())
 }
-/// The name Pengy calls itself in chat role labels.
+/// The name Pengy calls itself, and the glyphs the shipped label templates use.
+/// The glyphs live in the templates, not in the renderer: a label string is
+/// drawn verbatim, so dropping the emoji is a settings edit.
 pub const AGENT_NAME: &str = "Pengy";
+pub const USER_GLYPH: &str = "\u{1F9D1}";
+pub const ASSISTANT_GLYPH: &str = "\u{1F916}";
+
+fn label_template(configured: &str, default: &str) -> String {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() }
+}
 
 /// (human label, assistant label) for the chat role labels, derived from this
-/// node's config. Display-only: nothing is written to a chat file, so existing
-/// chats need no migration -- "who answered this" is a property of the machine
-/// rendering it, and chats are shared between machines.
+/// node's config. `{username}` and `{hostname}` expand the way they do in the
+/// system-message template; leaving a token out of a template simply omits that
+/// value, there is no hidden appending. Display-only: nothing is written to a
+/// chat file, so existing chats need no migration -- "who answered this" is a
+/// property of the machine rendering it, and chats are shared between machines.
 pub fn chat_identity(config: &Config) -> (String, String) {
-    let human = {
+    let username = {
         let trimmed = config.display_name.trim();
         if trimmed.is_empty() { whoami() } else { trimmed.to_string() }
     };
-    let assistant = if config.show_node_in_label {
+    let host_slot = if config.show_node_in_label {
         let host = hostname();
-        if host.is_empty() { AGENT_NAME.to_string() } else { format!("{AGENT_NAME} ({host})") }
+        if host.is_empty() { String::new() } else { format!(" ({host})") }
     } else {
-        AGENT_NAME.to_string()
+        String::new()
     };
-    (human, assistant)
+    let expand = |tmpl: &str| -> String {
+        tmpl.replace("{username}", &username).replace("{hostname}", &host_slot).trim().to_string()
+    };
+    (
+        expand(&label_template(&config.user_label, &format!("{{username}} {USER_GLYPH}"))),
+        expand(&label_template(&config.assistant_label, &format!("{AGENT_NAME}{{hostname}} {ASSISTANT_GLYPH}"))),
+    )
 }
 
 fn hostname() -> String {
@@ -517,18 +554,51 @@ mod tests {
         let mut cfg = Config::default();
         cfg.display_name = "  Pat  ".into();
         let (human, assistant) = chat_identity(&cfg);
-        assert_eq!(human, "Pat", "the setting is trimmed");
+        assert!(human.starts_with("Pat"), "the setting is trimmed and fills the username token");
         assert!(assistant.starts_with(AGENT_NAME));
         assert!(assistant.contains('('), "the node is named by default");
+    }
+
+    #[test]
+    fn chat_labels_carry_their_glyphs_and_the_renderer_adds_none() {
+        // The whole point: deleting the emoji is a settings edit, not a code edit.
+        let mut cfg = Config::default();
+        cfg.display_name = "Pat".into();
+        let (human, assistant) = chat_identity(&cfg);
+        assert!(human.contains(USER_GLYPH), "the shipped label carries its glyph");
+        assert!(assistant.contains(ASSISTANT_GLYPH));
+
+        cfg.user_label = "{username}".into();
+        cfg.assistant_label = AGENT_NAME.into();
+        let (plain_human, plain_assistant) = chat_identity(&cfg);
+        assert_eq!(plain_human, "Pat");
+        assert_eq!(plain_assistant, AGENT_NAME);
+
+        // Glyph-first is expressible the same way.
+        cfg.user_label = format!("{USER_GLYPH} {{username}}");
+        assert_eq!(chat_identity(&cfg).0, format!("{USER_GLYPH} Pat"));
+    }
+
+    #[test]
+    fn a_blank_label_template_restores_the_shipped_one() {
+        // A cleared settings field must not render an empty label.
+        let mut cfg = Config::default();
+        cfg.user_label = "   ".into();
+        cfg.assistant_label = "".into();
+        let (human, assistant) = chat_identity(&cfg);
+        assert!(!human.is_empty() && !assistant.is_empty());
+        assert!(human.contains(USER_GLYPH));
+        assert!(assistant.contains(ASSISTANT_GLYPH));
     }
 
     #[test]
     fn chat_identity_falls_back_to_the_login_name() {
         // Same value the system message gets for {username}, so the label can
         // never be worse-informed than the prompt.
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.display_name = "".into();
         let (human, _) = chat_identity(&cfg);
-        assert_eq!(human, whoami());
+        assert!(human.contains(&whoami()));
     }
 
     #[test]
@@ -536,8 +606,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.show_node_in_label = false;
         let (_, assistant) = chat_identity(&cfg);
-        assert_eq!(assistant, AGENT_NAME);
         assert!(!assistant.contains('('));
+        assert!(assistant.starts_with(AGENT_NAME));
+        // A template without the token never names the machine: no hidden appending.
+        cfg.show_node_in_label = true;
+        cfg.assistant_label = format!("{AGENT_NAME} {ASSISTANT_GLYPH}");
+        let (_, tokenless) = chat_identity(&cfg);
+        assert_eq!(tokenless, format!("{AGENT_NAME} {ASSISTANT_GLYPH}"));
     }
 
     #[test]
@@ -547,12 +622,15 @@ mod tests {
         let mut value = serde_json::to_value(Config::default()).unwrap();
         let obj = value.as_object_mut().unwrap();
         obj.remove("display_name");
+        obj.remove("user_label");
+        obj.remove("assistant_label");
         obj.remove("show_node_in_label");
         let cfg: Config = serde_json::from_value(value).unwrap();
-        assert_eq!(cfg.display_name, "");
+        assert_eq!(cfg.display_name, "You");
+        assert!(cfg.user_label.is_empty() && cfg.assistant_label.is_empty());
         assert!(cfg.show_node_in_label, "node naming is on by default");
         let (human, assistant) = chat_identity(&cfg);
-        assert_eq!(human, whoami());
+        assert!(human.starts_with("You"));
         assert!(assistant.starts_with(AGENT_NAME));
     }
 
@@ -674,6 +752,8 @@ mod tests {
             theme_mode: "dark".into(),
             theme_accent: "purple".into(),
             display_name: "Pat".into(),
+            user_label: String::new(),
+            assistant_label: String::new(),
             show_node_in_label: true,
             user_agent: "TestAgent/1.0".into(),
             llm_timeout: 120,
